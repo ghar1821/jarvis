@@ -26,6 +26,7 @@ PROMPT_PATH = Path(__file__).parent / "prompt_filter_score.md"
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     today = datetime.today()
     datetime_str = today.strftime("%Y-%m-%d_%H-%M")
@@ -52,7 +53,7 @@ def main() -> None:
     output_path.write_text(digest)
     print(f"  Written to {output_path}", flush=True)
 
-    download_must_reads(selected, all_papers, OUTPUT_DIR, datetime_str)
+    # download_must_reads(selected, all_papers, OUTPUT_DIR, datetime_str)
 
 
 if __name__ == "__main__":
