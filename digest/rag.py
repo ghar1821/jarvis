@@ -33,7 +33,7 @@ _embed_fn: SentenceTransformerEmbeddingFunction | None = None
 def _get_embed_fn() -> SentenceTransformerEmbeddingFunction:
     global _embed_fn
     if _embed_fn is None:
-        print("Loading embedding model (first run only)...", flush=True)
+        print("Loading embedding model...", flush=True)
         _embed_fn = SentenceTransformerEmbeddingFunction(get_config().embed_model)
     return _embed_fn
 

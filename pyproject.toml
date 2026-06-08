@@ -19,4 +19,4 @@ include = ["digest*", "vault_chat*"]
 run-digest = "digest.run:main"
 convert-pdf = "digest.convert:main"
 vault-chat = "vault_chat.chat:main"
-paper-rag = "digest.rag_cli:main"
+kb = "digest.kb:main"

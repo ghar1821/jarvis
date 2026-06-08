@@ -1,13 +1,15 @@
 """
-paper-rag CLI — manage the local RAG database.
+kb — local knowledge base manager.
+
+Manages a local vector database of research papers and Obsidian vault notes
+that vault-chat draws on during conversations.
 
 Subcommands:
   auth login        Browser OAuth PKCE flow → ~/.paper_digest/auth.json
   auth status       Show active auth method
 
   add <url|path>    Add a paper by arXiv URL or local PDF path
-  query <query>     Semantic search over papers
-  list              List papers in the database
+  list              List indexed papers
   stats             Show counts for papers and vault notes
   remove <doc_id>   Remove a paper by ID
 
@@ -15,15 +17,14 @@ Subcommands:
   refresh-vault     Incremental update of vault index
 
 Usage examples:
-  paper-rag auth login
-  paper-rag add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
-  paper-rag add paper.pdf --provider anthropic
-  paper-rag query "sparse autoencoders" --n 5 --score-min 8
-  paper-rag list --limit 20
-  paper-rag stats
-  paper-rag remove 2301.07041
-  paper-rag index-vault --vault-path ~/vault
-  paper-rag refresh-vault
+  uv run kb auth login
+  uv run kb add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
+  uv run kb add paper.pdf --provider anthropic
+  uv run kb list --limit 20
+  uv run kb stats
+  uv run kb remove 2301.07041
+  uv run kb index-vault
+  uv run kb refresh-vault
 """
 
 import argparse
@@ -232,30 +233,7 @@ def cmd_add(args: argparse.Namespace) -> None:
     print(f"Added to RAG (doc_id: {doc_id})")
 
 
-# ── Query / list / stats / remove ─────────────────────────────────────────────
-
-
-def cmd_query(args: argparse.Namespace) -> None:
-    from .rag import get_papers_collection, retrieve_papers
-
-    results = retrieve_papers(
-        query=args.query, n_results=args.n,
-        score_min=args.score_min, track=args.track,
-        collection=get_papers_collection(),
-    )
-    if not results:
-        print("No results found.")
-        return
-    print(f"Found {len(results)} result(s):\n")
-    for i, r in enumerate(results, 1):
-        print(f"{i}. [{r.get('score', '?')}/10 · {r.get('track', '')}] {r['title']}")
-        print(f"   Authors:   {r.get('authors', 'N/A')}")
-        print(f"   Published: {r.get('published', 'N/A')}  |  {r.get('link', '')}")
-        print(f"   Doc ID:    {r['doc_id']}")
-        preview = r.get("document", "")[:200].replace("\n", " ")
-        if preview:
-            print(f"   Preview:   {preview}...")
-        print()
+# ── List / stats / remove ─────────────────────────────────────────────────────
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -263,12 +241,12 @@ def cmd_list(args: argparse.Namespace) -> None:
 
     papers = list_papers(limit=args.limit, collection=get_papers_collection())
     if not papers:
-        print("No papers in RAG database.")
+        print("No papers in knowledge base.")
         return
-    print(f"{'Doc ID':<20} {'Score':>5}  {'Published':<12}  Title")
-    print("-" * 80)
     for p in papers:
-        print(f"{p['doc_id']:<20} {str(p.get('score', '?')):>5}  {p.get('published', 'N/A'):<12}  {p.get('title', '')[:50]}")
+        print(f"[{p.get('score', '?')}/10] {p.get('title', '')}")
+        print(f"  {p.get('link', 'no link')}  ·  {p.get('published', 'N/A')}  ·  {p['doc_id']}")
+        print()
 
 
 def cmd_stats() -> None:
@@ -339,7 +317,10 @@ def main() -> None:
     from .config import get_config
 
     cfg = get_config()
-    parser = argparse.ArgumentParser(prog="paper-rag", description="Manage the local RAG database.")
+    parser = argparse.ArgumentParser(
+        prog="kb",
+        description="Manage the local knowledge base (papers + vault notes).",
+    )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
 
@@ -361,15 +342,8 @@ def main() -> None:
         help=f"'anthropic' or Ollama model name (default: from config, currently {cfg.provider})",
     )
 
-    # query
-    p_query = sub.add_parser("query", help="Semantic search over papers")
-    p_query.add_argument("query")
-    p_query.add_argument("--n", type=int, default=5)
-    p_query.add_argument("--score-min", type=int, default=None, dest="score_min")
-    p_query.add_argument("--track", default=None)
-
     # list / stats / remove
-    p_list = sub.add_parser("list", help="List papers in the database")
+    p_list = sub.add_parser("list", help="List indexed papers")
     p_list.add_argument("--limit", type=int, default=20)
     sub.add_parser("stats", help="Show paper and vault note counts")
     p_remove = sub.add_parser("remove", help="Remove a paper by doc ID")
@@ -386,7 +360,6 @@ def main() -> None:
     dispatch = {
         "auth":          lambda: (cmd_auth_login() if args.auth_command == "login" else cmd_auth_status()),
         "add":           lambda: cmd_add(args),
-        "query":         lambda: cmd_query(args),
         "list":          lambda: cmd_list(args),
         "stats":         cmd_stats,
         "remove":        lambda: cmd_remove(args),

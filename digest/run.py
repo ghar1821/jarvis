@@ -9,7 +9,7 @@ from .format import download_must_reads, format_digest
 from .llm import make_provider
 from .score import filter_and_score
 
-PROMPT_PATH = Path(__file__).parent / "prompt_filter_score.md"
+PROMPT_PATH = Path(__file__).parent / "prompts" / "prompt_filter_score.md"
 
 
 def main() -> None:

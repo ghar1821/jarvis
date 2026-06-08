@@ -24,11 +24,9 @@ TOOLS = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read the full contents of a file from the Obsidian vault. "
-                "Use this whenever you need the actual content of a note, the glossary, "
-                "the reading list, common cross-paper themes, or any other vault file "
-                "before answering. Always read relevant files before answering — never "
-                "answer from memory alone."
+                "Read the full contents of a specific file from the Obsidian vault. "
+                "Only call this after search_vault or retrieve_papers has identified "
+                "the file as relevant. Do not use this to browse files speculatively."
             ),
             "parameters": {
                 "type": "object",
@@ -106,13 +104,6 @@ TOOLS = [
 # ── Vault helpers ──────────────────────────────────────────────────────────────
 
 
-def build_file_index(vault: Path) -> str:
-    lines = ["Available files in vault:"]
-    for path in sorted(vault.rglob("*.md")):
-        lines.append(f"  {path.relative_to(vault)}")
-    return "\n".join(lines)
-
-
 def read_file(vault: Path, rel_path: str) -> str:
     target = (vault / rel_path).resolve()
     try:
@@ -124,19 +115,31 @@ def read_file(vault: Path, rel_path: str) -> str:
     return target.read_text(encoding="utf-8")
 
 
+_DEFAULT_SYSTEM = """\
+You are a knowledgeable assistant with access to an Obsidian vault and a \
+local knowledge base of research papers.
+
+Always follow this workflow when answering:
+1. Search first — use search_vault and/or retrieve_papers to find relevant \
+content before reading anything.
+2. Read for detail — once search identifies a relevant file, use read_file \
+to read its full content.
+3. Never call read_file without first establishing through search that the \
+file is relevant.
+
+Use search_vault for questions about notes, projects, and personal writing. \
+Use retrieve_papers for questions about research papers and scientific topics. \
+Use read_file to get the complete content of a specific file identified by search.\
+"""
+
+
 def build_system_prompt(vault: Path) -> str:
     skill_path = vault / "system" / "SKILL.md"
-    base = (
+    return (
         skill_path.read_text(encoding="utf-8").rstrip()
         if skill_path.exists()
-        else (
-            "You are a knowledgeable assistant with access to an Obsidian vault "
-            "and a local database of curated research papers. "
-            "Use retrieve_papers to search indexed papers, search_vault to discover "
-            "relevant vault notes, and read_file to read specific files in full."
-        )
+        else _DEFAULT_SYSTEM
     )
-    return f"{base}\n\n{build_file_index(vault)}"
 
 
 # ── Tool dispatch ──────────────────────────────────────────────────────────────
@@ -283,12 +286,21 @@ def run_session(vault: Path) -> None:
 
 
 def main() -> None:
+    import argparse
+
     cfg = get_config()
-    vault = (
-        Path(sys.argv[1]).expanduser()
-        if len(sys.argv) > 1
-        else cfg.vault_path
+    parser = argparse.ArgumentParser(
+        prog="vault-chat",
+        description="Multi-turn chat over an Obsidian vault and the local paper RAG database.",
     )
+    parser.add_argument(
+        "vault",
+        nargs="?",
+        help=f"Path to the vault root (default from config: {cfg.vault_path})",
+    )
+    args = parser.parse_args()
+
+    vault = Path(args.vault).expanduser() if args.vault else cfg.vault_path
 
     if not vault.exists():
         print(f"Error: vault path does not exist: {vault}", file=sys.stderr)

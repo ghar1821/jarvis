@@ -16,10 +16,10 @@ paper_digest/
 │   ├── convert.py              # PDF-to-Markdown converter (standalone CLI)
 │   ├── run.py                  # Main pipeline entry point
 │   ├── rag.py                  # Local RAG database (ChromaDB + sentence-transformers)
-│   ├── rag_cli.py              # paper-rag CLI
-│   ├── prompt_filter_score.md  # Prompt template for paper scoring
+│   ├── kb.py                   # kb CLI
 │   └── prompts/
-│       └── paper_summary.md    # Prompt template for paper summarisation
+│       ├── prompt_filter_score.md  # Prompt template for paper scoring
+│       └── paper_summary.md        # Prompt template for paper summarisation
 ├── vault_chat/
 │   └── chat.py                 # Multi-turn vault + RAG chat
 ├── run_digest.sh               # Shell wrapper for launchd scheduling
@@ -47,7 +47,7 @@ provider = "ollama"          # "ollama" | "anthropic"
 vault_path = "~/vault"
 
 [auth]
-oauth_client_id = ""         # required for paper-rag auth login
+oauth_client_id = ""         # required for kb auth login
 ```
 
 Environment variables (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`, `CHAT_PROVIDER`, `VAULT_PATH`) override the corresponding TOML values when set.
@@ -100,23 +100,37 @@ Requires [Ollama](https://ollama.com) running locally with the configured model 
 
 ## Usage
 
+All commands below must be prefixed with `uv run` — they are entry points installed into the project's virtual environment, not system-wide executables:
+
+```bash
+uv run run-digest
+uv run vault-chat --help
+uv run kb --help
+uv run convert-pdf --help
+```
+
+Alternatively, activate the venv once (`source .venv/bin/activate`) and then use the command names directly for the rest of the session.
+
 ### Weekly digest
 
 ```bash
-run-digest
+uv run run-digest
 ```
 
 ### Vault chat
 
 ```bash
-vault-chat
-vault-chat ~/path/to/vault      # override vault path for this session
+uv run vault-chat
+uv run vault-chat ~/path/to/vault          # override vault path for this session
+CHAT_PROVIDER=anthropic uv run vault-chat  # use Anthropic Claude for this session
 ```
+
+The default provider comes from `[chat] provider` in `~/.paper_digest/config.toml`.
 
 On startup, vault-chat refreshes the vault index (new/changed/deleted files). Index the vault first if you haven't already:
 
 ```bash
-paper-rag index-vault
+uv run kb index-vault
 ```
 
 Example interactions:
@@ -130,24 +144,23 @@ You: what are my notes on transformers?
 
 ```bash
 # Index / refresh vault
-paper-rag index-vault
-paper-rag index-vault --vault-path ~/path/to/vault --force   # full re-index
-paper-rag refresh-vault
+uv run kb index-vault
+uv run kb index-vault --vault-path ~/path/to/vault --force   # full re-index
+uv run kb refresh-vault
 
 # Add papers
-paper-rag add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
-paper-rag add paper.pdf --provider anthropic
+uv run kb add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
+uv run kb add paper.pdf --provider anthropic
 
-# Search and inspect
-paper-rag query "sparse autoencoders" --score-min 8
-paper-rag list
-paper-rag stats
+# Inspect
+uv run kb list
+uv run kb stats
 
 # Remove by ID (use vault-chat for fuzzy removal by description)
-paper-rag remove 2406.04093
+uv run kb remove 2406.04093
 ```
 
-`--provider` accepts `anthropic` or an Ollama model name. PDFs are sent directly to the model — no conversion step, provided the model supports document input.
+`--provider` accepts `anthropic` or an Ollama model name. Defaults to the `[chat] provider` value from config — if that is already set to `anthropic`, you don't need to pass `--provider` explicitly. PDFs are sent directly to the model without a conversion step; the model must support document/vision input.
 
 ### Anthropic authentication
 
@@ -158,8 +171,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 **Option 2 — claude.ai OAuth** (browser flow, persists across sessions):
 ```bash
-paper-rag auth login     # opens browser, saves token to ~/.paper_digest/auth.json
-paper-rag auth status    # show current auth method
+uv run kb auth login     # opens browser, saves token to ~/.paper_digest/auth.json
+uv run kb auth status    # show current auth method
 ```
 
 OAuth login requires `oauth_client_id` in `~/.paper_digest/config.toml` (or `ANTHROPIC_OAUTH_CLIENT_ID` env var). Confirm the client ID and endpoint URLs from [Anthropic's developer documentation](https://docs.anthropic.com).
@@ -167,8 +180,8 @@ OAuth login requires `oauth_client_id` in `~/.paper_digest/config.toml` (or `ANT
 ### PDF conversion (standalone)
 
 ```bash
-convert-pdf --input https://arxiv.org/abs/2301.07041
-convert-pdf --input paper.pdf --output-dir ./output
+uv run convert-pdf --input https://arxiv.org/abs/2301.07041
+uv run convert-pdf --input paper.pdf --output-dir ./output
 ```
 
 ## Scheduling (macOS launchd)
