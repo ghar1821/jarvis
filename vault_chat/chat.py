@@ -1,27 +1,22 @@
 """
-CLI chat tool that connects an Obsidian vault to a local Ollama model
-using native tool calling.
+CLI chat tool connecting the Obsidian vault and paper RAG to an LLM.
 
-Configuration:
-  MODEL      — Ollama model name to use
-  VAULT_PATH — Path to the root of the Obsidian vault
+Provider is selected from config (default: ollama). Override with CHAT_PROVIDER env var
+or via ~/.paper_digest/config.toml → [chat] provider = "anthropic".
+
+Auth for Anthropic:
+  Option 1: export ANTHROPIC_API_KEY=sk-ant-...
+  Option 2: paper-rag auth login  (browser OAuth → ~/.paper_digest/auth.json)
 """
 
 import sys
 from pathlib import Path
 
-import ollama
+from digest.config import get_config
+from digest.errors import LLMError
+from digest.llm import make_provider
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-MODEL = "gemma4:26b"
-VAULT_PATH = (
-    Path(sys.argv[1]).expanduser()
-    if len(sys.argv) > 1
-    else Path("~/vault").expanduser()
-)
-
-# ── Tool definition ───────────────────────────────────────────────────────────
+# ── Tool definitions ───────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -46,25 +41,80 @@ TOOLS = [
                 "required": ["path"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_papers",
+            "description": (
+                "Search the local paper RAG database for papers relevant to a query. "
+                "Use this to find specific papers, look up details about papers added from "
+                "high-scoring digest runs, or explore research topics. "
+                "Returns up to n_results papers with title, authors, score, track, and a summary excerpt."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query"},
+                    "n_results": {"type": "integer", "description": "Number of results (default 5, max 20)", "default": 5},
+                    "score_min": {"type": "integer", "description": "Minimum relevance score (1-10)"},
+                    "track": {"type": "string", "description": "Track filter: 'Track 1' or 'Track 2'"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_vault",
+            "description": (
+                "Semantically search Obsidian vault notes to discover relevant files. "
+                "Use this to find which notes exist on a topic before reading them in full "
+                "with read_file. Returns matching chunks with file path and title."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query"},
+                    "n_results": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_paper",
+            "description": (
+                "Remove a paper from the RAG database by its document ID. "
+                "Always call retrieve_papers first to find the paper and confirm with the "
+                "user before removing. Never remove without explicit confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "Document ID from retrieve_papers results"},
+                },
+                "required": ["doc_id"],
+            },
+        },
+    },
 ]
 
-# ── Vault helpers ─────────────────────────────────────────────────────────────
+# ── Vault helpers ──────────────────────────────────────────────────────────────
 
 
 def build_file_index(vault: Path) -> str:
-    """Walk the vault and return a plain-text index of all .md files."""
     lines = ["Available files in vault:"]
     for path in sorted(vault.rglob("*.md")):
-        rel = path.relative_to(vault)
-        lines.append(f"  {rel}")
+        lines.append(f"  {path.relative_to(vault)}")
     return "\n".join(lines)
 
 
 def read_file(vault: Path, rel_path: str) -> str:
-    """Read a vault file by relative path. Returns an error string if not found."""
     target = (vault / rel_path).resolve()
-    # Guard against path traversal outside the vault
     try:
         target.relative_to(vault.resolve())
     except ValueError:
@@ -75,73 +125,131 @@ def read_file(vault: Path, rel_path: str) -> str:
 
 
 def build_system_prompt(vault: Path) -> str:
-    """Load SKILL.md and append the file index so the model knows what exists."""
     skill_path = vault / "system" / "SKILL.md"
-    if skill_path.exists():
-        base = skill_path.read_text(encoding="utf-8").rstrip()
-    else:
-        base = "You are a knowledgeable assistant with access to an Obsidian vault."
-
-    file_index = build_file_index(vault)
-    return f"{base}\n\n{file_index}"
-
-
-# ── Agentic loop ──────────────────────────────────────────────────────────────
-
-
-def run_agentic_turn(
-    client: ollama.Client,
-    history: list[dict],
-    vault: Path,
-) -> str:
-    """
-    Send history to the model and execute any tool calls in a loop.
-    Returns the final plain-text response.
-    """
-    while True:
-        response = client.chat(
-            model=MODEL,
-            messages=history,
-            tools=TOOLS,
-            format=None,
+    base = (
+        skill_path.read_text(encoding="utf-8").rstrip()
+        if skill_path.exists()
+        else (
+            "You are a knowledgeable assistant with access to an Obsidian vault "
+            "and a local database of curated research papers. "
+            "Use retrieve_papers to search indexed papers, search_vault to discover "
+            "relevant vault notes, and read_file to read specific files in full."
         )
-        message = response["message"]
-
-        # No tool call — this is the final answer
-        if not message.get("tool_calls"):
-            reply = message["content"]
-            history.append({"role": "assistant", "content": reply})
-            return reply
-
-        # Append the assistant's tool-call message to history
-        history.append(message)
-
-        # Execute each tool call and append the results
-        for tool_call in message["tool_calls"]:
-            fn = tool_call["function"]
-            if fn["name"] == "read_file":
-                path_arg = fn["arguments"].get("path", "")
-                result = read_file(vault, path_arg)
-            else:
-                result = f"[Error: unknown tool '{fn['name']}']"
-
-            history.append({"role": "tool", "content": result})
+    )
+    return f"{base}\n\n{build_file_index(vault)}"
 
 
-# ── Main session loop ─────────────────────────────────────────────────────────
+# ── Tool dispatch ──────────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    if not VAULT_PATH.exists():
-        print(f"Error: vault path does not exist: {VAULT_PATH}", file=sys.stderr)
-        sys.exit(1)
+def _dispatch_tool(name: str, arguments: dict, vault: Path) -> str:
+    if name == "read_file":
+        return read_file(vault, arguments.get("path", ""))
+    if name == "retrieve_papers":
+        return _retrieve_papers(arguments)
+    if name == "search_vault":
+        return _search_vault(arguments)
+    if name == "remove_paper":
+        return _remove_paper(arguments)
+    return f"[Error: unknown tool '{name}']"
 
-    client = ollama.Client()
-    system_prompt = build_system_prompt(VAULT_PATH)
 
-    history: list[dict] = [{"role": "system", "content": system_prompt}]
+def _retrieve_papers(args: dict) -> str:
+    try:
+        from digest.rag import RAGError, get_papers_collection, retrieve_papers
 
-    print(f"Vault chat ready. Model: {MODEL}  Vault: {VAULT_PATH}")
+        results = retrieve_papers(
+            query=args["query"],
+            n_results=min(int(args.get("n_results", 5)), 20),
+            score_min=args.get("score_min"),
+            track=args.get("track"),
+            collection=get_papers_collection(),
+        )
+        if not results:
+            return "[No papers found. The RAG database may be empty — run 'paper-rag add' or wait for a digest run.]"
+        lines = [f"Found {len(results)} paper(s):\n"]
+        for i, r in enumerate(results, 1):
+            lines.append(
+                f"{i}. [{r.get('score', '?')}/10 · {r.get('track', '')}] {r['title']}\n"
+                f"   Authors: {r.get('authors', 'N/A')}\n"
+                f"   Published: {r.get('published', 'N/A')}  |  {r.get('link', '')}\n"
+                f"   Doc ID: {r['doc_id']}\n"
+                f"   Summary: {r.get('document', '')[:300].replace(chr(10), ' ')}...\n"
+            )
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"[RAG papers error: {exc}]"
+
+
+def _search_vault(args: dict) -> str:
+    try:
+        from digest.rag import get_vault_collection, search_vault
+
+        results = search_vault(
+            query=args["query"],
+            n_results=min(int(args.get("n_results", 5)), 20),
+            collection=get_vault_collection(),
+        )
+        if not results:
+            return "[No vault notes found. Run 'paper-rag index-vault' to index your vault.]"
+        lines = [f"Found {len(results)} matching note chunk(s):\n"]
+        for i, r in enumerate(results, 1):
+            lines.append(
+                f"{i}. {r['title']}  ({r['file_path']})\n"
+                f"   Excerpt: {r['chunk'][:300].replace(chr(10), ' ')}...\n"
+            )
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"[RAG vault error: {exc}]"
+
+
+def _remove_paper(args: dict) -> str:
+    try:
+        from digest.rag import count, get_papers_collection, remove_paper
+
+        col = get_papers_collection()
+        before = count(col)
+        remove_paper(args["doc_id"], col)
+        after = count(col)
+        if before != after:
+            return f"Removed paper (doc_id: {args['doc_id']}). {after} papers remain in RAG."
+        return f"No paper found with doc_id: {args['doc_id']}"
+    except Exception as exc:
+        return f"[Remove error: {exc}]"
+
+
+# ── Vault auto-refresh ─────────────────────────────────────────────────────────
+
+
+def _auto_refresh_vault(vault: Path) -> None:
+    try:
+        from digest.rag import count_vault, get_vault_collection, refresh_vault
+
+        col = get_vault_collection()
+        if count_vault(col) == 0:
+            print("Vault not yet indexed — run: paper-rag index-vault", flush=True)
+            return
+        added, updated, deleted = refresh_vault(vault, col)
+        if added + updated + deleted > 0:
+            print(
+                f"Vault index refreshed: +{added} new, ~{updated} changed, -{deleted} removed",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"Warning: vault index refresh failed: {exc}", flush=True)
+
+
+# ── Session loop ───────────────────────────────────────────────────────────────
+
+
+def run_session(vault: Path) -> None:
+    cfg = get_config()
+    provider = make_provider(cfg.provider)
+    system_prompt = build_system_prompt(vault)
+    messages: list[dict] = []
+
+    provider_label = f"Anthropic ({cfg.anthropic_model})" if cfg.provider == "anthropic" else f"Ollama ({cfg.ollama_model})"
+    print(f"Vault chat ready. Provider: {provider_label}  Vault: {vault}")
     print("Type your question and press Enter. Ctrl-C or Ctrl-D to quit.\n")
 
     while True:
@@ -154,15 +262,40 @@ def main() -> None:
         if not user_input:
             continue
 
-        history.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": user_input})
 
         try:
-            answer = run_agentic_turn(client, history, VAULT_PATH)
-        except ollama.ResponseError as exc:
-            print(f"[Ollama error: {exc}]")
+            reply = provider.agentic_turn(
+                messages=messages,
+                tools=TOOLS,
+                dispatch_fn=lambda name, args: _dispatch_tool(name, args, vault),
+                system=system_prompt,
+            )
+        except LLMError as exc:
+            print(f"[LLM error: {exc}]")
+            messages.pop()  # Remove the failed user message so the user can retry
             continue
 
-        print(f"\nAssistant: {answer}\n")
+        print(f"\nAssistant: {reply}\n")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    cfg = get_config()
+    vault = (
+        Path(sys.argv[1]).expanduser()
+        if len(sys.argv) > 1
+        else cfg.vault_path
+    )
+
+    if not vault.exists():
+        print(f"Error: vault path does not exist: {vault}", file=sys.stderr)
+        sys.exit(1)
+
+    _auto_refresh_vault(vault)
+    run_session(vault)
 
 
 if __name__ == "__main__":

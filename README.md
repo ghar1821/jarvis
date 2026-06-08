@@ -1,82 +1,182 @@
 # paper_digest
 
-Daily arXiv paper digest for a computational biologist interested in cytometry, single-cell genomics, and AI/ML research. Also includes a vault chat tool for querying an Obsidian vault with a local LLM.
+arXiv paper digest for a computational biologist interested in cytometry, single-cell genomics, and AI/ML research. Fetches papers weekly, scores them with an LLM, and writes a ranked Markdown digest. High-scoring papers are automatically indexed into a local RAG database for retrieval and chat.
 
 ## Repository structure
 
 ```
 paper_digest/
-├── digest/                     # Paper digest pipeline
-│   ├── fetch.py                # Fetch and deduplicate papers from arXiv
+├── digest/
+│   ├── config.py               # Central configuration (loads ~/.paper_digest/config.toml)
+│   ├── errors.py               # Domain exceptions and retry decorator
+│   ├── llm.py                  # LLM provider abstraction (Ollama and Anthropic adapters)
+│   ├── fetch.py                # Fetch papers from arXiv
 │   ├── score.py                # LLM-based filtering and scoring
-│   ├── format.py               # Markdown digest formatter + must-read PDF downloader
+│   ├── format.py               # Markdown digest formatter
 │   ├── convert.py              # PDF-to-Markdown converter (standalone CLI)
-│   ├── run.py                  # Config and main pipeline entry point
-│   └── prompt_filter_score.md  # Prompt template for the scoring LLM call
-├── vault_chat/                 # Obsidian vault chat
-│   └── chat.py                 # Multi-turn agentic loop over a local vault
-├── run_digest.sh               # Shell wrapper for cron/launchd
+│   ├── run.py                  # Main pipeline entry point
+│   ├── rag.py                  # Local RAG database (ChromaDB + sentence-transformers)
+│   ├── rag_cli.py              # paper-rag CLI
+│   ├── prompt_filter_score.md  # Prompt template for paper scoring
+│   └── prompts/
+│       └── paper_summary.md    # Prompt template for paper summarisation
+├── vault_chat/
+│   └── chat.py                 # Multi-turn vault + RAG chat
+├── run_digest.sh               # Shell wrapper for launchd scheduling
 └── pyproject.toml
 ```
 
-## digest
+## Configuration
 
-Fetches recent papers from selected arXiv categories (cs.LG, cs.AI, cs.NE, cs.CV, cs.CL, cs.MA), uses a local LLM via [Ollama](https://ollama.com) to filter and score them by relevance, and writes a ranked Markdown digest. Must-read papers (score ≥ 9) are automatically downloaded and converted to Markdown using [marker-pdf](https://github.com/VikParuchuri/marker).
+All settings live in `~/.paper_digest/config.toml`. The file is optional — built-in defaults are used if it doesn't exist. Environment variables override TOML values.
 
-Configuration is at the top of [digest/run.py](digest/run.py):
+```toml
+[digest]
+ollama_model = "gemma4:26b"
+anthropic_model = "claude-sonnet-4-6"
+output_dir = "~/Documents/papers/digest"
+max_results = 10
+# arxiv_categories = [["cs.LG", 150], ["cs.AI", 80], ...]  # override fetch targets
 
-| Variable | Default | Description |
-|---|---|---|
-| `MODEL` | `gemma4:26b` | Ollama model for scoring |
-| `OUTPUT_DIR` | `~/Documents/papers/digest` | Where digests are written |
-| `MAX_RESULTS` | `10` | Max papers to include in digest |
-| `ARXIV_CATS` | see file | Categories and per-category fetch limits |
+[rag]
+rag_dir = "~/.paper_digest/rag"
+embed_model = "all-MiniLM-L6-v2"
 
-## vault_chat
+[chat]
+provider = "ollama"          # "ollama" | "anthropic"
+vault_path = "~/vault"
 
-A CLI tool that connects an [Obsidian](https://obsidian.md) vault to a local Ollama model via a multi-turn agentic loop. On startup it builds a file index from the vault and injects it into the conversation so the model knows what files are available. When the model needs to read a file it emits `READ: path/to/file.md`; the tool reads the file and feeds its contents back into the conversation.
-
-Expected vault layout:
-
-```
-vault/
-├── notes/          # .md files, one per source
-├── glossary.md     # term definitions
-├── to-read.md      # reading list
-└── system/
-    └── SKILL.md    # loaded as the system prompt on startup
+[auth]
+oauth_client_id = ""         # required for paper-rag auth login
 ```
 
-Configuration is at the top of [vault_chat/chat.py](vault_chat/chat.py):
+Environment variables (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`, `CHAT_PROVIDER`, `VAULT_PATH`) override the corresponding TOML values when set.
 
-| Variable | Default | Description |
+## Features
+
+### Digest pipeline
+
+Fetches recent papers from arXiv (cs.LG, cs.AI, cs.NE, cs.CV, cs.CL, cs.MA), scores them with the configured LLM, and writes a tiered Markdown digest to `output_dir`. Papers are scored 1–10 and grouped into Must-Read (≥ 9), Worth Reading (7–8), and Skim/Bookmark (5–6).
+
+After each run, papers with score ≥ 9 are automatically added to the local RAG database. The scoring pipeline works with either Ollama or Anthropic — the same `provider` setting used for chat applies.
+
+### LLM providers
+
+Both the digest pipeline and vault chat use the same provider abstraction. Switching providers changes the model used for scoring, summarisation, and chat all at once.
+
+| Provider | Config | Env var override |
 |---|---|---|
-| `MODEL` | `llama3.2` | Ollama model for chat |
-| `VAULT_PATH` | `~/vault` | Path to the Obsidian vault root |
+| Ollama (local, default) | `[chat] provider = "ollama"` | `CHAT_PROVIDER=ollama` |
+| Anthropic Claude | `[chat] provider = "anthropic"` | `CHAT_PROVIDER=anthropic` |
+
+### RAG database
+
+A persistent local vector database (ChromaDB at `~/.paper_digest/rag/`) with two collections:
+
+- **Papers** — one document per paper, stored as an LLM-generated dense summary (up to 1000 words). Papers from digest runs reuse the existing scoring summary; manually added papers get a fresh summary generated at add time.
+- **Vault notes** — Obsidian vault `.md` files, chunked and indexed for semantic search.
+
+Embeddings use `all-MiniLM-L6-v2` (runs locally, no API call needed).
+
+### Vault chat
+
+A multi-turn agentic CLI with four tools:
+
+| Tool | What it does |
+|---|---|
+| `read_file` | Read a specific vault file by relative path |
+| `search_vault` | Semantic search over vault notes to discover relevant files |
+| `retrieve_papers` | Semantic search over indexed papers |
+| `remove_paper` | Remove a paper — LLM identifies it from a description, confirms before acting |
+
+## Setup
+
+```bash
+uv sync
+uv pip install -e .
+```
+
+Requires [Ollama](https://ollama.com) running locally with the configured model pulled (for Ollama provider).
 
 ## Usage
 
-```bash
-# Run the daily digest
-uv run -m digest.run
-
-# Convert a single paper to Markdown
-uv run -m digest.convert --input https://arxiv.org/abs/2301.07041
-uv run -m digest.convert --input paper.pdf --output-dir ./output
-
-# Start the vault chat
-uv run -m vault_chat.chat
-```
-
-Or use the installed scripts after `uv pip install -e .`:
+### Weekly digest
 
 ```bash
 run-digest
-convert-pdf --input paper.pdf
-vault-chat
 ```
+
+### Vault chat
+
+```bash
+vault-chat
+vault-chat ~/path/to/vault      # override vault path for this session
+```
+
+On startup, vault-chat refreshes the vault index (new/changed/deleted files). Index the vault first if you haven't already:
+
+```bash
+paper-rag index-vault
+```
+
+Example interactions:
+```
+You: what papers do we have on mechanistic interpretability?
+You: remove the paper about SAE probing in biology
+You: what are my notes on transformers?
+```
+
+### Paper RAG database
+
+```bash
+# Index / refresh vault
+paper-rag index-vault
+paper-rag index-vault --vault-path ~/path/to/vault --force   # full re-index
+paper-rag refresh-vault
+
+# Add papers
+paper-rag add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
+paper-rag add paper.pdf --provider anthropic
+
+# Search and inspect
+paper-rag query "sparse autoencoders" --score-min 8
+paper-rag list
+paper-rag stats
+
+# Remove by ID (use vault-chat for fuzzy removal by description)
+paper-rag remove 2406.04093
+```
+
+`--provider` accepts `anthropic` or an Ollama model name. PDFs are sent directly to the model — no conversion step, provided the model supports document input.
+
+### Anthropic authentication
+
+**Option 1 — API key:**
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**Option 2 — claude.ai OAuth** (browser flow, persists across sessions):
+```bash
+paper-rag auth login     # opens browser, saves token to ~/.paper_digest/auth.json
+paper-rag auth status    # show current auth method
+```
+
+OAuth login requires `oauth_client_id` in `~/.paper_digest/config.toml` (or `ANTHROPIC_OAUTH_CLIENT_ID` env var). Confirm the client ID and endpoint URLs from [Anthropic's developer documentation](https://docs.anthropic.com).
+
+### PDF conversion (standalone)
+
+```bash
+convert-pdf --input https://arxiv.org/abs/2301.07041
+convert-pdf --input paper.pdf --output-dir ./output
+```
+
+## Scheduling (macOS launchd)
+
+See [LAUNCHD_SETUP.md](LAUNCHD_SETUP.md). The shell wrapper [run_digest.sh](run_digest.sh) is the launchd target.
 
 ## Requirements
 
-- [uv](https://github.com/astral-sh/uv) for dependency management
-- [Ollama](https://ollama.com) running locally with the configured models pulled
+- [uv](https://github.com/astral-sh/uv)
+- [Ollama](https://ollama.com) (for Ollama provider)
+- Python ≥ 3.12

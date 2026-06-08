@@ -1,20 +1,25 @@
 """LLM-based filtering and scoring of papers."""
 
 import json
-import time
 from pathlib import Path
 
-import ollama
+from .errors import LLMError, with_retries
+from .llm import ChatProvider
+
+# 192k tokens to fit ~490 abstracts in one call
+_SCORING_CONTEXT_LENGTH = 196608
 
 
 def filter_and_score(
     papers: list[dict],
-    model: str,
+    provider: ChatProvider,
     max_results: int,
     prompt_path: Path,
 ) -> dict:
-    """Ask the local LLM to filter and score a list of papers.
+    """
+    Ask the LLM to filter and score a list of papers.
 
+    provider: any ChatProvider (Ollama or Anthropic).
     Returns the parsed JSON object from the model response.
     """
     abstracts_text = ""
@@ -34,42 +39,32 @@ def filter_and_score(
         .replace("{abstracts_text}", abstracts_text)
     )
 
-    def _parse_json_from_raw(raw_text: str) -> dict:
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("```")[1]
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
-        if not cleaned:
-            raise ValueError("Model returned empty content.")
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(cleaned[start : end + 1])
-            raise
+    @with_retries(max_attempts=3, backoff=2.0, exceptions=(LLMError, ValueError))
+    def _call() -> dict:
+        raw = provider.complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=8192,
+            context_length=_SCORING_CONTEXT_LENGTH,
+        )
+        return _parse_json(raw)
 
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            response = ollama.chat(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"num_ctx": 196608},
-            )
-            raw = (response or {}).get("message", {}).get("content", "")
-            return _parse_json_from_raw(raw)
-        except Exception as exc:
-            last_err = exc
-            print(
-                f"  Warning: LLM response parse failed (attempt {attempt}/3): {exc}",
-                flush=True,
-            )
-            time.sleep(2 * attempt)
+    return _call()
 
-    raise RuntimeError(
-        "Failed to obtain valid JSON from LLM after 3 attempts."
-    ) from last_err
+
+def _parse_json(raw_text: str) -> dict:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    cleaned = cleaned.strip()
+    if not cleaned:
+        raise ValueError("Model returned empty content.")
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
