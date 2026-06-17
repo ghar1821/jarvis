@@ -89,14 +89,14 @@ TOOLS = [
             "name": "add_document",
             "description": (
                 "Add a paper or document to the knowledge base. "
-                "Source can be an arXiv URL or an absolute path to a local PDF file. "
-                "Two storage modes — ask the user which they want if not specified:\n"
-                "  summary (default): LLM generates a dense ~1000-word summary, then chunks it. "
-                "Fast and compact. Good for most papers.\n"
-                "  full_text: converts the PDF to Markdown and chunks the entire text. "
-                "Slower and larger, but supports paragraph-level retrieval. "
-                "Use for papers the user wants to query in depth.\n"
-                "For local PDFs also ask whether they should be public or private.\n"
+                "Source can be an arXiv URL or an absolute path to a local PDF file.\n"
+                "For arXiv URLs: always stored as 'paper'. Ask the user whether they want "
+                "summary (default, fast) or full_text (paragraph-level retrieval) mode.\n"
+                "For local PDFs: ALWAYS ask the user whether it is a 'paper' or a 'note' before calling.\n"
+                "  doc_type='paper': research paper — supports summary or full_text mode.\n"
+                "  doc_type='note': personal note — always indexed as full text; "
+                "content hash tracked so refresh_vault detects changes automatically.\n"
+                "Also ask for visibility (public/private) for local PDFs. "
                 "Narrate each step as you go."
             ),
             "parameters": {
@@ -106,12 +106,18 @@ TOOLS = [
                         "type": "string",
                         "description": "arXiv URL (https://arxiv.org/abs/...) or absolute path to a local PDF file",
                     },
+                    "doc_type": {
+                        "type": "string",
+                        "enum": ["paper", "note"],
+                        "description": "For local PDFs only: 'paper' (research paper) or 'note' (personal note, always full text with hash tracking). arXiv URLs are always 'paper'.",
+                        "default": "paper",
+                    },
                     "score": {"type": "integer", "description": "Relevance score 0-10", "default": 0},
                     "track": {"type": "string", "description": "Research track label", "default": ""},
                     "mode": {
                         "type": "string",
                         "enum": ["summary", "full_text"],
-                        "description": "summary: LLM-generated summary. full_text: full PDF text chunked.",
+                        "description": "For papers only: summary (LLM-generated) or full_text (full PDF chunked). Notes are always full_text.",
                         "default": "summary",
                     },
                     "visibility": {
@@ -438,17 +444,48 @@ def _add_document(args: dict, provider_obj) -> str:
             )
 
         # ── Local PDF ─────────────────────────────────────────────────────────
-        pdf_path = _Path(source).expanduser()
+        pdf_path = _Path(source).expanduser().resolve()
         if not pdf_path.exists():
             return f"[Error: file not found: {source}]"
         if pdf_path.suffix.lower() != ".pdf":
             return f"[Error: only PDF files are supported for local paths: {source}]"
 
         title = title_override or pdf_path.stem
-        file_source = pdf_path.resolve().as_uri()
+        file_source = pdf_path.as_uri()
+        doc_type = args.get("doc_type", "paper")
 
         if _source_exists(file_source, store):
             return f"Already in knowledge base: \"{title}\""
+
+        if doc_type == "note":
+            # Notes are always full text with content_hash for change tracking
+            from digest.arxiv.convert import convert_pdf
+            import hashlib as _hashlib
+            import tempfile
+            print(f"  Converting PDF note {pdf_path.name} to Markdown...", flush=True)
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = _Path(tmp)
+                convert_pdf(pdf_path, tmp_path)
+                md_path = tmp_path / f"{pdf_path.stem}.md"
+                if not md_path.exists():
+                    return "[Error: PDF conversion produced no output]"
+                content = md_path.read_text(encoding="utf-8")
+            content_hash = _hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+            print("  Chunking and indexing...", flush=True)
+            ids = add_texts(
+                content=content, doc_type="note", visibility=visibility,
+                source=file_source,
+                extra_metadata={
+                    "title": title, "file_path": str(pdf_path),
+                    "content_hash": content_hash, "storage_mode": "full_text",
+                },
+                store=store,
+            )
+            return (
+                f"Added note \"{title}\" (full text, {visibility}, {len(ids)} chunk(s)).\n"
+                f"  Source: {file_source}\n"
+                f"  Hash tracked — refresh_vault will detect changes automatically."
+            )
 
         if mode == "full_text":
             from digest.arxiv.convert import convert_pdf
@@ -463,25 +500,25 @@ def _add_document(args: dict, provider_obj) -> str:
                 content = md_path.read_text(encoding="utf-8")
             print("  Chunking and indexing full text...", flush=True)
             ids = add_texts(
-                content=content, doc_type="pdf", visibility=visibility,
+                content=content, doc_type="paper", visibility=visibility,
                 source=file_source,
                 extra_metadata={"title": title, "file_path": str(pdf_path),
-                                "score": score, "track": track},
+                                "score": score, "track": track, "storage_mode": "full_text"},
                 store=store,
             )
         else:
             print(f"  Generating summary from {pdf_path.name}...", flush=True)
             summary = provider_obj.summarize(title, pdf_path)
             ids = add_texts(
-                content=f"{title}\n\n{summary}", doc_type="pdf", visibility=visibility,
+                content=f"{title}\n\n{summary}", doc_type="paper", visibility=visibility,
                 source=file_source,
                 extra_metadata={"title": title, "file_path": str(pdf_path),
-                                "score": score, "track": track},
+                                "score": score, "track": track, "storage_mode": "summary"},
                 store=store,
             )
 
         return (
-            f"Added \"{title}\" ({mode}, {visibility}, {len(ids)} chunk(s)).\n"
+            f"Added paper \"{title}\" ({mode}, {visibility}, {len(ids)} chunk(s)).\n"
             f"  Source: {file_source}"
         )
     except Exception as exc:
@@ -580,11 +617,10 @@ def _kb_stats() -> str:
         store = get_store()
         papers = count_unique_documents("paper", "source", store)
         notes = count_unique_documents("note", "file_path", store)
-        pdfs = count_unique_documents("pdf", "source", store)
         chunks = count(store)
         return (
             f"Knowledge base:\n"
-            f"  {papers} papers · {notes} notes · {pdfs} PDFs\n"
+            f"  {papers} papers · {notes} notes\n"
             f"  {chunks} total chunks"
         )
     except Exception as exc:

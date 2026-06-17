@@ -329,7 +329,7 @@ def list_papers(
     s = store or get_store()
     try:
         result = s._collection.get(
-            where={"doc_type": {"$in": ["paper", "pdf"]}},
+            where={"doc_type": {"$eq": "paper"}},
             include=["metadatas"],
         )
     except Exception as exc:
@@ -448,5 +448,55 @@ def refresh_vault(
         if rel_path not in current:
             delete_by_metadata("file_path", rel_path, s)
             deleted += 1
+
+    # ── Phase 2: PDF notes (absolute file paths, doc_type="note") ────────────
+    # Local PDFs added as notes — not scanned from vault_root.
+    # Always full_text. Missing file: warn, leave DB unchanged.
+    # Changed file: delete old chunks, re-convert, re-index, then temp dir cleaned up.
+    try:
+        pdf_result = s._collection.get(
+            where={"doc_type": {"$eq": "note"}},
+            include=["metadatas"],
+        )
+        pdf_notes: dict[str, dict] = {}
+        for meta in pdf_result["metadatas"]:
+            fp = meta.get("file_path", "")
+            if fp and fp.endswith(".pdf") and fp not in pdf_notes:
+                pdf_notes[fp] = meta
+    except Exception:
+        pdf_notes = {}
+
+    for abs_path_str, meta in pdf_notes.items():
+        pdf_path = Path(abs_path_str)
+        if not pdf_path.exists():
+            print(f"  ⚠️  PDF note not found (keeping DB entry): {abs_path_str}", flush=True)
+            continue
+        current_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+        if current_hash == meta.get("content_hash", ""):
+            continue
+        import tempfile
+        from ..arxiv.convert import convert_pdf
+        print(f"  PDF note changed, re-indexing: {pdf_path.name}", flush=True)
+        delete_by_metadata("file_path", abs_path_str, s)
+        with tempfile.TemporaryDirectory() as tmp:
+            # temp dir (and converted .md) deleted automatically on exit
+            tmp_path = Path(tmp)
+            convert_pdf(pdf_path, tmp_path)
+            md_path = tmp_path / f"{pdf_path.stem}.md"
+            if md_path.exists():
+                add_texts(
+                    content=md_path.read_text(encoding="utf-8"),
+                    doc_type="note",
+                    visibility=meta.get("visibility", "public"),
+                    source=pdf_path.as_uri(),
+                    extra_metadata={
+                        "title": meta.get("title", pdf_path.stem),
+                        "file_path": abs_path_str,
+                        "content_hash": current_hash,
+                        "storage_mode": "full_text",
+                    },
+                    store=s,
+                )
+                updated += 1
 
     return added, updated, deleted

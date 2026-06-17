@@ -12,3 +12,4 @@ wheels/
 output/
 .DS_Store
 .python-version
+CLAUDE.md

@@ -95,7 +95,6 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 |---|---|
 | `~/.seshat/config.toml` | User configuration |
 | `~/.seshat/rag/` | ChromaDB persistent store |
-| `~/.seshat/auth.json` | Anthropic OAuth tokens |
 | `~/Documents/papers/digest/` | Weekly digest `.md` output files (configurable) |
 
 ---
@@ -118,8 +117,7 @@ Resolution order (later wins): defaults → `~/.seshat/config.toml` → env vars
 | `provider` | `ollama` | `CHAT_PROVIDER` | Active LLM provider |
 | `vault_path` | `~/vault` | `VAULT_PATH` | Obsidian vault root |
 | `private_vault_dirs` | `["private"]` | — | Vault folders treated as private |
-| `auth_file` | `~/.seshat/auth.json` | — | OAuth token storage |
-| `oauth_client_id` | `""` | `ANTHROPIC_OAUTH_CLIENT_ID` | Required for `kb auth login` |
+| `anthropic_api_key` | `""` | `ANTHROPIC_API_KEY` | Anthropic API key (alternative to env var) |
 
 ---
 
@@ -133,16 +131,27 @@ Single LangChain + ChromaDB collection (`knowledge_base`).
 page_content : str   — chunked text (embedded)
 metadata:
   date_added  : str  — ISO timestamp
-  doc_type    : str  — "paper" | "note" | "pdf"
+  doc_type    : str  — "paper" | "note"
   visibility  : str  — "public" | "private"
-  source      : str  — arXiv/DOI URL, or "local" for notes/PDFs without URL
+  source      : str  — arXiv/DOI URL for papers; "local" for vault .md notes;
+                       file:/// URI for local PDF notes
   title       : str  — display title
   authors     : str  — papers only
   score       : int  — relevance 0–10, papers only
   track       : str  — research track, papers only
-  file_path   : str  — vault-relative path, notes only
-  content_hash: str  — SHA-256 for change detection, notes only
+  storage_mode: str  — "summary" | "full_text"
+  file_path   : str  — vault-relative path for .md notes; absolute path for local PDF notes
+  content_hash: str  — SHA-256 for change detection (notes; also local PDF papers in full_text mode)
 ```
+
+**`doc_type` rules:**
+- arXiv URL → always `"paper"`
+- Local PDF → user must specify `"paper"` or `"note"` via `--doc-type`
+- Vault `.md` files → always `"note"`
+
+**`storage_mode` rules:**
+- `"note"` documents are always `full_text`
+- `"paper"` documents default to `"summary"` (LLM-generated ~1000-word summary, 1–2 chunks); `--full-text` stores all PDF chunks
 
 ### Privacy model
 
@@ -165,9 +174,10 @@ Files under `private_vault_dirs` folders → `"private"`. All papers → `"publi
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
 | `count()` · `count_unique_documents()` · `list_papers()` | Inspection |
+| `update_file_path(source, new_path)` | Update `file_path` (and `source` URI) for all chunks matching a source; no re-embedding |
 | `get_visibility(file_path, vault_root)` | Derive visibility from folder path |
 | `index_vault_file(file_path, vault_root)` | Chunk and index one vault file |
-| `refresh_vault(vault_root)` | Incremental sync; returns `(added, updated, deleted)` |
+| `refresh_vault(vault_root)` | Incremental sync (Phase 1: vault `.md` files; Phase 2: local PDF notes); returns `(added, updated, deleted)` |
 
 ---
 
@@ -225,7 +235,7 @@ agentic_turn(messages, tools, dispatch_fn, system) -> str
 ```
 
 `make_provider(spec, model, options)` factory:
-- `"anthropic"` → `AnthropicProvider` (checks `ANTHROPIC_API_KEY`, then `auth.json`)
+- `"anthropic"` → `AnthropicProvider` (checks `ANTHROPIC_API_KEY` env var, then `config.anthropic_api_key`)
 - `"ollama"` or model name → `OllamaProvider`
 
 ---
@@ -243,7 +253,8 @@ System prompt loaded from `~/.seshat/system_prompt.md` if present; otherwise the
 | `retrieve_papers` | Search indexed papers | Public only + warning if private matched |
 | `search_notes` | Search vault notes | Public only + warning if private matched |
 | `read_file` | Read one vault file in full (after search identifies it) | Blocks files in `private_vault_dirs` |
-| `add_document` | Add a paper or PDF; two modes (see below) | Any |
+| `add_document` | Add a paper or PDF; requires `doc_type` for local PDFs; two storage modes (see below) | Any |
+| `update_file_path` | Update stored path for a local document without re-embedding | Any |
 | `remove_document` | Two-step remove: preview → confirm; optionally delete local file | Any |
 | `list_papers` | List indexed papers | Any |
 | `kb_stats` | Document and chunk counts | Any |
@@ -256,10 +267,12 @@ The tool exposes two modes; the LLM asks the user which to use if not specified:
 
 | Mode | Flow | Chunks stored | Best for |
 |---|---|---|---|
-| `summary` (default) | abstract/PDF → LLM generates ~1000-word summary → chunk | 1–2 | Most papers — fast, compact |
+| `summary` (default for papers) | abstract/PDF → LLM generates ~1000-word summary → chunk | 1–2 | Most papers — fast, compact |
 | `full_text` | download PDF → marker-pdf → chunk raw Markdown | Many | Papers the user wants to query at paragraph level |
 
-For local PDFs, `visibility` (`"public"` / `"private"`) and an optional `title` override are also accepted.
+Notes (`doc_type="note"`) are **always** stored as `full_text` regardless of what the caller requests.
+
+For local PDFs, `doc_type` (`"paper"` or `"note"`), `visibility` (`"public"` / `"private"`), and an optional `title` override are also accepted.
 
 ### `remove_document` two-step flow
 
@@ -301,8 +314,11 @@ User message → provider.agentic_turn() → tool loop → reply
   read_file                       → privacy check → filesystem read
   add_document (summary mode)     → fetch metadata → provider.summarize() → add_texts()
   add_document (full_text mode)   → download PDF → convert_pdf() → chunk → add_texts()
+  add_document (note, local PDF)  → convert_pdf() in tempdir → chunk → add_texts(); tempdir auto-deleted
+  update_file_path                → update file_path + source URI in all matching chunks; no re-embedding
   remove_document (unconfirmed)   → lookup metadata → return preview
   remove_document (confirmed)     → store.delete() → optionally unlink local file
   index_vault                     → optionally clear notes → refresh_vault()
-  refresh_vault                   → compare hashes → index new/changed, delete removed
+  refresh_vault Phase 1           → compare hashes → index new/changed vault .md, delete removed
+  refresh_vault Phase 2           → check local PDF notes: warn if missing, re-index if hash changed
 ```

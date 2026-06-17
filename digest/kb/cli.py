@@ -104,11 +104,42 @@ def cmd_add(args: argparse.Namespace) -> None:
             print(f"Added (summary): {paper['link']}")
 
     elif Path(input_str).exists() and Path(input_str).suffix.lower() == ".pdf":
-        pdf_path = Path(input_str)
+        pdf_path = Path(input_str).resolve()
         title = args.title or pdf_path.stem
         visibility = args.visibility
+        doc_type = args.doc_type
 
-        if args.full_text:
+        if doc_type == "note":
+            # Notes are always indexed as full text; content_hash tracked for refresh
+            from ..arxiv.convert import convert_pdf
+            import hashlib as _hashlib
+            import tempfile
+            print(f"Converting PDF note to Markdown ({visibility}): {pdf_path.name}...")
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                convert_pdf(pdf_path, tmp_path)
+                md_path = tmp_path / f"{pdf_path.stem}.md"
+                if not md_path.exists():
+                    print("Error: PDF conversion produced no output.", file=sys.stderr)
+                    sys.exit(1)
+                full_text = md_path.read_text(encoding="utf-8")
+            content_hash = _hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+            ids = add_texts(
+                content=full_text,
+                doc_type="note",
+                visibility=visibility,
+                source=pdf_path.as_uri(),
+                extra_metadata={
+                    "title": title,
+                    "file_path": str(pdf_path),
+                    "content_hash": content_hash,
+                    "storage_mode": "full_text",
+                },
+                store=store,
+            )
+            print(f"Added note (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
+
+        elif args.full_text:
             from ..arxiv.convert import convert_pdf
             import tempfile
             print(f"Converting PDF to Markdown ({visibility}): {pdf_path.name}...")
@@ -120,28 +151,27 @@ def cmd_add(args: argparse.Namespace) -> None:
                     print("Error: PDF conversion produced no output.", file=sys.stderr)
                     sys.exit(1)
                 full_text = md_path.read_text(encoding="utf-8")
-            print("Chunking and indexing full text...")
             ids = add_texts(
                 content=full_text,
-                doc_type="pdf",
+                doc_type="paper",
                 visibility=visibility,
-                source=pdf_path.resolve().as_uri(),
+                source=pdf_path.as_uri(),
                 extra_metadata={"title": title, "file_path": str(pdf_path), "storage_mode": "full_text"},
                 store=store,
             )
-            print(f"Added (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
+            print(f"Added paper (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
         else:
             print(f"Generating summary from PDF ({visibility}): {pdf_path.name}...")
             summary = get_provider().summarize(title, pdf_path)
             add_texts(
                 content=f"{title}\n\n{summary}",
-                doc_type="pdf",
+                doc_type="paper",
                 visibility=visibility,
-                source=pdf_path.resolve().as_uri(),
+                source=pdf_path.as_uri(),
                 extra_metadata={"title": title, "file_path": str(pdf_path), "storage_mode": "summary"},
                 store=store,
             )
-            print(f"Added: {pdf_path.name} ({visibility})")
+            print(f"Added paper (summary): {pdf_path.name} ({visibility})")
 
     else:
         print(f"Error: '{input_str}' is not a valid arXiv URL or PDF path.", file=sys.stderr)
@@ -251,8 +281,7 @@ def cmd_stats() -> None:
     total_chunks = count(store)
     papers = count_unique_documents("paper", "source", store)
     notes = count_unique_documents("note", "file_path", store)
-    pdfs = count_unique_documents("pdf", "source", store)
-    print(f"Documents:  {papers} papers · {notes} notes · {pdfs} PDFs")
+    print(f"Documents:  {papers} papers · {notes} notes")
     print(f"Chunks:     {total_chunks} total")
 
 
@@ -418,7 +447,11 @@ def main() -> None:
     p_add.add_argument("--title", default="", help="Override title (for local PDFs)")
     p_add.add_argument(
         "--visibility", default="public", choices=["public", "private"],
-        help="Visibility for local PDFs (papers are always public)",
+        help="Visibility for local PDFs (arXiv papers are always public)",
+    )
+    p_add.add_argument(
+        "--doc-type", default="paper", choices=["paper", "note"], dest="doc_type",
+        help="Type for local PDFs: 'paper' (research paper) or 'note' (always indexed as full text with hash tracking)",
     )
     p_add.add_argument(
         "--provider", default="",
