@@ -196,6 +196,31 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "update_file_path",
+            "description": (
+                "Update the stored file path for a local document (PDF or vault note) "
+                "when the file has been moved or renamed. Updates both the file_path "
+                "metadata and the source URI for all chunks of that document."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Current source URL of the document (file:/// URI). Use list_papers or search to find it.",
+                    },
+                    "new_path": {
+                        "type": "string",
+                        "description": "New filesystem path to the file (absolute or ~ expanded).",
+                    },
+                },
+                "required": ["source", "new_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "index_vault",
             "description": (
                 "Build or rebuild the vault index from scratch. "
@@ -236,6 +261,7 @@ then confirm with the user before calling with confirmed=true.
 - To inspect the knowledge base: use list_papers or kb_stats.
 - To index the vault for the first time or force a rebuild: call index_vault.
 - To pick up recent vault changes: call refresh_vault.
+- To update the path of a moved or renamed local file: call update_file_path with the old source URL and the new path. Use list_papers or search_notes to find the source URL first.
 
 Always include the source URL when discussing a paper.\
 """
@@ -565,6 +591,23 @@ def _kb_stats() -> str:
         return f"[kb_stats error: {exc}]"
 
 
+def _update_file_path(args: dict) -> str:
+    try:
+        from digest.kb.store import get_store, update_file_path
+
+        source = args.get("source", "")
+        new_path = args.get("new_path", "")
+        if not source or not new_path:
+            return "[Error: both source and new_path are required]"
+        n = update_file_path(source, new_path, get_store())
+        if n == 0:
+            return f"No documents found with source: {source}"
+        resolved = str(Path(new_path).expanduser().resolve())
+        return f"Updated {n} chunk(s) — new path: {resolved}"
+    except Exception as exc:
+        return f"[update_file_path error: {exc}]"
+
+
 def _refresh_vault_tool(vault: Path) -> str:
     try:
         from digest.kb.store import get_store, refresh_vault
@@ -626,6 +669,8 @@ def _dispatch_tool(
         return _list_papers(arguments)
     if name == "kb_stats":
         return _kb_stats()
+    if name == "update_file_path":
+        return _update_file_path(arguments)
     if name == "refresh_vault":
         return _refresh_vault_tool(vault)
     if name == "index_vault":

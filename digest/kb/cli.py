@@ -366,6 +366,19 @@ def cmd_index_vault(args: argparse.Namespace) -> None:
     print(f"Done — +{added} new, ~{updated} changed, -{deleted} removed")
 
 
+def cmd_update_path(args: argparse.Namespace) -> None:
+    from .store import get_store, update_file_path
+
+    new_path = Path(args.new_path).expanduser().resolve()
+    if not new_path.exists():
+        print(f"Warning: new path does not exist: {new_path}", file=sys.stderr)
+    n = update_file_path(args.source, str(new_path), get_store())
+    if n == 0:
+        print(f"No documents found with source: {args.source}")
+    else:
+        print(f"Updated {n} chunk(s) — new path: {new_path}")
+
+
 def cmd_refresh_vault(args: argparse.Namespace) -> None:
     from ..config import get_config
     from .store import get_store, refresh_vault
@@ -434,6 +447,11 @@ def main() -> None:
     )
     sub.add_parser("clear", help="Delete all documents (prompts for confirmation)")
 
+    # update-path
+    p_upd = sub.add_parser("update-path", help="Update the file path for a local document")
+    p_upd.add_argument("source", help="Current source URL of the document (file:/// URI or arXiv URL)")
+    p_upd.add_argument("new_path", help="New filesystem path to the file")
+
     # index-vault / refresh-vault
     p_idx = sub.add_parser("index-vault", help="(Re)index the Obsidian vault")
     p_idx.add_argument("--vault-path", default="")
@@ -449,6 +467,7 @@ def main() -> None:
         "stats":         cmd_stats,
         "remove":        lambda: cmd_remove(args),
         "clear":         lambda: cmd_clear(args),
+        "update-path":   lambda: cmd_update_path(args),
         "index-vault":   lambda: cmd_index_vault(args),
         "refresh-vault": lambda: cmd_refresh_vault(args),
     }

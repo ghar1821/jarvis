@@ -289,6 +289,38 @@ def count_unique_documents(
         return 0
 
 
+def update_file_path(source: str, new_path: str, store: Chroma | None = None) -> int:
+    """
+    Update the file_path metadata (and source URI for local files) for all chunks
+    matching the given source. Returns the number of chunks updated.
+    """
+    s = store or get_store()
+    try:
+        result = s._collection.get(
+            where={"source": {"$eq": source}}, include=["metadatas", "documents", "embeddings"]
+        )
+    except Exception as exc:
+        raise RAGError(f"Failed to look up source: {exc}") from exc
+
+    ids = result["ids"]
+    if not ids:
+        return 0
+
+    new_path_str = str(Path(new_path).expanduser().resolve())
+    new_source = Path(new_path_str).as_uri() if source.startswith("file:///") else source
+
+    updated_metadatas = []
+    for meta in result["metadatas"]:
+        updated_metadatas.append({**meta, "file_path": new_path_str, "source": new_source})
+
+    try:
+        s._collection.update(ids=ids, metadatas=updated_metadatas)
+    except Exception as exc:
+        raise RAGError(f"Failed to update metadata: {exc}") from exc
+
+    return len(ids)
+
+
 def list_papers(
     limit: int = 50,
     store: Chroma | None = None,
