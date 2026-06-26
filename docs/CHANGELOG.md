@@ -4,7 +4,24 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — privacy hard stop (PrivacyError); web UI rebuild (FastAPI + SSE); refresh_vault bug fix
+## [current] — knowledge source toggle (DB only / AI fallback)
+
+### Added
+- `USE_OWN_KNOWLEDGE_TOOL` pseudo-tool in `vault_chat/chat.py` — included in the tools list only when AI fallback is enabled. The LLM calls it before drawing on its training knowledge, giving the UI a structured signal to display to the user. Dispatch returns a simple acknowledgement string.
+- `build_system_prompt(kb_only=True)` — replaces the old zero-argument function. Appends one of two addendums to the base prompt: a hard restriction ("answer only from KB tools") when `kb_only=True`, or a preference ("search KB first, call `use_own_knowledge` before using training knowledge") when `kb_only=False`.
+- `run_session(vault, kb_only=True)` — `kb_only` parameter added; selects the correct system prompt and tools list.
+- `vault-chat --no-db-only` flag — enables AI fallback mode from the terminal. Default behaviour (DB only) is unchanged with no flag.
+- `POST /config` endpoint in `webapp/app.py` — accepts `{"kb_only": bool}`; updates session flag and rebuilds the system prompt for subsequent requests.
+- `kb_only: True` added to the webapp session state dict.
+- **DB only toggle** in the web UI input bar — pill toggle, on by default. Fires `POST /config` on change. Label reads "DB only".
+- Amber status badge in the web UI — rendered when the `use_own_knowledge` tool event arrives via SSE, or when replaying history. Shown instead of a collapsible tool-call row.
+
+### Changed
+- `webapp/app.py` `chat()` route: snapshots `kb_only` at request time and passes either `TOOLS` or `TOOLS + [USE_OWN_KNOWLEDGE_TOOL]` to `agentic_turn()`.
+
+---
+
+## [previous] — privacy hard stop (PrivacyError); web UI rebuild (FastAPI + SSE); refresh_vault bug fix
 
 ### Added
 - `PrivacyError(PaperDigestError)` in `digest/errors.py` — raised (not returned as a string) when a cloud provider attempts to access private content

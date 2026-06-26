@@ -261,9 +261,16 @@ agentic_turn(messages, tools, dispatch_fn, system) -> str
 
 ## KB agent — `vault_chat/chat.py`
 
-Single `run_session(vault)` loop using `provider.agentic_turn()`. Every tool call is printed to the terminal (`→ tool_name(args)`) so the user sees each step.
+Single `run_session(vault, kb_only=True)` loop using `provider.agentic_turn()`. Every tool call is printed to the terminal (`→ tool_name(args)`) so the user sees each step.
 
-System prompt loaded from `~/.seshat/system_prompt.md` if present; otherwise the built-in default is used. The vault path has no effect on the system prompt.
+`build_system_prompt(kb_only=True)` loads the base prompt from `~/.seshat/system_prompt.md` if present, otherwise uses the built-in default, then appends a knowledge-source instruction based on `kb_only`.
+
+### Knowledge source modes
+
+| Mode | `kb_only` | System prompt addendum | Tools list | How to enable |
+|---|---|---|---|---|
+| DB only (default) | `True` | LLM forbidden from drawing on training knowledge | `TOOLS` | `vault-chat` (no flag) |
+| AI fallback | `False` | LLM searches KB first; may fall back to training knowledge after calling `use_own_knowledge` | `TOOLS + [USE_OWN_KNOWLEDGE_TOOL]` | `vault-chat --no-db-only` |
 
 ### Tools
 
@@ -278,6 +285,7 @@ System prompt loaded from `~/.seshat/system_prompt.md` if present; otherwise the
 | `list_papers` | List indexed papers | Any |
 | `kb_stats` | Document and chunk counts | Any |
 | `index_vault` | Incremental vault sync (new/changed/deleted files); `force=true` clears vault `.md` index first while preserving PDF notes | Any |
+| `use_own_knowledge` | Pseudo-tool called by the LLM before answering from training knowledge; dispatch returns an acknowledgement string; only included in the tools list when `kb_only=False` | Any |
 
 ### `add_document` storage modes
 
@@ -310,18 +318,40 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 
 **Session state:** a single in-memory dict shared across browser tabs. Appropriate for a local single-user tool.
 
+| Session field | Default | Description |
+|---|---|---|
+| `messages` | `[]` | Full API history passed to the LLM, including internal tool turns |
+| `display` | `[]` | User + assistant turns sent to the browser for rendering |
+| `provider` | set at startup | Active `ChatProvider` instance |
+| `system` | set at startup | Active system prompt string |
+| `kb_only` | `True` | Knowledge source mode; updated by `POST /config` |
+
+**Routes:**
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Serves `index.html` |
+| `GET /info` | Returns `{provider, vault}` for the header |
+| `GET /history` | Returns the display list for page-refresh restore |
+| `POST /chat` | Accepts `{message}`, streams SSE events |
+| `POST /config` | Accepts `{kb_only: bool}`; updates session flag and rebuilds system prompt |
+
 **Request flow:**
 
 ```
 Browser POST /chat
-  → FastAPI spawns a background thread running provider.agentic_turn()
+  → FastAPI snapshots kb_only, builds tools list (TOOLS or TOOLS + [USE_OWN_KNOWLEDGE_TOOL])
+  → spawns a background thread running provider.agentic_turn()
   → thread pushes {type: "tool"} events to a queue as each tool fires
   → async SSE generator drains the queue (50 ms poll) and yields data: lines
   → thread pushes {type: "reply"} event + sentinel when done
 Browser reads the stream via fetch() + ReadableStream
-  → tool events: appended live to an open <details> box
+  → tool events (regular): appended live to an open <details> box
+  → tool event (use_own_knowledge): amber status badge inserted — "No results in database — answering from model training knowledge"
   → reply event: <details> collapses; reply bubble appears
 ```
+
+**DB only toggle:** A pill toggle in the input bar (on by default). Fires `POST /config` on change. When on, `kb_only=True` and the LLM is restricted to KB tools. When off, `kb_only=False` and `USE_OWN_KNOWLEDGE_TOOL` is added to the tools list.
 
 **Why fetch + ReadableStream instead of EventSource:** `EventSource` only supports `GET`; sending the message body requires `POST`.
 

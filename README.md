@@ -120,7 +120,10 @@ All commands require the `uv run` prefix (entry points live in `.venv/bin/`). Al
 uv run vault-chat                           # uses provider from config
 uv run vault-chat ~/path/to/vault           # override vault path
 CHAT_PROVIDER=anthropic uv run vault-chat   # use Anthropic for this session
+uv run vault-chat --no-db-only              # allow AI knowledge fallback when DB has no results
 ```
+
+By default (`--db-only` behaviour), the agent answers only from documents in the knowledge base. Pass `--no-db-only` to allow the LLM to fall back to its training knowledge when the database returns no relevant results — it will call `use_own_knowledge` first to make the fallback visible.
 
 ### Web UI
 
@@ -131,6 +134,8 @@ uv run webapp --provider ollama
 ```
 
 Same agent as `vault-chat`. Tool calls appear live in a collapsible box while the agent is working. Localhost only — not accessible from other machines.
+
+A **DB only** toggle (on by default) restricts the agent to the knowledge base. Switch it off to allow the model to fall back to its training knowledge — an amber status badge appears whenever this happens.
 
 Available tools the agent can call:
 
@@ -145,6 +150,7 @@ Available tools the agent can call:
 | `kb_stats` | Paper, note, and chunk counts |
 | `update_file_path` | Update stored path for a moved or renamed local file |
 | `index_vault` | Incremental vault sync; `force=true` clears vault `.md` index first (PDF notes preserved) |
+| `use_own_knowledge` | Called by the LLM before answering from training knowledge (only available when DB only is off) |
 
 Example interactions:
 

@@ -239,6 +239,23 @@ TOOLS = [
     },
 ]
 
+# The use_own_knowledge tool is only included in the tools list when the
+# kb_only toggle is OFF. It acts as an explicit signal — the LLM must call it
+# before drawing on its training knowledge, giving the UI something concrete
+# to display to the user.
+USE_OWN_KNOWLEDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "use_own_knowledge",
+        "description": (
+            "Call this before answering from your training knowledge, when all "
+            "knowledge base searches returned no relevant results. This signals "
+            "to the user that the answer comes from your training data, not their documents."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 # ── System prompt ──────────────────────────────────────────────────────────────
 
 _DEFAULT_SYSTEM = """\
@@ -262,19 +279,36 @@ then confirm with the user before calling with confirmed=true.
 Always include the source URL when discussing a paper.\
 """
 
+# Appended to the base prompt depending on the knowledge source mode.
+_KB_ONLY_ADDENDUM = (
+    "\nKnowledge source restriction: You MUST answer ONLY from information "
+    "retrieved using the tools above. Do NOT draw on your training knowledge "
+    "to fill gaps or speculate. If the tools return no relevant results, say "
+    "so clearly and stop."
+)
 
-def build_system_prompt() -> str:
+_OWN_KNOWLEDGE_ADDENDUM = (
+    "\nKnowledge source preference: Always search the knowledge base first. "
+    "If all searches return no relevant results, you may draw on your training "
+    "knowledge — but you MUST call use_own_knowledge() first to inform the user "
+    "before doing so."
+)
+
+
+def build_system_prompt(kb_only: bool = True) -> str:
     """
-    Load the agent system prompt.
+    Build the agent system prompt.
 
-    Override by creating ~/.seshat/system_prompt.md.
+    Override the base prompt by creating ~/.seshat/system_prompt.md.
     Falls back to the built-in default.
+
+    kb_only=True  (default): LLM may only answer from KB tool results.
+    kb_only=False: LLM searches KB first, falls back to training knowledge.
     """
     from pathlib import Path as _Path
     override = _Path.home() / ".seshat" / "system_prompt.md"
-    if override.exists():
-        return override.read_text(encoding="utf-8").rstrip()
-    return _DEFAULT_SYSTEM
+    base = override.read_text(encoding="utf-8").rstrip() if override.exists() else _DEFAULT_SYSTEM
+    return base + (_KB_ONLY_ADDENDUM if kb_only else _OWN_KNOWLEDGE_ADDENDUM)
 
 
 # ── Vault helpers ──────────────────────────────────────────────────────────────
@@ -639,6 +673,10 @@ def _update_file_path(args: dict) -> str:
         return f"[update_file_path error: {exc}]"
 
 
+def _use_own_knowledge() -> str:
+    return "Understood. Proceeding to answer from training knowledge."
+
+
 def _index_vault_tool(vault: Path, force: bool = False) -> str:
     try:
         from digest.kb.store import get_store, refresh_vault
@@ -697,6 +735,8 @@ def _dispatch_tool(
         return _update_file_path(arguments)
     if name == "index_vault":
         return _index_vault_tool(vault, bool(arguments.get("force", False)))
+    if name == "use_own_knowledge":
+        return _use_own_knowledge()
     return f"[Error: unknown tool '{name}']"
 
 
@@ -728,10 +768,11 @@ def _auto_refresh_vault(vault: Path) -> None:
 # ── Session ────────────────────────────────────────────────────────────────────
 
 
-def run_session(vault: Path) -> None:
+def run_session(vault: Path, kb_only: bool = True) -> None:
     cfg = get_config()
     provider = make_provider(cfg.provider)
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(kb_only=kb_only)
+    tools = TOOLS if kb_only else TOOLS + [USE_OWN_KNOWLEDGE_TOOL]
     messages: list[dict] = []
 
     provider_label = (
@@ -755,7 +796,7 @@ def run_session(vault: Path) -> None:
         try:
             reply = provider.agentic_turn(
                 messages=messages,
-                tools=TOOLS,
+                tools=tools,
                 dispatch_fn=lambda name, args: _dispatch_tool(
                     name, args, vault, cfg.provider, provider
                 ),
@@ -785,6 +826,13 @@ def main() -> None:
         nargs="?",
         help=f"Path to the vault root (default from config: {cfg.vault_path})",
     )
+    parser.add_argument(
+        "--no-db-only",
+        dest="kb_only",
+        action="store_false",
+        default=True,
+        help="Allow the LLM to fall back to its training knowledge when the database has no results.",
+    )
     args = parser.parse_args()
 
     vault = Path(args.vault).expanduser() if args.vault else cfg.vault_path
@@ -793,7 +841,7 @@ def main() -> None:
         sys.exit(1)
 
     _auto_refresh_vault(vault)
-    run_session(vault)
+    run_session(vault, kb_only=args.kb_only)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from digest.config import get_config
 from digest.errors import LLMError
 from digest.llm import make_provider
-from vault_chat.chat import TOOLS, _auto_refresh_vault, _dispatch_tool, build_system_prompt
+from vault_chat.chat import TOOLS, USE_OWN_KNOWLEDGE_TOOL, _auto_refresh_vault, _dispatch_tool, build_system_prompt
 
 _ROOT = Path(__file__).parent
 cfg = get_config()
@@ -32,11 +32,14 @@ _vault = cfg.vault_path
 # Single-user session — shared across browser tabs (intended for local use only).
 # messages  : full API history passed to the LLM, including internal tool turns
 # display   : user + assistant turns sent to the browser for rendering
+# kb_only   : when True (default), LLM answers only from KB tools; when False,
+#             it may fall back to training knowledge after searching the KB
 _session: dict = {
     "messages": [],
     "display": [],
     "provider": None,
     "system": None,
+    "kb_only": True,
 }
 
 
@@ -45,7 +48,7 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _auto_refresh_vault, _vault)
     _session["provider"] = make_provider(cfg.provider)
-    _session["system"] = build_system_prompt()
+    _session["system"] = build_system_prompt(kb_only=True)
     yield
 
 
@@ -79,11 +82,25 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class ConfigRequest(BaseModel):
+    kb_only: bool
+
+
+@app.post("/config")
+async def config(req: ConfigRequest) -> dict:
+    _session["kb_only"] = req.kb_only
+    _session["system"] = build_system_prompt(kb_only=req.kb_only)
+    return {"kb_only": req.kb_only}
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
     provider = _session["provider"]
     system = _session["system"]
     messages = _session["messages"]
+    # Snapshot kb_only at request time so a mid-stream toggle doesn't change it
+    kb_only = _session["kb_only"]
+    tools = TOOLS if kb_only else TOOLS + [USE_OWN_KNOWLEDGE_TOOL]
 
     messages.append({"role": "user", "content": req.message})
     _session["display"].append({"role": "user", "content": req.message})
@@ -105,7 +122,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         try:
             reply = provider.agentic_turn(
                 messages=messages,
-                tools=TOOLS,
+                tools=tools,
                 dispatch_fn=dispatch_fn,
                 system=system,
             )
