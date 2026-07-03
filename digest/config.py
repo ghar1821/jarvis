@@ -18,9 +18,13 @@ Example ~/.seshat/config.toml:
 
     [rag]
     rag_dir = "~/.seshat/rag"
-    embed_model = "all-MiniLM-L6-v2"
-    chunk_size = 2048
-    chunk_overlap = 256
+    embed_model = "BAAI/bge-small-en-v1.5"
+    # Query-side instruction prefix for BGE-style models; "" to disable
+    query_prefix = "Represent this sentence for searching relevant passages: "
+    chunk_size = 1024
+    chunk_overlap = 128
+    rerank_model = "cross-encoder/ms-marco-MiniLM-L6-v2"   # "" to disable re-ranking
+    rerank_top_n = 25
 
     [chat]
     provider = "ollama"          # "ollama" | "anthropic"
@@ -58,9 +62,16 @@ class Config:
 
     # ── RAG ───────────────────────────────────────────────────────────────────
     rag_dir: Path = field(default_factory=lambda: Path("~/.seshat/rag").expanduser())
-    embed_model: str = "all-MiniLM-L6-v2"
-    chunk_size: int = 2048
-    chunk_overlap: int = 256
+    embed_model: str = "BAAI/bge-small-en-v1.5"
+    # Instruction prepended to queries (not documents) before embedding. BGE-style
+    # models are trained with this asymmetric prefix; empty string disables it.
+    query_prefix: str = "Represent this sentence for searching relevant passages: "
+    chunk_size: int = 1024
+    chunk_overlap: int = 128
+    # Cross-encoder that re-ranks the top rerank_top_n candidates down to the
+    # requested number of results. Empty string disables re-ranking.
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
+    rerank_top_n: int = 25
 
     # ── Chat ──────────────────────────────────────────────────────────────────
     provider: str = "ollama"  # "ollama" | "anthropic"
@@ -97,10 +108,16 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             cfg.rag_dir = Path(str(r["rag_dir"])).expanduser()
         if "embed_model" in r:
             cfg.embed_model = str(r["embed_model"])
+        if "query_prefix" in r:
+            cfg.query_prefix = str(r["query_prefix"])
         if "chunk_size" in r:
             cfg.chunk_size = int(r["chunk_size"])
         if "chunk_overlap" in r:
             cfg.chunk_overlap = int(r["chunk_overlap"])
+        if "rerank_model" in r:
+            cfg.rerank_model = str(r["rerank_model"])
+        if "rerank_top_n" in r:
+            cfg.rerank_top_n = int(r["rerank_top_n"])
 
         c = data.get("chat", {})
         if "provider" in c:

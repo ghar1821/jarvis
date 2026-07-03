@@ -19,6 +19,8 @@ Document schema
     track       : str  — research track label, papers only (optional)
     file_path   : str  — vault-relative path, notes/PDFs only (optional)
     content_hash: str  — SHA-256 of full file, used for change detection
+    chunk_index : int  — position of this chunk within its source document
+    section     : str  — markdown header breadcrumb ("H1 › H2"), "" if none
 
 Privacy model
 -------------
@@ -39,7 +41,11 @@ from pathlib import Path
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
+from sentence_transformers import CrossEncoder
 
 from ..config import get_config
 from ..errors import RAGError
@@ -47,18 +53,53 @@ from ..errors import RAGError
 COLLECTION_NAME = "knowledge_base"
 
 _embeddings: HuggingFaceEmbeddings | None = None
+_reranker: CrossEncoder | None = None
 _store: Chroma | None = None
 
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
 
+def build_embeddings(model_name: str, query_prefix: str = "") -> HuggingFaceEmbeddings:
+    """
+    Construct a HuggingFace embedding model.
+
+    Embeddings are L2-normalised so cosine similarity and inner product agree.
+    When query_prefix is set (BGE-style models are trained with an asymmetric
+    instruction prefix), it is prepended to queries only — never to documents.
+    """
+    query_encode_kwargs = {"normalize_embeddings": True}
+    if query_prefix:
+        query_encode_kwargs["prompt"] = query_prefix
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        encode_kwargs={"normalize_embeddings": True},
+        query_encode_kwargs=query_encode_kwargs,
+    )
+
+
 def _get_embeddings() -> HuggingFaceEmbeddings:
     global _embeddings
     if _embeddings is None:
+        cfg = get_config()
         print("Loading embedding model...", flush=True)
-        _embeddings = HuggingFaceEmbeddings(model_name=get_config().embed_model)
+        _embeddings = build_embeddings(cfg.embed_model, cfg.query_prefix)
     return _embeddings
+
+
+def _get_reranker() -> CrossEncoder | None:
+    """
+    Return the cross-encoder used to re-rank search candidates, or None when
+    re-ranking is disabled (empty rerank_model in config).
+    """
+    global _reranker
+    cfg = get_config()
+    if not cfg.rerank_model:
+        return None
+    if _reranker is None:
+        print("Loading reranker...", flush=True)
+        _reranker = CrossEncoder(cfg.rerank_model)
+    return _reranker
 
 
 def get_store(rag_dir: Path | None = None) -> Chroma:
@@ -67,12 +108,39 @@ def get_store(rag_dir: Path | None = None) -> Chroma:
     if _store is None:
         d = rag_dir or get_config().rag_dir
         d.mkdir(parents=True, exist_ok=True)
+        cfg = get_config()
         _store = Chroma(
             collection_name=COLLECTION_NAME,
             embedding_function=_get_embeddings(),
             persist_directory=str(d),
+            collection_metadata={
+                "embed_model": cfg.embed_model,
+                "query_prefix": cfg.query_prefix,
+            },
         )
+        _check_embedding_model_matches(_store, cfg.embed_model)
     return _store
+
+
+def _check_embedding_model_matches(store: Chroma, embed_model: str) -> None:
+    """
+    Guard against silently mixing embedding spaces.
+
+    Chroma records collection_metadata only when the collection is first
+    created, so a collection built with a different model keeps its original
+    embed_model tag. If a non-empty collection was built with a different model
+    than the config now names, retrieval would compare vectors from two
+    incompatible spaces and return garbage — so we fail loudly instead.
+    """
+    if store._collection.count() == 0:
+        return
+    recorded = (store._collection.metadata or {}).get("embed_model")
+    if recorded != embed_model:
+        raise RAGError(
+            f"Embedding model mismatch: the knowledge base was built with "
+            f"'{recorded or 'unknown'}' but config specifies '{embed_model}'. "
+            f"Run 'uv run kb reindex' to re-embed the knowledge base with the new model."
+        )
 
 
 def _splitter() -> RecursiveCharacterTextSplitter:
@@ -81,6 +149,41 @@ def _splitter() -> RecursiveCharacterTextSplitter:
         chunk_size=cfg.chunk_size,
         chunk_overlap=cfg.chunk_overlap,
     )
+
+
+# Headers we split markdown on, paired with the metadata key each level is stored under.
+_MARKDOWN_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3")]
+
+
+def _split_markdown(content: str) -> list[tuple[str, str]]:
+    """
+    Split content into chunks that respect markdown section boundaries.
+
+    First break the text on markdown headers, then split each section further
+    with the recursive character splitter so long sections still obey the chunk
+    size. Every chunk is paired with a breadcrumb of the headers above it, e.g.
+    "CRISPR screens › Results", so a chunk carries the context of where it came
+    from. Content with no headers (such as paper summaries) passes through as a
+    single section with an empty breadcrumb — behaviour identical to before.
+
+    Returns a list of (chunk_text, breadcrumb) pairs.
+    """
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=_MARKDOWN_HEADERS,
+        strip_headers=False,
+    )
+    sections = header_splitter.split_text(content)
+
+    recursive = _splitter()
+    chunks: list[tuple[str, str]] = []
+    for section in sections:
+        # Build a "H1 › H2 › H3" breadcrumb from whichever header levels are present.
+        breadcrumb = " › ".join(
+            section.metadata[key] for _, key in _MARKDOWN_HEADERS if key in section.metadata
+        )
+        for chunk_text in recursive.split_text(section.page_content):
+            chunks.append((chunk_text, breadcrumb))
+    return chunks
 
 
 # ── Core write operations ─────────────────────────────────────────────────────
@@ -95,17 +198,25 @@ def add_texts(
     store: Chroma | None = None,
 ) -> list[str]:
     """Chunk content and add all chunks to the knowledge base. Returns chunk IDs."""
-    chunks = _splitter().split_text(content)
+    chunks = _split_markdown(content)
     if not chunks:
         return []
-    metadata = {
+    base_metadata = {
         "date_added": datetime.now(timezone.utc).isoformat(),
         "doc_type": doc_type,
         "visibility": visibility,
         "source": source,
         **(extra_metadata or {}),
     }
-    documents = [Document(page_content=chunk, metadata=metadata) for chunk in chunks]
+    # Each chunk gets its own metadata dict (never a shared reference) carrying
+    # its position and section breadcrumb. When a chunk sits under a heading, we
+    # also prepend the breadcrumb to the embedded text so a search for the note
+    # topic plus the section topic can match the chunk.
+    documents = []
+    for index, (chunk_text, breadcrumb) in enumerate(chunks):
+        metadata = {**base_metadata, "chunk_index": index, "section": breadcrumb}
+        page_content = f"{breadcrumb}\n{chunk_text}" if breadcrumb else chunk_text
+        documents.append(Document(page_content=page_content, metadata=metadata))
     s = store or get_store()
     try:
         return s.add_documents(documents)
@@ -206,8 +317,19 @@ def search(
     visibility: str | None = None,
     doc_type: str | None = None,
     store: Chroma | None = None,
+    rerank: bool = True,
 ) -> list[Document]:
-    """Semantic search with optional metadata filters."""
+    """
+    Semantic search with optional metadata filters.
+
+    When a reranker is configured and rerank=True, this fetches a wider pool of
+    candidates (rerank_top_n) with the embedding model, then re-orders them with
+    a cross-encoder and returns the top n_results. The cross-encoder scores each
+    (query, chunk) pair jointly, which is far more accurate than the bi-encoder's
+    independent embeddings — the right chunk is much more likely to land in the
+    top few. Filters are applied by ChromaDB before re-ranking, so re-ranking
+    never widens visibility.
+    """
     s = store or get_store()
     conditions = []
     if visibility:
@@ -221,10 +343,20 @@ def search(
     elif len(conditions) > 1:
         filter_dict = {"$and": conditions}
 
+    reranker = _get_reranker() if rerank else None
+    fetch_k = max(n_results, get_config().rerank_top_n) if reranker else n_results
+
     try:
-        return s.similarity_search(query, k=n_results, filter=filter_dict)
+        candidates = s.similarity_search(query, k=fetch_k, filter=filter_dict)
     except Exception as exc:
         raise RAGError(f"Search failed: {exc}") from exc
+
+    if reranker is None or len(candidates) <= n_results:
+        return candidates[:n_results]
+
+    scores = reranker.predict([(query, doc.page_content) for doc in candidates])
+    ranked = [doc for _, doc in sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)]
+    return ranked[:n_results]
 
 
 def search_with_privacy_check(
@@ -253,8 +385,9 @@ def search_with_privacy_check(
         results = search(query, n_results=n_results, visibility="public",
                          doc_type=doc_type, store=s)
         try:
+            # A cheap existence probe — order doesn't matter, so skip re-ranking.
             private_check = search(query, n_results=1, visibility="private",
-                                   doc_type=doc_type, store=s)
+                                   doc_type=doc_type, store=s, rerank=False)
             has_private = len(private_check) > 0
         except RAGError:
             has_private = False

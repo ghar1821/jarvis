@@ -21,11 +21,16 @@ Sections
 7. refresh_vault             — incremental vault sync (add / update / delete / PDF notes)
 """
 
+import uuid
 from pathlib import Path
 
 import pytest
+from langchain_chroma import Chroma
 
+from digest.config import Config
+from digest.errors import RAGError
 from digest.kb.store import (
+    _check_embedding_model_matches,
     add_paper,
     add_texts,
     count,
@@ -36,6 +41,9 @@ from digest.kb.store import (
     search_with_privacy_check,
     update_file_path,
 )
+
+# Same gitignored store directory the shared fixtures use (see conftest.py).
+TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -418,3 +426,139 @@ def test_refresh_vault_preserves_pdf_notes(tmp_path, store):
     )
     stored_paths = [m.get("file_path", "") for m in result["metadatas"]]
     assert str(fake_pdf) in stored_paths
+
+
+# ── 8. Embedding-model guard ────────────────────────────────────────────────────
+
+def _tagged_store(embeddings, embed_model_tag: str) -> Chroma:
+    """A fresh isolated collection tagged with a given embed_model in its metadata."""
+    TEST_CHROMA_DIR.mkdir(exist_ok=True)
+    return Chroma(
+        collection_name=f"test_{uuid.uuid4().hex[:8]}",
+        embedding_function=embeddings,
+        persist_directory=str(TEST_CHROMA_DIR),
+        collection_metadata={"embed_model": embed_model_tag},
+    )
+
+
+def test_embedding_guard_raises_on_model_mismatch(embeddings):
+    """
+    A non-empty collection built with one embedding model must not be searched
+    with a different model — the vectors live in incompatible spaces. The guard
+    raises RAGError so the mismatch fails loudly instead of returning garbage.
+    """
+    store = _tagged_store(embeddings, "some-old-model")
+    add_texts(content="Attention mechanisms weight input tokens.", doc_type="note",
+              visibility="public", source="d1", store=store)
+    try:
+        with pytest.raises(RAGError):
+            _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")
+    finally:
+        store.delete_collection()
+
+
+def test_embedding_guard_allows_matching_model(embeddings):
+    """A collection tagged with the model in use passes the guard silently."""
+    store = _tagged_store(embeddings, "BAAI/bge-small-en-v1.5")
+    add_texts(content="Attention mechanisms weight input tokens.", doc_type="note",
+              visibility="public", source="d1", store=store)
+    try:
+        _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")  # no raise
+    finally:
+        store.delete_collection()
+
+
+def test_embedding_guard_ignores_empty_collection(embeddings):
+    """An empty collection has no vectors to be incompatible, so the guard is a no-op."""
+    store = _tagged_store(embeddings, "some-old-model")
+    try:
+        _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")  # no raise
+    finally:
+        store.delete_collection()
+
+
+# ── 9. Re-ranking ────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def rerank_on(monkeypatch):
+    """Force default retrieval config (re-ranking enabled) regardless of ~/.seshat/config.toml."""
+    monkeypatch.setattr("digest.kb.store.get_config", lambda: Config())
+
+
+def test_reranked_search_still_excludes_private_docs(store, rerank_on):
+    """
+    Re-ranking runs after the ChromaDB visibility filter, so it must never
+    surface a private document — the privacy invariant holds through the
+    re-rank path just as it does for plain similarity search.
+    """
+    content = "Backpropagation computes gradients through the chain rule."
+    add_texts(content=content, doc_type="note", visibility="public",
+              source="pub-rr", store=store)
+    add_texts(content=content, doc_type="note", visibility="private",
+              source="priv-rr", store=store)
+
+    results = search("backpropagation chain rule gradients", n_results=10,
+                     visibility="public", store=store)
+    sources = {doc.metadata["source"] for doc in results}
+    assert "pub-rr" in sources
+    assert "priv-rr" not in sources
+
+
+def test_search_rerank_false_skips_reranker(store, monkeypatch):
+    """
+    rerank=False must return plain similarity results without invoking the
+    cross-encoder at all (used for the cheap private-existence probe).
+    """
+    def fail_if_called():
+        raise AssertionError("reranker must not be loaded when rerank=False")
+
+    monkeypatch.setattr("digest.kb.store._get_reranker", fail_if_called)
+    add_texts(content="Recurrent networks process sequences step by step.",
+              doc_type="note", visibility="public", source="seq", store=store)
+    results = search("recurrent sequence model", n_results=3, store=store, rerank=False)
+    assert any(doc.metadata["source"] == "seq" for doc in results)
+
+
+# ── 10. Chunk metadata ─────────────────────────────────────────────────────────
+
+def test_chunks_get_distinct_index_and_section_breadcrumb(store):
+    """
+    Markdown-aware chunking gives every chunk its own metadata: a monotonic
+    chunk_index (proving the metadata dict is not shared by reference across
+    chunks) and a section breadcrumb built from the markdown headers above it.
+    """
+    content = (
+        "# Research log\n\n"
+        "## Methods\nWe designed a guide RNA library targeting 500 genes.\n\n"
+        "## Results\nTwelve genes reduced proliferation when knocked out.\n"
+    )
+    add_texts(content=content, doc_type="note", visibility="public",
+              source="note-sections", store=store)
+
+    stored = store._collection.get(
+        where={"source": {"$eq": "note-sections"}}, include=["metadatas"]
+    )
+    metadatas = stored["metadatas"]
+    indices = sorted(m["chunk_index"] for m in metadatas)
+    assert indices == list(range(len(metadatas)))  # 0..n-1, all distinct
+
+    sections = " ".join(m["section"] for m in metadatas)
+    assert "Methods" in sections
+    assert "Results" in sections
+
+
+def test_headerless_content_has_empty_section_and_no_breadcrumb(store):
+    """
+    Content without markdown headers (e.g. a paper summary) passes through as a
+    single unlabelled chunk — empty section, and no breadcrumb prepended to the
+    embedded text.
+    """
+    add_texts(content="Plain prose with no markdown headers whatsoever.",
+              doc_type="note", visibility="public", source="plain", store=store)
+
+    stored = store._collection.get(
+        where={"source": {"$eq": "plain"}}, include=["metadatas", "documents"]
+    )
+    assert stored["metadatas"][0]["section"] == ""
+    assert stored["metadatas"][0]["chunk_index"] == 0
+    assert stored["documents"][0].startswith("Plain prose")

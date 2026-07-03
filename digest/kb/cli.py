@@ -13,6 +13,7 @@ Subcommands:
   clear             Delete all documents (prompts for confirmation)
 
   index-vault       Incrementally update vault index; --force clears first
+  reindex           Re-embed all chunks with the configured embed_model
 
 Usage examples:
   uv run kb add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
@@ -23,6 +24,7 @@ Usage examples:
   uv run kb remove https://arxiv.org/abs/2301.07041
   uv run kb index-vault
   uv run kb index-vault --force
+  uv run kb reindex
 """
 
 import argparse
@@ -400,6 +402,73 @@ def cmd_index_vault(args: argparse.Namespace) -> None:
     print(f"Done — +{added} new, ~{updated} changed, -{deleted} removed")
 
 
+def cmd_reindex(args: argparse.Namespace) -> None:
+    """
+    Re-embed every stored chunk with the currently configured embedding model.
+
+    The chunk texts are already stored in ChromaDB, so this needs no LLM calls
+    and no re-summarising or re-downloading — it only recomputes vectors. Used
+    after changing embed_model / query_prefix. Work happens in a temporary
+    collection that is swapped in only once fully built, so an interrupted run
+    never leaves the knowledge base half-migrated.
+    """
+    import chromadb
+
+    from ..config import get_config
+    from .store import COLLECTION_NAME, build_embeddings
+
+    cfg = get_config()
+    reindex_name = f"{COLLECTION_NAME}_reindex"
+
+    # Read the old collection directly, bypassing get_store()'s model-mismatch
+    # guard — the mismatch is exactly what we are here to resolve.
+    client = chromadb.PersistentClient(path=str(cfg.rag_dir))
+    try:
+        old_collection = client.get_collection(COLLECTION_NAME)
+    except Exception:
+        print(f"No '{COLLECTION_NAME}' collection found — nothing to reindex.")
+        return
+
+    stored = old_collection.get(include=["documents", "metadatas"])
+    ids = stored["ids"]
+    documents = stored["documents"]
+    metadatas = stored["metadatas"]
+    if not ids:
+        print("Knowledge base is empty — nothing to reindex.")
+        return
+
+    print(f"Reindexing {len(ids)} chunks with '{cfg.embed_model}'...", flush=True)
+    embeddings = build_embeddings(cfg.embed_model, cfg.query_prefix)
+
+    # Start from a clean temp collection in case a previous run was interrupted.
+    try:
+        client.delete_collection(reindex_name)
+    except Exception:
+        pass
+    new_collection = client.create_collection(
+        reindex_name,
+        metadata={"embed_model": cfg.embed_model, "query_prefix": cfg.query_prefix},
+    )
+
+    batch_size = 100
+    for start in range(0, len(ids), batch_size):
+        end = start + batch_size
+        batch_docs = documents[start:end]
+        vectors = embeddings.embed_documents(batch_docs)
+        new_collection.add(
+            ids=ids[start:end],
+            documents=batch_docs,
+            metadatas=metadatas[start:end],
+            embeddings=vectors,
+        )
+        print(f"  {min(end, len(ids))}/{len(ids)} chunks", flush=True)
+
+    # Swap: drop the old collection, then rename the rebuilt one into its place.
+    client.delete_collection(COLLECTION_NAME)
+    new_collection.modify(name=COLLECTION_NAME)
+    print(f"Done — reindexed {len(ids)} chunks with '{cfg.embed_model}'.")
+
+
 def cmd_update_path(args: argparse.Namespace) -> None:
     from .store import get_store, update_file_path
 
@@ -478,6 +547,9 @@ def main() -> None:
     p_idx.add_argument("--vault-path", default="")
     p_idx.add_argument("--force", action="store_true", help="Clear existing vault .md index first (preserves PDF notes)")
 
+    # reindex
+    sub.add_parser("reindex", help="Re-embed all chunks with the configured embed_model (no LLM calls)")
+
     args = parser.parse_args()
     dispatch = {
         "add":         lambda: cmd_add(args),
@@ -488,6 +560,7 @@ def main() -> None:
         "clear":       lambda: cmd_clear(args),
         "update-path": lambda: cmd_update_path(args),
         "index-vault": lambda: cmd_index_vault(args),
+        "reindex":     lambda: cmd_reindex(args),
     }
     dispatch[args.command]()
 

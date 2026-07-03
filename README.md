@@ -18,6 +18,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture documentation.
 **Personal knowledge base**
 - Stores papers as LLM-generated summaries (~1000 words) or as full chunked text for deep querying
 - Indexes your Obsidian vault notes alongside papers in a single local vector store (runs entirely on your machine)
+- Retrieval combines BGE embeddings, section-aware chunking, and a cross-encoder reranker for accurate matches — all local, no external calls
 - Privacy model: vault folders marked private are accessible to the local model only — never sent to cloud APIs
 
 **Conversational agent (`vault-chat` and web UI)**
@@ -67,6 +68,8 @@ uv sync
 
 Requires [Ollama](https://ollama.com) running locally with the configured model pulled (default: `gemma4:26b`).
 
+**Upgrading an existing knowledge base:** the default embedding model is now `BAAI/bge-small-en-v1.5`. Run `uv run kb reindex` once to re-embed your existing chunks — the app refuses to search a knowledge base built with a different embedding model until you do. This re-embeds stored chunk text only (no LLM calls, nothing re-downloaded). To also benefit from the newer section-aware chunking, run `uv run kb index-vault --force` for vault notes.
+
 ---
 
 ## Configuration
@@ -81,6 +84,12 @@ max_results = 10
 
 [rag]
 rag_dir = "~/.seshat/rag"
+embed_model = "BAAI/bge-small-en-v1.5"                                      # changing it requires `kb reindex`
+query_prefix = "Represent this sentence for searching relevant passages: " # query-side prefix for BGE models; "" to disable
+chunk_size = 1024
+chunk_overlap = 128
+rerank_model = "cross-encoder/ms-marco-MiniLM-L6-v2"                        # cross-encoder reranker; "" to disable
+rerank_top_n = 25                                                          # candidates fetched before re-ranking
 
 [chat]
 provider = "ollama"              # "ollama" | "anthropic"
@@ -181,6 +190,10 @@ For scripted use, batch imports, and initial setup.
 # Vault indexing (incremental by default; --force clears vault .md index first)
 uv run kb index-vault
 uv run kb index-vault --vault-path ~/path/to/vault --force
+
+# Re-embed all chunks with the configured embed_model (no LLM calls).
+# Run once after upgrading or after changing embed_model / query_prefix.
+uv run kb reindex
 
 # Add a paper by arXiv URL
 uv run kb add https://arxiv.org/abs/2406.04093

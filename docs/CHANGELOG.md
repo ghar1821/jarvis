@@ -4,7 +4,34 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — knowledge source toggle (DB only / AI fallback)
+## [current] — retrieval accuracy: BGE embeddings, cross-encoder re-ranking, section-aware chunking
+
+Improves document-retrieval accuracy using techniques from the LlamaIndex playbook, implemented with the existing LangChain + sentence-transformers stack (no new dependencies, no framework migration). See `docs/DESIGN.md` → "Retrieval pipeline" and "Deferred retrieval improvements".
+
+### Added
+- **Cross-encoder re-ranking** in `search()` (`digest/kb/store.py`) — fetches the top `rerank_top_n` (default 25) dense candidates, then re-orders them with a local cross-encoder (`rerank_model`, default `cross-encoder/ms-marco-MiniLM-L6-v2`) and returns the top `n_results`. New `rerank: bool = True` parameter; the private-existence probe in `search_with_privacy_check()` passes `rerank=False`. Re-ranking runs after the visibility filter, so the privacy invariant is unchanged. `_get_reranker()` lazily loads the model (a singleton, like `_get_embeddings()`); `rerank_model = ""` disables it.
+- **Section-aware chunking** — `add_texts()` now splits on markdown headers (`MarkdownHeaderTextSplitter`) before the recursive size split via the new `_split_markdown()` helper. Each chunk records `chunk_index` and a `section` breadcrumb (e.g. `"CRISPR screens › Results"`), and the breadcrumb is prepended to the embedded text. Headerless content (paper summaries) is unaffected.
+- **Embedding-model guard** — `get_store()` tags the collection with `embed_model` and calls `_check_embedding_model_matches()`, which raises `RAGError` when a non-empty collection's model tag differs from config (or is absent, as in pre-upgrade collections). Fails loudly instead of silently mixing embedding spaces.
+- **`kb reindex` command** (`digest/kb/cli.py` `cmd_reindex`) — re-embeds every stored chunk with the configured `embed_model` into a temporary collection, then swaps it in atomically. No LLM calls or re-summarising: chunk texts are already stored. This is the fix the guard points users to.
+- **`build_embeddings(model_name, query_prefix)`** helper in `store.py` — L2-normalised embeddings with an optional query-side instruction prefix; shared by production and the test fixtures.
+- **Config fields** (`digest/config.py`, `[rag]`): `query_prefix`, `rerank_model`, `rerank_top_n`.
+- **`tests/test_retrieval_quality.py`** — a golden-set benchmark (paper summaries + markdown notes, ~22 queries) reporting hit-rate@5 and MRR@5, so retrieval changes are measurable and regressions are caught. Runs as a normal unit test (local cached models only).
+
+### Changed
+- **Default embedding model**: `all-MiniLM-L6-v2` → `BAAI/bge-small-en-v1.5` (same 384 dims, stronger retrieval; needs a query-side prefix, now set via `query_prefix`).
+- **Default chunk size / overlap**: `2048/256` → `1024/128` (smaller chunks fit the cross-encoder's window better and give finer-grained matches).
+- `tests/conftest.py` — the `embeddings` fixture now builds via `build_embeddings()` from the default config, so tests exercise the real query prefix and normalisation.
+
+### Migration
+- **Existing installs must run `uv run kb reindex` once after upgrading.** The embedding-model guard fires on any pre-upgrade collection (it has no `embed_model` tag), and the default model changed — `reindex` re-embeds with the configured model and writes the tag. To adopt `bge-small`, remove any `embed_model` pin from `~/.seshat/config.toml` (or set it to `BAAI/bge-small-en-v1.5`) before reindexing.
+- **Re-chunking** (to benefit from section-aware chunking / smaller chunks) is separate: run `uv run kb index-vault --force` for vault notes. Summary-mode papers (1–2 chunks) are unaffected; full-text papers keep their existing chunk boundaries until re-added (`kb remove` + `kb add --full-text`). `kb reindex` deliberately does not re-chunk — it only re-embeds existing chunk texts.
+
+### Dependencies
+- No new packages. The cross-encoder uses `sentence-transformers` (already required) and markdown splitting uses `langchain-text-splitters` (already required).
+
+---
+
+## [previous] — knowledge source toggle (DB only / AI fallback)
 
 ### Added
 - `USE_OWN_KNOWLEDGE_TOOL` pseudo-tool in `vault_chat/chat.py` — included in the tools list only when AI fallback is enabled. The LLM calls it before drawing on its training knowledge, giving the UI a structured signal to display to the user. Dispatch returns a simple acknowledgement string.

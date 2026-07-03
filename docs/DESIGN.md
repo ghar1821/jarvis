@@ -80,9 +80,9 @@ A personal research tool that:
 |---|---|
 | `langchain-chroma` | LangChain wrapper over ChromaDB vector store |
 | `langchain-huggingface` | HuggingFace embeddings via LangChain |
-| `langchain-text-splitters` | `RecursiveCharacterTextSplitter` for document chunking |
+| `langchain-text-splitters` | `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter` for section-aware chunking |
 | `chromadb` | Underlying persistent vector store (SQLite + HNSW) |
-| `sentence-transformers` | Local embedding model (`all-MiniLM-L6-v2`) |
+| `sentence-transformers` | Local embedding model (`BAAI/bge-small-en-v1.5`) and cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L6-v2`) |
 | `anthropic` | Anthropic Claude API client |
 | `ollama` | Local Ollama LLM client |
 | `marker-pdf` | High-quality PDF-to-Markdown conversion for scientific papers |
@@ -128,9 +128,12 @@ Resolution order (later wins): defaults → `~/.seshat/config.toml` → env vars
 | `max_results` | `10` | — | Max papers per digest |
 | `arxiv_cats` | 6 categories | — | `[(category, limit), ...]` |
 | `rag_dir` | `~/.seshat/rag` | — | ChromaDB storage path |
-| `embed_model` | `all-MiniLM-L6-v2` | — | Embedding model |
-| `chunk_size` | `2048` | — | Characters per chunk |
-| `chunk_overlap` | `256` | — | Overlap between chunks |
+| `embed_model` | `BAAI/bge-small-en-v1.5` | — | Embedding model (changing it requires `kb reindex`) |
+| `query_prefix` | BGE search instruction | — | Prepended to queries only (BGE-style asymmetric prefix); `""` disables |
+| `chunk_size` | `1024` | — | Characters per chunk |
+| `chunk_overlap` | `128` | — | Overlap between chunks |
+| `rerank_model` | `cross-encoder/ms-marco-MiniLM-L6-v2` | — | Cross-encoder reranker; `""` disables re-ranking |
+| `rerank_top_n` | `25` | — | Candidates fetched before re-ranking down to `n_results` |
 | `provider` | `ollama` | `CHAT_PROVIDER` | Active LLM provider |
 | `vault_path` | `~/vault` | `VAULT_PATH` | Obsidian vault root |
 | `private_vault_dirs` | `["private"]` | — | Vault folders treated as private |
@@ -159,6 +162,8 @@ metadata:
   storage_mode: str  — "summary" | "full_text"
   file_path   : str  — vault-relative path for .md notes; absolute path for local PDF notes
   content_hash: str  — SHA-256 for change detection (notes; also local PDF papers in full_text mode)
+  chunk_index : int  — 0-based position of this chunk within its source document
+  section     : str  — markdown header breadcrumb ("H1 › H2"); "" when the chunk has no heading
 ```
 
 **`doc_type` rules:**
@@ -185,11 +190,12 @@ Files under `private_vault_dirs` folders → `"private"`. All papers → `"publi
 
 | Function | Description |
 |---|---|
-| `get_store()` | Process-wide Chroma singleton |
+| `get_store()` | Process-wide Chroma singleton; tags the collection with `embed_model` and enforces the mismatch guard |
+| `build_embeddings(model_name, query_prefix)` | Construct a normalised HuggingFace embedding model with an optional query-side prefix |
 | `add_paper(paper, summary, score, track)` | Add paper; idempotent by source URL |
 | `add_papers_batch(entries)` | Batch add from digest; no extra LLM call |
-| `add_texts(content, doc_type, visibility, source, ...)` | Low-level chunk and add |
-| `search(query, n_results, visibility, doc_type)` | Semantic search with filters |
+| `add_texts(content, doc_type, visibility, source, ...)` | Low-level: section-aware chunk and add |
+| `search(query, n_results, visibility, doc_type, rerank=True)` | Semantic search with filters, then optional cross-encoder re-ranking |
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
 | `count()` · `count_unique_documents()` · `list_papers()` | Inspection |
@@ -197,6 +203,25 @@ Files under `private_vault_dirs` folders → `"private"`. All papers → `"publi
 | `get_visibility(file_path, vault_root)` | Derive visibility from folder path |
 | `index_vault_file(file_path, vault_root)` | Chunk and index one vault file |
 | `refresh_vault(vault_root)` | Incremental sync (Phase 1: vault `.md` files; Phase 2: local PDF notes); returns `(added, updated, deleted)` |
+
+### Retrieval pipeline
+
+A query flows through three stages, all local — no data leaves the machine:
+
+1. **Chunking (index time).** `add_texts` splits content on markdown headers (`MarkdownHeaderTextSplitter`) and then by size (`RecursiveCharacterTextSplitter`). Each chunk stores its `chunk_index` and a `section` breadcrumb, and the breadcrumb is prepended to the embedded text so a query naming both the document topic and a section can match. Headerless content (paper summaries) passes through unchanged as a single unlabelled chunk.
+2. **Dense retrieval.** The query is embedded with a BGE-style model (`embed_model`), prefixed by `query_prefix` on the query side only. ChromaDB returns the top `rerank_top_n` candidates after applying the `visibility`/`doc_type` metadata filters.
+3. **Re-ranking.** A cross-encoder (`rerank_model`) scores each `(query, chunk)` pair jointly and reorders the candidates, returning the top `n_results`. Re-ranking is far more accurate than the bi-encoder's independent embeddings at deciding which chunk is actually most relevant. It runs **after** the visibility filter, so it never widens what a cloud provider can see; set `rerank_model = ""` to disable it.
+
+**Embedding-model guard.** ChromaDB records `embed_model` in the collection metadata when the collection is first created. `get_store()` compares that tag against the configured model and raises `RAGError` on any mismatch — including legacy collections created before the tag existed. This prevents silently comparing vectors from two incompatible embedding spaces. The fix is always `uv run kb reindex`, which re-embeds every stored chunk (no LLM calls, chunk texts are already stored) into a fresh collection and swaps it in atomically.
+
+### Deferred retrieval improvements
+
+These were designed but intentionally not built, to keep the retrieval stack simple. Each has a concrete trigger for revisiting so the decision has a paper trail. The `tests/test_retrieval_quality.py` golden set is the instrument that makes the triggers observable — its acronym/proper-noun queries (`LoRA`, `BERT`, `Dr. Tanaka`) are the sentinel for the keyword-recall gap.
+
+- **Hybrid BM25 + reciprocal-rank fusion.** *Trigger:* the golden set's acronym/proper-noun queries regress after the current pipeline. *Sketch:* add `rank-bm25`; build a BM25 index **per query** over the pre-filtered ChromaDB candidate set (`_collection.get(where=filter_dict, ...)`) so the visibility filter is applied before the sparse index exists — privacy holds by construction; fuse dense + sparse rankings with a ~15-line RRF helper (`c=60`, identity by chunk id) and feed the result to the existing reranker; gate behind a single `hybrid: bool` config flag. No index-sync problem at this corpus size (rebuild ≈ 50–200 ms). Chroma's `where_document={"$contains": ...}` was rejected as the simpler option — it is unranked substring filtering, so it narrows recall rather than adding keyword recall.
+- **Multi-query expansion.** *Trigger:* evidence that pre-rerank recall@`rerank_top_n` is the bottleneck. *Why deferred:* needs an LLM call per search inside the currently LLM-free `store.py`, and the agentic chat loop already reformulates queries across tool calls.
+- **MMR (diversity re-ranking).** *Trigger:* top results dominated by near-duplicate chunks of one document. *Why deferred:* conflicts with cross-encoder ordering; the cheaper first fix would be a per-source cap applied after re-ranking.
+- **Score thresholds.** *Why deferred:* cosine scores are poorly calibrated and corpus-dependent, and the reranker already sinks irrelevant results. Revisit only if junk results demonstrably pollute answers.
 
 ---
 

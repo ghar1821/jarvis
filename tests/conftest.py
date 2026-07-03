@@ -10,10 +10,12 @@ store from scratch on every run.
 
 HuggingFace embedding model
 ----------------------------
-The real all-MiniLM-L6-v2 model is used — no mock embeddings. The model
-downloads once to ~/.cache/huggingface/ (~90 MB) on first run and is reused
-from cache on every subsequent run. The fixture is session-scoped so the model
-loads once per pytest session regardless of how many tests use it.
+The real embedding model named in the default config is used — no mock
+embeddings. It is built through the same build_embeddings() helper production
+uses, so the query prefix and normalisation match real retrieval exactly. The
+model downloads once to ~/.cache/huggingface/ on first run and is reused from
+cache afterwards. The fixture is session-scoped so the model loads once per
+pytest session regardless of how many tests use it.
 
 This follows the project preference for real dependencies over mocks when the
 one-off setup cost is modest and the gain is genuine fidelity to production
@@ -25,7 +27,9 @@ from pathlib import Path
 
 import pytest
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+
+from digest.config import Config
+from digest.kb.store import build_embeddings
 
 # Persistent directory for the test ChromaDB store. Gitignored — never committed.
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
@@ -36,10 +40,12 @@ def embeddings():
     """
     Real HuggingFace embedding model, loaded once for the entire test session.
 
-    First run: downloads all-MiniLM-L6-v2 to ~/.cache/huggingface/ (~90 MB).
-    Subsequent runs: loads from local cache in a few seconds.
+    Uses the default config's embed_model and query_prefix via build_embeddings,
+    so tests exercise the same embedding behaviour as production. First run
+    downloads the model to ~/.cache/huggingface/; later runs load from cache.
     """
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    defaults = Config()
+    return build_embeddings(defaults.embed_model, defaults.query_prefix)
 
 
 @pytest.fixture

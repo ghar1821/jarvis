@@ -24,16 +24,22 @@ def test_defaults_when_no_config_file(tmp_path):
     Expected output:
         ollama_model    == "gemma4:26b"
         provider        == "ollama"
-        chunk_size      == 2048
-        chunk_overlap   == 256
-        embed_model     == "all-MiniLM-L6-v2"
+        chunk_size      == 1024
+        chunk_overlap   == 128
+        embed_model     == "BAAI/bge-small-en-v1.5"
+        query_prefix    == the BGE search instruction
+        rerank_model    == "cross-encoder/ms-marco-MiniLM-L6-v2"
+        rerank_top_n    == 25
     """
     cfg = load_config(tmp_path / "nonexistent.toml")
     assert cfg.ollama_model == "gemma4:26b"
     assert cfg.provider == "ollama"
-    assert cfg.chunk_size == 2048
-    assert cfg.chunk_overlap == 256
-    assert cfg.embed_model == "all-MiniLM-L6-v2"
+    assert cfg.chunk_size == 1024
+    assert cfg.chunk_overlap == 128
+    assert cfg.embed_model == "BAAI/bge-small-en-v1.5"
+    assert cfg.query_prefix == "Represent this sentence for searching relevant passages: "
+    assert cfg.rerank_model == "cross-encoder/ms-marco-MiniLM-L6-v2"
+    assert cfg.rerank_top_n == 25
 
 
 def test_toml_values_override_defaults(tmp_path):
@@ -53,6 +59,31 @@ def test_toml_values_override_defaults(tmp_path):
     assert cfg.ollama_model == "llama3.2"
     assert cfg.max_results == 5
     assert cfg.provider == "ollama"
+
+
+def test_rag_settings_override_defaults(tmp_path):
+    """
+    The [rag] section fields — including the retrieval-tuning ones — are read
+    from the TOML. An empty rerank_model is honoured as the disable switch.
+
+    Input:  config.toml [rag] overriding embed_model, query_prefix, rerank_model,
+            rerank_top_n
+    Expected output:
+        each field takes the TOML value; rerank_model == "" (re-ranking off)
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[rag]\n'
+        'embed_model = "all-MiniLM-L6-v2"\n'
+        'query_prefix = ""\n'
+        'rerank_model = ""\n'
+        'rerank_top_n = 40\n'
+    )
+    cfg = load_config(config_file)
+    assert cfg.embed_model == "all-MiniLM-L6-v2"
+    assert cfg.query_prefix == ""
+    assert cfg.rerank_model == ""
+    assert cfg.rerank_top_n == 40
 
 
 def test_env_var_overrides_toml(tmp_path, monkeypatch):
