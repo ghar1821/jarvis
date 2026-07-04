@@ -1,5 +1,5 @@
 """
-Shared fixtures for the seshat test suite.
+Shared fixtures for the jarvis test suite.
 
 Test ChromaDB store
 -------------------

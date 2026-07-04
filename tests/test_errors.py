@@ -2,14 +2,17 @@
 Tests for digest/errors.py — the @with_retries decorator.
 
 @with_retries wraps a callable and retries it up to max_attempts times when one
-of the specified exception types is raised. A linear backoff (backoff * attempt
-seconds) is applied between retries.
+of the specified exception types is raised. An exponential backoff with jitter
+(backoff * 2**(attempt-1) * uniform(1.0, 1.25) seconds) is applied between
+retries.
 
-All tests use backoff=0 to skip sleep delays and keep the suite fast.
+All tests use backoff=0 to skip sleep delays and keep the suite fast, except
+the backoff-schedule test which stubs time.sleep to capture the waits.
 """
 
 import pytest
 
+import digest.errors
 from digest.errors import with_retries
 
 
@@ -105,3 +108,27 @@ def test_does_not_retry_on_unspecified_exception():
         wrong_error()
 
     assert calls == 1
+
+
+def test_backoff_grows_exponentially_with_jitter(monkeypatch):
+    """
+    The wait between retries follows backoff * 2**(attempt-1), scaled by a
+    jitter factor in [1.0, 1.25).
+
+    Input:  a function that always fails, backoff=2.0, max_attempts=4
+    Expected output:
+        three sleeps, each within [base, base * 1.25) for bases 2, 4, 8
+    """
+    waits: list[float] = []
+    monkeypatch.setattr(digest.errors.time, "sleep", waits.append)
+
+    @with_retries(max_attempts=4, backoff=2.0, exceptions=(ValueError,))
+    def always_fails():
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        always_fails()
+
+    assert len(waits) == 3
+    for wait, base in zip(waits, [2.0, 4.0, 8.0]):
+        assert base <= wait < base * 1.25

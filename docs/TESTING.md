@@ -55,6 +55,23 @@ The one-off download cost is worth the fidelity. This preference (a modest one-o
 setup cost over a mock that obscures real behaviour) is the general policy for this
 project; apply the same reasoning to other test decisions.
 
+### Real vs mocked, by boundary
+
+The policy in practice:
+
+- **Real dependencies:** embeddings, the reranker, ChromaDB, PyMuPDF, and
+  pymupdf4llm all run for real. PDF fixtures (annotated pages, scanned-like
+  pages) are generated in-test with PyMuPDF — no binary fixtures are committed,
+  and the real extraction/conversion paths run end-to-end.
+- **Mocked boundaries (sanctioned):** the arxiv client's network calls
+  (live HTTP to export.arxiv.org — `_client.results` is stubbed, with real
+  `arxiv.Result` objects), the bioRxiv API (`requests.get` stubbed with fake
+  responses shaped like the real payload), and the LLM API clients (billed per
+  token / need a running model server — mocked at the Ollama/Anthropic client
+  boundary, including `describe_image` for figure captioning). These are
+  genuine system boundaries where real calls are expensive or non-deterministic;
+  the retry/tool-loop logic under test is ours, not the libraries'.
+
 ### Retrieval-quality benchmark
 
 `test_retrieval_quality.py` measures *how good* retrieval is, not just whether it
@@ -78,9 +95,9 @@ Tests marked `@pytest.mark.integration` require live external services:
 
 | Test | Requirement |
 |---|---|
-| `test_anthropic_client_initialises` | API key in `ANTHROPIC_API_KEY` env var or `~/.seshat/config.toml [auth]` |
+| `test_anthropic_client_initialises` | API key in `ANTHROPIC_API_KEY` env var or `~/.jarvis/config.toml [auth]` |
 | `test_anthropic_models_list_confirms_auth` | API key + internet access |
-| `test_ollama_server_is_reachable` | Running Ollama server at `http://localhost:11434` |
+| `test_ollama_is_reachable` | Running Ollama server (checked via `ollama.list()` at `http://localhost:11434`) |
 
 Integration tests make no token-consuming LLM calls — they only validate
 connectivity and credentials.
@@ -91,19 +108,29 @@ connectivity and credentials.
 
 | File | Module | Behaviours covered |
 |---|---|---|
-| `test_config.py` | `digest/config.py` | Defaults when no TOML; TOML overrides defaults; env vars override TOML; `~` in paths expanded; `[auth] api_key` loaded |
-| `test_errors.py` | `digest/errors.py` | `@with_retries`: success on first try; retry on matching exception; raise after max attempts; no retry on non-matching exception |
+| `test_config.py` | `digest/config.py` | Defaults when no TOML; TOML overrides defaults; env vars override TOML; `~` in paths expanded; `[auth] api_key` loaded; `[chat] ollama_model` + `OLLAMA_MODEL` env; `[rag]` retrieval and figure-caption keys; `[digest]` bioRxiv keys; `[sync]` section defaults, overrides, and `PDF_WATCH_DIR` env override |
+| `test_errors.py` | `digest/errors.py` | `@with_retries`: success on first try; retry on matching exception; raise after max attempts; no retry on non-matching exception; backoff grows exponentially with jitter (sleep monkeypatched) |
 | `test_arxiv_convert.py` | `digest/arxiv/convert.py` | `parse_arxiv_url()`: `/abs/` URL; `/pdf/` URL; version suffix preserved; non-arXiv URL returns None |
-| `test_store.py` | `digest/kb/store.py` | `add_texts` count; `add_paper` idempotency; visibility filter; privacy check (cloud and local); `delete_by_metadata`; `list_papers` deduplication and chunk count; `update_file_path` metadata and URI; `update_file_path` unknown source; `refresh_vault` add / update / delete / PDF notes preserved; embedding-model guard (mismatch / match / empty); re-ranking preserves visibility filter and `rerank=False` skips the reranker; chunk_index / section breadcrumb metadata |
+| `test_arxiv_fetch.py` | `digest/arxiv/fetch.py` | `_to_paper` field mapping; fetch success; empty-feed-with-200 treated as transient (retried, then raises `FetchError`); recovery when the empty feed is transient; library errors wrapped as `FetchError`; single-paper fetch by ID; deduplication. The arxiv client's network calls are stubbed (real `arxiv.Result` objects, no HTTP); retries run with `time.sleep` monkeypatched |
+| `test_biorxiv_fetch.py` | `digest/biorxiv/fetch.py` | Record→paper mapping (doi→link, `bioRxiv:{category}` source); cursor pagination across pages and `max_results` cap; empty first page retried then raises `FetchError`; keyword matching (title/abstract, case-insensitive, non-match excluded, first-keyword source tag); DOI dedup across two matched keywords. `requests.get` stubbed with fake responses shaped like the real API; `time.sleep` monkeypatched |
+| `test_images.py` | `digest/kb/images.py`, `digest/kb/store.py` | `extract_figures` keeps large images with their 1-indexed page and drops sub-`min_pixels` decoys; `max_figures` cap. `add_figures` indexes `[FIGURE p.N]` caption chunks (`annotation_kind="figure"`) with a fake provider; private+anthropic skip writes nothing and never calls the model; per-figure failure is tolerated; the kill-switch disables it; delete-by-source sweeps figure chunks |
+| `test_pdf_convert.py` | `digest/kb/convert.py` | Real pymupdf4llm conversion of PDFs generated in-test: text extracted; string returned with no intermediate files; scanned/image-only PDF raises `ConversionError` |
+| `test_annotations.py` | `digest/kb/annotations.py` | Extraction from PDFs annotated in-test with PyMuPDF (the same annotation objects Preview/Foxit write — no binary fixtures): highlight text recovery; typed note on a highlight; underline treated as highlight; sticky note → comment; unannotated PDF → `[]`; Ink drawing ignored; multi-line highlight reading order |
+| `test_store.py` | `digest/kb/store.py` | `add_texts` count; `add_paper` idempotency; title-based dedup (`_title_exists` normalisation, add skipped on same title from a different source, `allow_duplicate` forces the add); `add_papers_batch` returns `(added, skipped)`; visibility filter; privacy check (cloud and local); `delete_by_metadata`; `list_papers` deduplication and chunk count; `update_file_path` metadata and URI; `update_file_path` unknown source; `update_visibility` metadata-only; `add_annotations` indexing (and no-op on unannotated PDFs); delete-by-source sweeps body and annotation chunks together; `annotation_kind` search filter; `refresh_vault` add / update / delete / PDF notes preserved / visibility re-check when config reclassifies a dir; embedding-model guard (mismatch / match / empty); re-ranking preserves visibility filter and `rerank=False` skips the reranker; chunk_index / section breadcrumb metadata |
 | `test_retrieval_quality.py` | `digest/kb/store.py` | Golden-set retrieval benchmark — hit-rate@5 and MRR@5 over a seeded corpus of paper summaries and markdown notes |
-| `test_llm.py` *(integration)* | `digest/llm.py` | Anthropic client initialisation; models list API call; Ollama server reachability |
+| `test_privacy_guard.py` | `vault_chat/chat.py` | The chat-layer privacy guards: `read_file` vault containment, private-dir hard stop for cloud only, symlink-into-private-dir regression, path-escape rejection; `_search_notes` excluded-results caveat, private-only hard stop, no caveat for the local provider; `_add_document` rejects private papers, allows private note PDFs |
+| `test_daemon.py` | `digest/daemon.py` | Pure decision functions plus real ingestion with the store fixture: `_build_scheduler` builds cleanly with both jobs and a real (non-string) timezone — the regression for the `timezone="local"` crash-loop; `digest_is_overdue` (first start, within the week, missed slot, boundary); `wait_for_stable` (settled / growing / vanished files); `ingest_pdf` add → skip (unchanged hash) → update (changed bytes); `scan_watch_dir` queuing and artifact skipping; `_validate_sync_config`; status file round-trip, job recording, and corrupt-file handling |
+| `test_sessions.py` | `vault_chat/sessions.py` | Save/load round-trip; pydantic message normalisation; empty sessions never written; malicious session-id rejection; pruning keeps newest unpinned and all pinned; sidebar ordering; `mark_private` flag + re-index; `check_resume` matrix and strict refusal of a retired `llamacpp`-provider session under `ollama`; chat-history search respects session privacy; delete removes file and chunks; rename round-trip, empty/whitespace rejected, 120-char cap, unknown id, and `update_chat_title` propagates to indexed chat chunks; compaction no-op below threshold, replaces old turns with a summary (fake provider), display untouched; token estimation |
+| `test_skills.py` | `vault_chat/skills.py` | Name/description listing; missing dir = feature off; full-content read; traversal-name rejection; unknown name lists available skills |
+| `test_settings.py` | `digest/config.py` + `vault_chat/chat.py` | Response style lands in the system prompt (and absent when empty); skills advertised in the prompt; `set_config_value` tomlkit round-trip preserving comments and other keys; creates missing file/section; `reset_config` reloads the singleton |
+| `test_security.py` | `digest/kb/store.py`, `vault_chat/chat.py`, `webapp/app.py` | `delete_local_file` papers-only rule (deletes paper PDFs, never notes, refuses non-PDF papers); `_remove_document` human gate: unconfirmed previews only, confirmed without a channel refuses, human decline blocks, human approval executes, deferred (webapp) confirmation leaves everything intact; a keep-file (`delete_file=false`) removal leaves the PDF on disk and both the preview and dialog show the full path + KEPT wording; `truncate_middle` preserves head+tail so a `file:///` filename stays visible; webapp rejects foreign Host headers (TrustedHost); session-id traversal rejected |
+| `test_llm.py` | `digest/llm.py` | Unit tests with the LLM clients mocked at the API boundary: `make_provider` spec dispatch; Ollama tool loop uses dict arguments directly (no JSON parsing) and normalises the pydantic message; both providers honour the `PrivacyError` contract (return the error text, restore message history, no further LLM call); Anthropic tool results bundled into one user message. Integration tests (marked): Anthropic client init, models-list auth check, Ollama reachability via `ollama.list()` |
 
 ## What is not tested
 
 | Module | Reason |
 |---|---|
-| `digest/llm.py` (beyond connectivity) | Wraps external APIs; meaningful correctness tests would require mocking the full HTTP layer, which is not preferred |
-| `digest/arxiv/fetch.py` | Same — live arXiv API |
 | `digest/pipeline/` | Depends on LLM responses; correctness is validated by running the pipeline |
-| `vault_chat/chat.py` | The agentic loop is integration-level; all KB behaviour it relies on is covered by `test_store.py` |
-| `webapp/` | The web UI is integration-level (requires a live browser, server, and LLM); the FastAPI routes and SSE stream are thin wrappers over `vault_chat/chat.py` which is already covered |
+| `vault_chat/chat.py` (full agentic loop) | The end-to-end loop needs a live LLM; the guards it relies on are covered by `test_privacy_guard.py` / `test_security.py`, the tool loop mechanics by `test_llm.py`'s boundary-mocked tests, and all KB behaviour by `test_store.py` |
+| `webapp/` (UI and SSE stream) | Requires a live browser, server, and LLM; the security-relevant endpoints (TrustedHost, session-id validation) are covered by `test_security.py`, and the routes are thin wrappers over already-covered `vault_chat` code |
+| `digest/daemon.py` (scheduler loop, watchdog observer) | launchd/runtime plumbing around APScheduler and watchdog; the decision functions and job bodies they drive are covered by `test_daemon.py` |

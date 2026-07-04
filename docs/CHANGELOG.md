@@ -4,7 +4,231 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — retrieval accuracy: BGE embeddings, cross-encoder re-ranking, section-aware chunking
+## [current] — daemon tz fix, Ollama revert, bioRxiv, figure captioning, dark UI
+
+Fixes the launchd crash-loop, reverts the local provider from llama.cpp back to
+Ollama, adds bioRxiv as a digest source with knowledge-base title deduplication,
+captions PDF figures at ingest with a vision model, and reworks the web UI
+(dark theme, 80-char line cap, response-style modal, session rename, clearer
+deletion dialog).
+
+### Fixed
+- **launchd crash-loop**: `digest/daemon.py` constructed the scheduler as
+  `BlockingScheduler(timezone="local")`. The literal string `"local"` was
+  passed to ZoneInfo, which has no such zone, so the daemon raised
+  `ZoneInfoNotFoundError`/`ModuleNotFoundError` at startup and launchd restarted
+  it forever (visible in `~/.jarvis/logs/sync.log`). The timezone argument is
+  gone — APScheduler resolves the real local zone via tzlocal. Scheduler
+  construction is extracted into `_build_scheduler(cfg)` with a regression test.
+- **Deletion dialog hid the file path**: the confirmation description only named
+  a file when one was being deleted; a database-only removal showed no path, and
+  paths could read as a bare directory. `_remove_document` now always includes
+  the full local path (or "no local file") and an unambiguous "KEPT" / "will be
+  PERMANENTLY DELETED" line, in both the preview and the dialog.
+- **Tool-arg display clipped filenames**: `repr(v)[:40]` cut off exactly the
+  filename on a `file:///` URI. Replaced with a shared middle-ellipsis helper
+  (`truncate_middle`, keeps head + tail) used by both the CLI and the webapp.
+
+### Changed
+- **Reverted local provider llama.cpp → Ollama** (`digest/llm.py`,
+  `digest/config.py`). llama.cpp lasted exactly one iteration: running a
+  separate `llama-server` with a fixed launch-time context window and a
+  dedicated LaunchAgent proved fiddly ("llamacpp is hard to use"), whereas
+  Ollama runs as a login-item, keeps the model resident, and honours a
+  per-request context window. `OllamaProvider` replaces `LlamaCppProvider`;
+  `make_provider` specs are now `"ollama" | "anthropic"` (default ollama);
+  config keys `llamacpp_url`/`llamacpp_model` (+ their env vars) are replaced by
+  `ollama_model` / `OLLAMA_MODEL`, default `qwen3-vl:30b` (a vision + thinking
+  MoE that fits a 36GB M3 Max). Session provider matching in `check_resume` is
+  now strict per provider name, so a session recorded under the retired
+  `llamacpp` provider refuses to resume rather than replaying an incompatible
+  history. Summary mode under Ollama converts the PDF to markdown first (via the
+  existing `pdf_to_markdown`) rather than uploading the PDF.
+
+### Added
+- **bioRxiv digest source** (`digest/biorxiv/fetch.py`): `fetch_biorxiv` walks
+  the details API for a server-side category (e.g. `bioinformatics`), and
+  `fetch_biorxiv_keywords` matches free-text keywords (cytometry, spatial
+  transcriptomics, scRNA-seq — topics bioRxiv has no category for) over the
+  recent-preprint window, DOI-deduped. Wired into the pipeline after the arXiv
+  loop; config keys `biorxiv_categories`, `biorxiv_keywords`, `biorxiv_days`.
+- **Knowledge-base title dedup** (`_title_exists` in `digest/kb/store.py`): the
+  same paper can now arrive via arXiv and bioRxiv under different URLs, so
+  `add_paper` skips on a normalised-title match as well as a source-URL match.
+  `add_papers_batch` returns `(added, skipped)` and the pipeline reports both.
+  Manual adds prompt instead of skipping silently: `kb add` asks `[y/N]`, and
+  the chat `add_document` tool returns an ask-the-user message plus a new
+  `allow_duplicate` flag.
+- **PDF figure captioning at ingest** (`digest/kb/images.py` +
+  `add_figures` in `store.py`): embedded raster figures are captioned by the
+  active provider's vision model (`describe_image` on both providers) and
+  indexed as `[FIGURE p.N]` chunks (`annotation_kind="figure"`), so they share
+  the parent PDF's delete/re-ingest sweeps. Config: `figure_captions`
+  (kill-switch), `figure_max_per_doc`, `figure_min_pixels`. Private notes are
+  never captioned under Anthropic — the images would reach the cloud.
+- **Dark web UI**: a single dark palette via CSS custom properties (no toggle),
+  chat bubbles capped at ~80 characters, the response-style setting moved from a
+  sidebar box to a header ⋮ menu → modal (prefilled from `GET /settings`), and
+  per-session rename (`rename_session`, `POST /sessions/{id}/rename`, a ✎
+  button; indexed chat-chunk titles update via `update_chat_title`).
+
+---
+
+## [previous] — reliability, annotations, llama.cpp, sessions, security
+
+A broad pass covering scheduling reliability, arXiv flakiness, the PDF
+pipeline, PDF annotations, privacy/security hardening, the Ollama→llama.cpp
+switch, and three new chat features (sessions, skills, response style).
+
+### Fixed
+- **Scheduled digest was broken**: `run_digest.sh` invoked the non-existent
+  module `digest.run` (renamed to `digest.pipeline.run` long ago), so every
+  launchd run failed instantly. The script is gone entirely (see daemon below).
+- **arXiv flakiness**: the API's known empty-feed-with-HTTP-200 responses
+  bypassed retries and silently produced 0 papers; malformed XML crashed the
+  run. `digest/arxiv/fetch.py` now uses the `arxiv` package (built-in paging,
+  per-page retries, 3s courtesy delay) with a `FetchError`-based retry layer
+  on top; empty feeds are retried, `with_retries` backs off exponentially
+  with jitter.
+- **Privacy — `read_file` symlink bypass**: the private-dir check ran on the
+  unresolved caller-supplied path; a symlink in a public folder pointing into
+  `private/` leaked content to the cloud provider. Classification now uses
+  `get_visibility()` on the resolved path — one policy for indexing and reads.
+- **Privacy — stale visibility**: `refresh_vault` now re-checks each unchanged
+  note's classification, so editing `private_vault_dirs` reclassifies indexed
+  chunks (new `update_visibility()`, metadata-only, no re-embedding).
+- **Privacy — cloud PDF upload**: `add_document` summary mode uploaded local
+  PDFs to Anthropic without checking visibility. Resolved by the new invariant
+  below rather than a per-path gate.
+- **XSS**: the webapp markdown renderer didn't escape quotes in link hrefs —
+  a crafted link in assistant output could break out of the attribute. `esc()`
+  now escapes quotes and hrefs are validated with `new URL()`.
+
+### Added
+- **`jarvis-sync` daemon** (`digest/daemon.py`, entry point `jarvis-sync`) —
+  one supervised process under launchd `KeepAlive` replacing the old weekly
+  plist + `run_digest.sh` (both removed): weekly digest via APScheduler with
+  catch-up across sleep *and* power-off (persistent stamp in
+  `~/.jarvis/state/sync_status.json`); **PDF inbox watcher** (watchdog) that
+  auto-indexes PDFs dropped into `[sync] pdf_watch_dir` as public full-text
+  papers, with byte-hash dedup/update and wait-for-stable handling for cloud
+  syncs; **periodic vault refresh** (default every 30 min). One failing job
+  never kills the daemon; `kb sync-status` reports health. New `[sync]`
+  config keys: `pdf_watch_dir`, `vault_refresh_minutes`, `digest_day`,
+  `digest_hour`. The daemon no longer auto-starts the local LLM server.
+- **PDF annotation extraction** (`digest/kb/annotations.py`): highlights
+  (any colour; underline/squiggly/strikeout too) and typed notes (sticky
+  notes, text boxes, comments on highlights) written by macOS Preview /
+  Foxit Reader are indexed as their own chunks — `[HIGHLIGHT p.N]` /
+  `[USER NOTE p.N]` prefixes, new metadata fields `annotation_kind`, `page`,
+  `note_text`. Freehand/handwritten (Ink) annotations are not extractable
+  (stroke geometry, no text). Wired into `kb add`, `add_document`,
+  `refresh_vault`, and the daemon's inbox ingest; annotations share the
+  parent PDF's source so deletes/re-ingests sweep them automatically.
+  Re-saving a PDF with new highlights re-indexes it via the existing
+  byte-hash change detection.
+- **Persistent chat sessions** (`vault_chat/sessions.py`): every turn saved
+  to `~/.jarvis/sessions/<id>.json`; webapp sidebar to resume/pin/delete;
+  `vault-chat --list-sessions/--resume`. Retention: 50 most recent unpinned
+  sessions (pinned exempt and uncounted). Sessions touching private content
+  get a permanent private flag; exchanges are indexed as `doc_type="chat"`
+  with the session's visibility, searchable via the new
+  **`search_chat_history`** tool (cloud sees public sessions only); resuming
+  a private session under the cloud provider is refused. **In-session
+  compaction**: past `[chat] compact_after_tokens` (default 12000) old
+  exchanges are summarised by the session's own provider, keeping the last
+  `compact_keep_exchanges` turns verbatim — UI history stays complete.
+- **User-defined skills** (`vault_chat/skills.py`): `*.md` files in
+  `[chat] skills_dir` (default `~/.jarvis/skills`) are advertised in the
+  system prompt as name + first-line description; the model loads full
+  instructions on demand via the new `read_skill` tool.
+- **Response style**: `[chat] response_style` free-text instruction appended
+  to the system prompt; editable live in the webapp settings box, persisted
+  back to `config.toml` via tomlkit (comment-preserving, atomic, chmod 600).
+- **Cross-process write lock**: ChromaDB writes (daemon + webapp + CLI share
+  one store) are serialised via `flock` on `<rag_dir>/.write.lock`.
+- **`kb sync-status`** subcommand; `kb stats` warns about legacy private
+  papers (see invariant).
+
+### Changed
+- **Invariant: papers are always public.** Only notes (vault files and
+  note-type PDFs) can be private. Enforced at add time in `kb add` and
+  `add_document`; this is what makes the cloud summary path safe by
+  construction.
+- **Local provider: Ollama → llama.cpp.** `OllamaProvider` and the `ollama`
+  dependency are gone; `LlamaCppProvider` talks to an external `llama-server`
+  (OpenAI-compatible API via the `openai` client, tool calling with
+  `--jinja`). New `[chat]` keys `llamacpp_url` (default
+  `http://127.0.0.1:8081/v1` — port 8081 because the webapp owns 8080) and
+  `llamacpp_model`; `provider` default is now `"llamacpp"`; `ollama_model` /
+  `OLLAMA_MODEL` removed. Local PDF summarisation now converts to markdown
+  first (the old path sent the PDF bytes as an *image* to Ollama).
+  **Migration**: update `~/.jarvis/config.toml` — replace `provider =
+  "ollama"`/`ollama_model` with the new keys, and note the stale
+  `rag_dir = "~/.seshat/rag"` in existing configs should be fixed to
+  `~/.jarvis/rag` (then `kb reindex` or re-add).
+- **PDF conversion: marker-pdf → pymupdf4llm** (`digest/kb/convert.py`,
+  `pdf_to_markdown()` returns a string — no more temp-.md round-trips at any
+  call site; orders of magnitude faster, no ML model downloads; lower
+  fidelity on complex layouts/equations, accepted trade-off). Scanned PDFs
+  without a text layer raise the new `ConversionError` (no OCR fallback).
+  Standalone `convert-pdf` moved to `digest.kb.convert:main`; image
+  extraction dropped (nothing consumed it; `write_images=True` is the
+  one-line reinstatement if ever wanted). Existing marker-converted chunks
+  are not retroactively reconverted.
+- **Digest pipeline** runs whichever provider `[chat] provider` names; the
+  llama.cpp path checks `llama-server`'s `/health` first and warns when the
+  server's context size is smaller than the scoring call wants.
+- Webapp restructured: `index.html` split into `static/style.css` +
+  `static/app.js`; fetch errors render an error bubble instead of a stuck
+  "Working..." placeholder.
+
+### Security
+- **Destructive actions now require a human.** `remove_document(confirmed=true)`
+  no longer executes: the CLI prompts y/N in the terminal; the webapp shows a
+  Confirm/Cancel dialog whose Confirm hits the new `/confirm-action` endpoint
+  — outside the LLM loop, so prompt-injected deletions cannot fire.
+- **Note files are never deleted from disk** — by anyone. The shared
+  `delete_local_file()` choke point (used by `kb remove --delete-file` and
+  the chat tool) only ever unlinks paper PDFs.
+- The LLM-facing `index_vault` tool lost its destructive `force` option
+  (`kb index-vault --force` remains for humans).
+- Retrieved document content is wrapped in BEGIN/END RETRIEVED DATA markers
+  with a system-prompt rule to treat it as data (defence in depth, not a
+  guarantee).
+- Webapp: `TrustedHostMiddleware` (DNS-rebinding), strict session-id
+  validation before any path construction, still bound to 127.0.0.1.
+- File permissions: config write-back and session files are 0600 (sessions
+  dir 0700); `jarvis-sync` and `vault-chat` warn when `config.toml` is
+  group/world-readable.
+
+### Known issues / follow-ups
+- `update_file_path` with `source="local"` would clobber all vault notes'
+  metadata (vault note sources are not unique) — restrict to `file://`
+  sources if ever touched.
+- The `has_private` probe retrieves one private document into local process
+  memory (never serialised or sent anywhere) — accepted for a single-user
+  local tool.
+
+---
+
+## [previous] — project rename to jarvis
+
+### Renamed
+- GitHub repository: `ghar1821/seshat` → `ghar1821/jarvis`
+- Project package name: `seshat` → `jarvis` in `pyproject.toml`
+- Config directory: `~/.seshat/` → `~/.jarvis/` (config, auth, RAG store)
+- Local project directory: `~/projects/seshat/` → `~/projects/jarvis/`
+- launchd agent label: `com.putri.seshat` → `com.putri.jarvis`
+- launchd plist file: `com.putri.seshat.plist` → `com.putri.jarvis.plist`
+
+### Changed
+- README blurb: no longer named after the Egyptian goddess of writing and knowledge; now named after Iron Man's J.A.R.V.I.S. ("Just A Rather Very Intelligent System")
+- All `~/.seshat/...` path references across code, tests, and docs updated to `~/.jarvis/...`
+
+---
+
+## [earlier] — retrieval accuracy: BGE embeddings, cross-encoder re-ranking, section-aware chunking
 
 Improves document-retrieval accuracy using techniques from the LlamaIndex playbook, implemented with the existing LangChain + sentence-transformers stack (no new dependencies, no framework migration). See `docs/DESIGN.md` → "Retrieval pipeline" and "Deferred retrieval improvements".
 
@@ -23,7 +247,7 @@ Improves document-retrieval accuracy using techniques from the LlamaIndex playbo
 - `tests/conftest.py` — the `embeddings` fixture now builds via `build_embeddings()` from the default config, so tests exercise the real query prefix and normalisation.
 
 ### Migration
-- **Existing installs must run `uv run kb reindex` once after upgrading.** The embedding-model guard fires on any pre-upgrade collection (it has no `embed_model` tag), and the default model changed — `reindex` re-embeds with the configured model and writes the tag. To adopt `bge-small`, remove any `embed_model` pin from `~/.seshat/config.toml` (or set it to `BAAI/bge-small-en-v1.5`) before reindexing.
+- **Existing installs must run `uv run kb reindex` once after upgrading.** The embedding-model guard fires on any pre-upgrade collection (it has no `embed_model` tag), and the default model changed — `reindex` re-embeds with the configured model and writes the tag. To adopt `bge-small`, remove any `embed_model` pin from `~/.jarvis/config.toml` (or set it to `BAAI/bge-small-en-v1.5`) before reindexing.
 - **Re-chunking** (to benefit from section-aware chunking / smaller chunks) is separate: run `uv run kb index-vault --force` for vault notes. Summary-mode papers (1–2 chunks) are unaffected; full-text papers keep their existing chunk boundaries until re-added (`kb remove` + `kb add --full-text`). `kb reindex` deliberately does not re-chunk — it only re-embeds existing chunk texts.
 
 ### Dependencies

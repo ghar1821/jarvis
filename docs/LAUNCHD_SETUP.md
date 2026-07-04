@@ -1,22 +1,43 @@
-# Scheduling the weekly digest with launchd on macOS
+# Running jarvis-sync with launchd on macOS
 
-`launchd` is macOS's native job scheduler. Unlike `cron`, it runs as your full user session (no Full Disk Access issues) and will run a missed job when the Mac wakes from sleep.
+Background work is handled by a single supervised daemon, `jarvis-sync`
+(`digest/daemon.py`). It owns three jobs in one process:
 
-## 1. Make the script executable
+- the **weekly arXiv + bioRxiv digest** (default Monday 02:00, `[sync]` config), with
+  catch-up: a run missed while the Mac was asleep fires on wake, and a run
+  missed while powered off runs at the next daemon start;
+- the **PDF inbox watcher** — new PDFs dropped into `pdf_watch_dir` are
+  indexed automatically as public full-text papers (with annotations);
+- the **periodic vault refresh** — the incremental Obsidian sync, every
+  `vault_refresh_minutes` (default 30).
+
+launchd's job is only to keep that process alive (`KeepAlive`): if it
+crashes, launchd restarts it. There is no cron-style schedule in the plist —
+scheduling lives inside the daemon, where it can do catch-up properly.
+
+Check daemon health any time with:
 
 ```bash
-chmod +x ~/projects/paper_digest/run_digest.sh
+uv run kb sync-status
 ```
 
-## 2. Create the LaunchAgent plist
+## Migrating from the old setup
 
-LaunchAgents live in `~/Library/LaunchAgents/`. Create the file:
+Earlier versions scheduled `run_digest.sh` via a `StartCalendarInterval`
+plist. That script and setup are gone. Remove the old agent first:
 
 ```bash
-nano ~/Library/LaunchAgents/com.putri.seshat.plist
+launchctl unload ~/Library/LaunchAgents/com.putri.jarvis.plist 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.putri.jarvis.plist
 ```
 
-Paste the following (the schedule below is every Monday at 02:00):
+## 1. Create the sync LaunchAgent
+
+```bash
+nano ~/Library/LaunchAgents/com.putri.jarvis.sync.plist
+```
+
+Paste (adjust the username in paths if different):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,28 +46,25 @@ Paste the following (the schedule below is every Monday at 02:00):
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.putri.seshat</string>
+    <string>com.putri.jarvis.sync</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/putri.g/projects/paper_digest/run_digest.sh</string>
+        <string>/Users/putri.g/projects/jarvis/.venv/bin/jarvis-sync</string>
     </array>
 
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key>
-        <integer>1</integer>
-        <key>Hour</key>
-        <integer>2</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Wait 60s before restarting after a crash — prevents a hot crash-loop -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/putri.g/projects/paper_digest/output/logs/launchd-stdout.log</string>
+    <string>/Users/putri.g/.jarvis/logs/sync.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/putri.g/projects/paper_digest/output/logs/launchd-stderr.log</string>
+    <string>/Users/putri.g/.jarvis/logs/sync.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -59,62 +77,77 @@ Paste the following (the schedule below is every Monday at 02:00):
 </plist>
 ```
 
-`StartCalendarInterval` weekday values: 1 = Monday, 5 = Friday, 7 = Sunday.
+The venv's `jarvis-sync` entry point is invoked directly — no wrapper script,
+so there is no module-path or PATH indirection to go stale.
 
-## 3. Load the agent
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.putri.seshat.plist
-launchctl start com.putri.seshat
-```
-
-This registers the job, persists across reboots, and runs it immediately so you can confirm it works.
-
-## 4. Verify it is loaded
+Create the log directory once, then load:
 
 ```bash
-launchctl list | grep seshat
+mkdir -p ~/.jarvis/logs
+launchctl load ~/Library/LaunchAgents/com.putri.jarvis.sync.plist
 ```
 
-You should see a line like:
-
-```
--    0    com.putri.seshat
-```
-
-The second column is the last exit code. `0` means success (or not yet run). A non-zero value means the last run failed — check the logs.
-
-## 5. Applying changes to the plist
-
-**Any time you edit the plist, you must unload and reload for the changes to take effect:**
+## 2. Verify
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.putri.seshat.plist
-launchctl load  ~/Library/LaunchAgents/com.putri.seshat.plist
+launchctl list | grep jarvis
+uv run kb sync-status
+tail -f ~/.jarvis/logs/sync.log
 ```
 
-To immediately test:
+`kb sync-status` shows daemon liveness (pid), each job's last run/success/
+error, and the log tail. On first start the digest waits for its next
+scheduled slot; drop a PDF into `pdf_watch_dir` to see the watcher react
+immediately.
+
+## 3. Local LLM (Ollama)
+
+The daemon does **not** start the local model server. If `provider = "ollama"`,
+run Ollama yourself — the digest job fails with a clear log message when it is
+unreachable (health-checked at `http://localhost:11434/api/tags`). No
+LaunchAgent is needed: install the Ollama macOS app and let it run as a
+login-item, or run `ollama serve`. Pull a model that supports tool calling and
+vision (`ollama pull qwen3-vl:30b`) so digest scoring, the chat agent, and
+figure captioning all work.
+
+## Applying plist changes
+
+Editing a plist on disk has no effect while the agent is loaded:
 
 ```bash
-launchctl start com.putri.seshat
-tail -f ~/projects/paper_digest/output/logs/launchd-stdout.log
+launchctl unload ~/Library/LaunchAgents/com.putri.jarvis.sync.plist
+launchctl load  ~/Library/LaunchAgents/com.putri.jarvis.sync.plist
 ```
-
-> **Note:** Editing the plist on disk has no effect while the agent is loaded. Always unload first.
 
 ## Common commands
 
 | Task | Command |
 |------|---------|
-| Load / register | `launchctl load ~/Library/LaunchAgents/com.putri.seshat.plist` |
-| Unload / unregister | `launchctl unload ~/Library/LaunchAgents/com.putri.seshat.plist` |
+| Load / register | `launchctl load ~/Library/LaunchAgents/com.putri.jarvis.sync.plist` |
+| Unload / unregister | `launchctl unload ~/Library/LaunchAgents/com.putri.jarvis.sync.plist` |
 | Apply plist changes | unload → load |
-| Run now | `launchctl start com.putri.seshat` |
-| Check status | `launchctl list \| grep seshat` |
+| Daemon health | `uv run kb sync-status` |
+| Live log | `tail -f ~/.jarvis/logs/sync.log` |
 
 ## Troubleshooting
 
-- **Job not in `launchctl list`** — plist has a syntax error. Validate: `plutil ~/Library/LaunchAgents/com.putri.seshat.plist`.
-- **Non-zero exit code** — check `~/projects/paper_digest/output/logs/launchd-stderr.log`.
-- **Ollama not starting** — confirm `ollama` is on the `PATH` in the plist (`which ollama` to find the right path).
-- **Job skipped while Mac was asleep** — launchd runs it the next time the Mac is awake past the scheduled time.
+- **Job not in `launchctl list`** — plist syntax error. Validate:
+  `plutil ~/Library/LaunchAgents/com.putri.jarvis.sync.plist`.
+- **Daemon restarts in a loop** — a fatal setup problem (bad `[sync]` config,
+  embedding-model mismatch). The reason is at the top of `~/.jarvis/logs/sync.log`;
+  launchd's `ThrottleInterval` keeps the loop slow enough to read.
+- **Daemon crash-loop with `ZoneInfoNotFoundError` / `ModuleNotFoundError:
+  tzdata`** (fixed) — an earlier build constructed the scheduler with
+  `BlockingScheduler(timezone="local")`, and the literal string `"local"` is
+  not a valid ZoneInfo key, so the daemon crashed at startup on every launchd
+  restart. Resolved by dropping the timezone argument (APScheduler resolves the
+  real local zone via tzlocal). If you see this in an old `sync.log`, update to
+  the current build.
+- **Digest job failing** — `kb sync-status` shows the last error. Usual
+  suspects: Ollama not running (start it or set `provider = "anthropic"`),
+  no network for arXiv/bioRxiv.
+- **PDFs not being picked up** — confirm `pdf_watch_dir` exists and matches
+  the config; the daemon refuses to start (exit 1) when the folder is missing
+  rather than watching a mistyped path.
+- **Log growth** — the log is append-only and low-volume; truncate manually
+  or add a `newsyslog.d` rule if it ever bothers you.

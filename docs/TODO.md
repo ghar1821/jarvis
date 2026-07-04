@@ -1,0 +1,17 @@
+Things that need to be done:
+- [x] chat box in the ui. the line length must be capped to say 80 characters. anything else that goes past that need to go to new line
+  - Resolved: `.bubble { max-width: min(80ch, 100%) }`, alignment still driven by `.turn`.
+- [x] the launchd is broken. There is an import error when setting up the pdf file watch. See ~/.jarvis/logs/sync.log
+  - Resolved: the real cause was `BlockingScheduler(timezone="local")` — the literal `"local"` was handed to ZoneInfo and raised at startup. Dropped the argument (APScheduler resolves the local zone itself).
+- [x] response style box is hard to use. this should be like a menu icon in top right, a drop down, then an option to set response style. Then a pop up with text box appear with save button or cancel. Prefill the text box with existing response style. leave empty if this is empty.
+  - Resolved: sidebar box removed; a header ⋮ menu → "Set response style…" opens a modal prefilled from GET /settings, with Save / Cancel / Esc / backdrop-close.
+- [x] llamacpp is hard to use. revert back to ollama.
+  - Resolved: reverted to `OllamaProvider`; the provider abstraction and PrivacyError contract are unchanged. Default model `qwen3-vl:30b`.
+- [x] need to add support to do digest from biorxiv as well.
+  - Resolved: new `digest/biorxiv/fetch.py` (category + keyword fetches) wired into the pipeline, plus KB-level title dedup so the same paper from arXiv + bioRxiv is not indexed twice.
+- [x] add ability to rename a chat session
+  - Resolved: `rename_session()` + POST /sessions/{id}/rename + a ✎ button; indexed chat-chunk titles update too.
+- [x] ui should be dark theme. the current one looks too much like facebook chat. irritating to the eye.
+  - Resolved: dark palette via CSS custom properties, no toggle (dark only).
+- [x] if pdf file's images are parsed and embedded, can llm recognise what it is? if yes, then pdf full text should have the images parsed as well.
+  - Resolved: yes — figures are captioned at ingest by the active provider's vision model (`describe_image`) and indexed as `[FIGURE p.N]` chunks. Requires a vision-capable model; images of private notes are never sent to the cloud provider.

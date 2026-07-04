@@ -31,7 +31,10 @@ from digest.config import Config
 from digest.errors import RAGError
 from digest.kb.store import (
     _check_embedding_model_matches,
+    _title_exists,
+    add_annotations,
     add_paper,
+    add_papers_batch,
     add_texts,
     count,
     delete_by_metadata,
@@ -40,6 +43,7 @@ from digest.kb.store import (
     search,
     search_with_privacy_check,
     update_file_path,
+    update_visibility,
 )
 
 # Same gitignored store directory the shared fixtures use (see conftest.py).
@@ -174,8 +178,8 @@ def test_privacy_check_cloud_provider_sees_public_only_and_reports_private_hit(s
 
 def test_privacy_check_local_provider_sees_all_docs(store):
     """
-    search_with_privacy_check() for a local provider ("ollama") must return all
-    documents regardless of visibility, and always set has_private_hits=False.
+    search_with_privacy_check() for a local provider ("ollama") must return
+    all documents regardless of visibility, and always set has_private_hits=False.
 
     Input:
         doc A — visibility="public",  source="pub2"
@@ -375,6 +379,71 @@ def test_refresh_vault_removes_deleted_files(tmp_path, store):
     assert deleted == 1
 
 
+def test_refresh_vault_updates_visibility_when_config_reclassifies_dir(
+    tmp_path, store, monkeypatch
+):
+    """
+    A note whose content and path are unchanged must still get its visibility
+    metadata re-checked: when private_vault_dirs gains the note's folder, the
+    stored chunks flip to private without re-embedding.
+
+    Input:  vault with confidential/note.md indexed while private_vault_dirs
+            is ["private"]; config then changes to ["private", "confidential"]
+    Expected output: second refresh reports updated=1 and the stored chunk's
+            visibility is "private"
+    """
+    monkeypatch.setattr(
+        "digest.kb.store.get_config",
+        lambda: Config(private_vault_dirs=["private"]),
+    )
+    (tmp_path / "confidential").mkdir()
+    note = tmp_path / "confidential" / "note.md"
+    note.write_text("# Secret plans\nContent that should become private.")
+    refresh_vault(vault_root=tmp_path, store=store)
+
+    stored = store._collection.get(
+        where={"file_path": {"$eq": "confidential/note.md"}}, include=["metadatas"]
+    )
+    assert stored["metadatas"][0]["visibility"] == "public"
+
+    monkeypatch.setattr(
+        "digest.kb.store.get_config",
+        lambda: Config(private_vault_dirs=["private", "confidential"]),
+    )
+    added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
+    assert (added, updated, deleted) == (0, 1, 0)
+
+    stored = store._collection.get(
+        where={"file_path": {"$eq": "confidential/note.md"}}, include=["metadatas"]
+    )
+    assert all(m["visibility"] == "private" for m in stored["metadatas"])
+
+
+def test_update_visibility_updates_metadata_only(store):
+    """
+    update_visibility rewrites the visibility field for every chunk of a note
+    and leaves content untouched.
+
+    Input:  a public note with one chunk; update_visibility(..., "private")
+    Expected output: returns 1; chunk metadata now private; document text unchanged
+    """
+    add_texts(content="A note about lab meetings.", doc_type="note",
+              visibility="public", source="local",
+              extra_metadata={"file_path": "meetings.md"}, store=store)
+
+    changed = update_visibility("meetings.md", "private", store)
+    assert changed == 1
+
+    stored = store._collection.get(
+        where={"file_path": {"$eq": "meetings.md"}},
+        include=["metadatas", "documents"],
+    )
+    assert stored["metadatas"][0]["visibility"] == "private"
+    assert stored["documents"][0] == "A note about lab meetings."
+
+    assert update_visibility("no-such-file.md", "private", store) == 0
+
+
 def test_refresh_vault_preserves_pdf_notes(tmp_path, store):
     """
     PDF notes (doc_type="note", file_path is an absolute .pdf path) must NOT
@@ -481,7 +550,7 @@ def test_embedding_guard_ignores_empty_collection(embeddings):
 
 @pytest.fixture
 def rerank_on(monkeypatch):
-    """Force default retrieval config (re-ranking enabled) regardless of ~/.seshat/config.toml."""
+    """Force default retrieval config (re-ranking enabled) regardless of ~/.jarvis/config.toml."""
     monkeypatch.setattr("digest.kb.store.get_config", lambda: Config())
 
 
@@ -562,3 +631,150 @@ def test_headerless_content_has_empty_section_and_no_breadcrumb(store):
     assert stored["metadatas"][0]["section"] == ""
     assert stored["metadatas"][0]["chunk_index"] == 0
     assert stored["documents"][0].startswith("Plain prose")
+
+
+# ── 11. PDF annotations ────────────────────────────────────────────────────────
+
+def _annotated_pdf(tmp_path: Path) -> Path:
+    """PDF with one highlighted-and-commented passage and one sticky note."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Mitochondria are the powerhouse of the cell.", fontsize=12)
+    highlight = page.add_highlight_annot(page.search_for("powerhouse of the cell", quads=True))
+    highlight.set_info(content="key claim")
+    highlight.update()
+    page.add_text_annot((72, 150), "Check the original 1957 reference")
+    pdf_path = tmp_path / "annotated.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    return pdf_path
+
+
+def test_add_annotations_indexes_highlights_and_comments(store, tmp_path):
+    """
+    add_annotations turns each highlight/comment into its own chunk with
+    annotation metadata and the [HIGHLIGHT]/[USER NOTE] page prefix embedded.
+    """
+    pdf_path = _annotated_pdf(tmp_path)
+    ids = add_annotations(
+        pdf_path, doc_type="paper", visibility="public",
+        source="file:///annotated.pdf", title="Annotated", store=store,
+    )
+    assert len(ids) == 2
+
+    highlights = store._collection.get(
+        where={"annotation_kind": {"$eq": "highlight"}},
+        include=["metadatas", "documents"],
+    )
+    assert len(highlights["ids"]) == 1
+    assert highlights["documents"][0].startswith("[HIGHLIGHT p.1]")
+    assert "powerhouse of the cell" in highlights["documents"][0]
+    assert "User note: key claim" in highlights["documents"][0]
+    assert highlights["metadatas"][0]["page"] == 1
+
+    comments = store._collection.get(
+        where={"annotation_kind": {"$eq": "comment"}}, include=["documents"]
+    )
+    assert comments["documents"][0] == "[USER NOTE p.1] Check the original 1957 reference"
+
+
+def test_add_annotations_unannotated_pdf_is_noop(store, tmp_path):
+    """A PDF without annotations adds nothing and returns []."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Nothing marked here.", fontsize=12)
+    pdf_path = tmp_path / "plain.pdf"
+    doc.save(pdf_path)
+    doc.close()
+
+    before = count(store)
+    assert add_annotations(
+        pdf_path, doc_type="paper", visibility="public",
+        source="file:///plain.pdf", store=store,
+    ) == []
+    assert count(store) == before
+
+
+def test_delete_by_source_sweeps_body_and_annotations(store, tmp_path):
+    """
+    Annotation chunks share the parent PDF's source, so deleting by source
+    removes body text and annotations together.
+    """
+    pdf_path = _annotated_pdf(tmp_path)
+    source = "file:///swept.pdf"
+    add_texts(content="Body text of the swept paper.", doc_type="paper",
+              visibility="public", source=source, store=store)
+    add_annotations(pdf_path, doc_type="paper", visibility="public",
+                    source=source, store=store)
+
+    deleted = delete_by_metadata("source", source, store)
+    assert deleted == 3  # 1 body chunk + 2 annotation chunks
+    remaining = store._collection.get(where={"source": {"$eq": source}}, include=[])
+    assert remaining["ids"] == []
+
+
+def test_search_annotation_kind_filter(store, tmp_path):
+    """
+    search(annotation_kind="highlight") returns only highlight chunks even
+    when body chunks about the same topic exist.
+    """
+    pdf_path = _annotated_pdf(tmp_path)
+    add_texts(content="Long discussion about cellular energy production.",
+              doc_type="paper", visibility="public", source="file:///cells.pdf", store=store)
+    add_annotations(pdf_path, doc_type="paper", visibility="public",
+                    source="file:///cells.pdf", store=store)
+
+    results = search("cell energy powerhouse", n_results=5,
+                     annotation_kind="highlight", store=store, rerank=False)
+    assert results
+    assert all(doc.metadata["annotation_kind"] == "highlight" for doc in results)
+
+
+# ── Title-based dedup ───────────────────────────────────────────────────────────
+
+def test_title_exists_normalises_case_and_whitespace(store):
+    """
+    _title_exists matches on the normalised title (lowercased, whitespace
+    collapsed), so a paper arriving via a second source is recognised.
+    """
+    add_paper(_paper(1), dense_summary="A summary.", store=store)  # title "Test Paper 1"
+    assert _title_exists("Test Paper 1", store) is True
+    assert _title_exists("  test   paper 1 ", store) is True  # case + whitespace
+    assert _title_exists("Some Other Paper", store) is False
+    assert _title_exists("", store) is False
+
+
+def test_add_paper_skips_on_title_match_from_different_source(store):
+    """
+    A paper with a new source URL but a title already in the KB is skipped —
+    this is what stops arXiv+bioRxiv duplicates of the same paper.
+    """
+    add_paper(_paper(2), dense_summary="First copy.", store=store)
+    same_title_new_source = {
+        "link": "https://doi.org/10.1101/duplicate",  # different URL
+        "title": "Test Paper 2",                       # same title
+        "authors": "Test Author",
+    }
+    assert add_paper(same_title_new_source, dense_summary="Second copy.", store=store) == []
+
+
+def test_add_paper_allow_duplicate_forces_the_add(store):
+    """allow_duplicate bypasses both the source and title guards."""
+    add_paper(_paper(3), dense_summary="Original.", store=store)
+    forced = add_paper(_paper(3), dense_summary="Forced.", store=store, allow_duplicate=True)
+    assert forced  # non-empty: it really added
+
+
+def test_add_papers_batch_reports_added_and_skipped(store):
+    """add_papers_batch returns (added, skipped); a repeat title counts as skipped."""
+    entries = [
+        (_paper(10), {"summary": "s", "why": "w", "score": 9, "track": "T"}),
+        (_paper(10), {"summary": "s", "why": "w", "score": 9, "track": "T"}),  # dup
+    ]
+    added, skipped = add_papers_batch(entries, store=store)
+    assert added == 1
+    assert skipped == 1

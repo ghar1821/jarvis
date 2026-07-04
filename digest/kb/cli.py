@@ -14,6 +14,7 @@ Subcommands:
 
   index-vault       Incrementally update vault index; --force clears first
   reindex           Re-embed all chunks with the configured embed_model
+  sync-status       Show jarvis-sync daemon health and last job outcomes
 
 Usage examples:
   uv run kb add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
@@ -41,7 +42,10 @@ def cmd_add(args: argparse.Namespace) -> None:
     from ..arxiv.convert import parse_arxiv_url
     from ..arxiv.fetch import fetch_arxiv_paper
     from ..llm import make_provider
-    from .store import add_paper, add_texts, get_store
+    from .store import (
+        _source_exists, _title_exists, add_annotations, add_figures,
+        add_paper, add_texts, get_store,
+    )
 
     cfg = get_config()
     store = get_store()
@@ -52,6 +56,18 @@ def cmd_add(args: argparse.Namespace) -> None:
         if _provider is None:
             _provider = make_provider(args.provider or cfg.provider)
         return _provider
+
+    def confirm_duplicate(source: str, title: str) -> bool:
+        """
+        Return True if the item is new or the user chose to add it anyway.
+        A paper can arrive twice via different sources (arXiv + bioRxiv), so we
+        check both the source URL and the title.
+        """
+        if not (_source_exists(source, store) or _title_exists(title, store)):
+            return True
+        print(f"Already in the knowledge base: \"{title}\" ({source})")
+        return input("Add anyway? [y/N] ").strip().lower() == "y"
+
     input_str: str = args.input
 
     if input_str.startswith("http://") or input_str.startswith("https://"):
@@ -63,45 +79,62 @@ def cmd_add(args: argparse.Namespace) -> None:
         paper = fetch_arxiv_paper(arxiv_id)
         print(f"  Title: {paper['title']}")
 
+        if not confirm_duplicate(paper.get("link", ""), paper.get("title", "")):
+            print("Cancelled.")
+            return
+
         if args.full_text:
             import tempfile
-            from ..arxiv.convert import convert_pdf, download_arxiv_pdf
+            from ..arxiv.convert import download_arxiv_pdf
+            from ..errors import ConversionError
+            from .convert import pdf_to_markdown
             print("Downloading PDF...")
             with tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                pdf_path_dl = download_arxiv_pdf(arxiv_id, tmp_path)
-                print("Converting to Markdown (this may take a moment)...")
-                convert_pdf(pdf_path_dl, tmp_path)
-                md_path = tmp_path / f"{pdf_path_dl.stem}.md"
-                if not md_path.exists():
-                    print("Error: PDF conversion produced no output.", file=sys.stderr)
+                pdf_path_dl = download_arxiv_pdf(arxiv_id, Path(tmp))
+                print("Converting to Markdown...")
+                try:
+                    full_text = pdf_to_markdown(pdf_path_dl)
+                except ConversionError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
                     sys.exit(1)
-                full_text = md_path.read_text(encoding="utf-8")
-            print("Chunking and indexing full text...")
-            from .store import _source_exists
-            if _source_exists(paper.get("link", ""), store):
-                print(f"Already in knowledge base: {paper['link']}")
-            else:
-                ids = add_texts(
-                    content=full_text,
-                    doc_type="paper",
-                    visibility="public",
-                    source=paper["link"],
-                    extra_metadata={
-                        "title": paper.get("title", ""),
-                        "authors": paper.get("authors", ""),
-                        "score": int(args.score),
-                        "track": str(args.track),
-                        "storage_mode": "full_text",
-                    },
-                    store=store,
+                annotation_ids = add_annotations(
+                    pdf_path_dl, doc_type="paper", visibility="public",
+                    source=paper["link"], title=paper.get("title", ""), store=store,
                 )
-                print(f"Added (full text, {len(ids)} chunks): {paper['link']}")
+                figure_ids = add_figures(
+                    pdf_path_dl, doc_type="paper", visibility="public",
+                    source=paper["link"], provider_obj=get_provider(),
+                    provider_str=(args.provider or cfg.provider),
+                    title=paper.get("title", ""), store=store,
+                )
+            print("Chunking and indexing full text...")
+            ids = add_texts(
+                content=full_text,
+                doc_type="paper",
+                visibility="public",
+                source=paper["link"],
+                extra_metadata={
+                    "title": paper.get("title", ""),
+                    "authors": paper.get("authors", ""),
+                    "score": int(args.score),
+                    "track": str(args.track),
+                    "storage_mode": "full_text",
+                },
+                store=store,
+            )
+            print(f"Added (full text, {len(ids)} chunks): {paper['link']}")
+            if annotation_ids:
+                print(f"  {len(annotation_ids)} annotation(s) indexed")
+            if figure_ids:
+                print(f"  {len(figure_ids)} figure(s) captioned")
         else:
             print("Generating summary...")
             summary = get_provider().summarize(paper["title"], paper["abstract"])
+            # allow_duplicate: confirm_duplicate already gated this — the user
+            # either has no duplicate or explicitly chose to add anyway.
             add_paper(paper=paper, dense_summary=summary, score=args.score,
-                      track=args.track, store=store, storage_mode="summary")
+                      track=args.track, store=store, storage_mode="summary",
+                      allow_duplicate=True)
             print(f"Added (summary): {paper['link']}")
 
     elif Path(input_str).exists() and Path(input_str).suffix.lower() == ".pdf":
@@ -110,20 +143,49 @@ def cmd_add(args: argparse.Namespace) -> None:
         visibility = args.visibility
         doc_type = args.doc_type
 
+        # Invariant: papers are always public. Only notes may be private.
+        if doc_type == "paper" and visibility == "private":
+            print(
+                "Error: papers are always public — use --doc-type note for private documents.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not confirm_duplicate(pdf_path.as_uri(), title):
+            print("Cancelled.")
+            return
+
+        def index_annotations() -> None:
+            # Highlights, typed notes, and captioned figures each become their
+            # own chunks, regardless of whether the body was stored as summary
+            # or full text.
+            annotation_ids = add_annotations(
+                pdf_path, doc_type=doc_type, visibility=visibility,
+                source=pdf_path.as_uri(), title=title,
+                file_path=str(pdf_path), store=store,
+            )
+            if annotation_ids:
+                print(f"  {len(annotation_ids)} annotation(s) indexed")
+            figure_ids = add_figures(
+                pdf_path, doc_type=doc_type, visibility=visibility,
+                source=pdf_path.as_uri(), provider_obj=get_provider(),
+                provider_str=(args.provider or cfg.provider),
+                title=title, file_path=str(pdf_path), store=store,
+            )
+            if figure_ids:
+                print(f"  {len(figure_ids)} figure(s) captioned")
+
         if doc_type == "note":
             # Notes are always indexed as full text; content_hash tracked for refresh
-            from ..arxiv.convert import convert_pdf
             import hashlib as _hashlib
-            import tempfile
+            from ..errors import ConversionError
+            from .convert import pdf_to_markdown
             print(f"Converting PDF note to Markdown ({visibility}): {pdf_path.name}...")
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                convert_pdf(pdf_path, tmp_path)
-                md_path = tmp_path / f"{pdf_path.stem}.md"
-                if not md_path.exists():
-                    print("Error: PDF conversion produced no output.", file=sys.stderr)
-                    sys.exit(1)
-                full_text = md_path.read_text(encoding="utf-8")
+            try:
+                full_text = pdf_to_markdown(pdf_path)
+            except ConversionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
             content_hash = _hashlib.sha256(pdf_path.read_bytes()).hexdigest()
             ids = add_texts(
                 content=full_text,
@@ -139,19 +201,17 @@ def cmd_add(args: argparse.Namespace) -> None:
                 store=store,
             )
             print(f"Added note (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
+            index_annotations()
 
         elif args.full_text:
-            from ..arxiv.convert import convert_pdf
-            import tempfile
+            from ..errors import ConversionError
+            from .convert import pdf_to_markdown
             print(f"Converting PDF to Markdown ({visibility}): {pdf_path.name}...")
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                convert_pdf(pdf_path, tmp_path)
-                md_path = tmp_path / f"{pdf_path.stem}.md"
-                if not md_path.exists():
-                    print("Error: PDF conversion produced no output.", file=sys.stderr)
-                    sys.exit(1)
-                full_text = md_path.read_text(encoding="utf-8")
+            try:
+                full_text = pdf_to_markdown(pdf_path)
+            except ConversionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
             ids = add_texts(
                 content=full_text,
                 doc_type="paper",
@@ -161,6 +221,7 @@ def cmd_add(args: argparse.Namespace) -> None:
                 store=store,
             )
             print(f"Added paper (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
+            index_annotations()
         else:
             print(f"Generating summary from PDF ({visibility}): {pdf_path.name}...")
             summary = get_provider().summarize(title, pdf_path)
@@ -173,10 +234,58 @@ def cmd_add(args: argparse.Namespace) -> None:
                 store=store,
             )
             print(f"Added paper (summary): {pdf_path.name} ({visibility})")
+            index_annotations()
 
     else:
         print(f"Error: '{input_str}' is not a valid arXiv URL or PDF path.", file=sys.stderr)
         sys.exit(1)
+
+
+# ── Sync status ───────────────────────────────────────────────────────────────
+
+
+def cmd_sync_status() -> None:
+    """Report jarvis-sync daemon liveness and per-job outcomes."""
+    import os as _os
+
+    from ..daemon import STATUS_FILE, read_status
+
+    log_file = Path.home() / ".jarvis" / "logs" / "sync.log"
+
+    if not STATUS_FILE.exists():
+        print("Daemon has never run. See docs/LAUNCHD_SETUP.md to set it up.")
+        return
+
+    status = read_status()
+    daemon = status.get("daemon", {})
+    pid = daemon.get("pid")
+    alive = False
+    if pid:
+        try:
+            _os.kill(int(pid), 0)
+            alive = True
+        except (OSError, ValueError):
+            alive = False
+    state = f"running (pid {pid})" if alive else "NOT RUNNING"
+    print(f"Daemon:   {state}, started {daemon.get('started_at', '?')}")
+
+    for job in ("digest", "vault_refresh", "pdf_ingest"):
+        entry = status.get("jobs", {}).get(job)
+        if not entry:
+            print(f"{job:14s} never run")
+            continue
+        line = f"{job:14s} last run {entry.get('last_run', '?')}"
+        if entry.get("last_success"):
+            line += f" · last success {entry['last_success']}"
+        if entry.get("last_error"):
+            line += f"\n{'':14s} ⚠️  {entry['last_error']}"
+        print(line)
+
+    print(f"\nLog: {log_file}")
+    if log_file.exists():
+        tail = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+        for line in tail:
+            print(f"  {line}")
 
 
 # ── Add-digest ────────────────────────────────────────────────────────────────
@@ -285,6 +394,26 @@ def cmd_stats() -> None:
     print(f"Documents:  {papers} papers · {notes} notes")
     print(f"Chunks:     {total_chunks} total")
 
+    # Consistency check for the papers-are-always-public invariant. Entries
+    # added before the invariant existed could still be private; surface them
+    # rather than silently migrating.
+    try:
+        stray = store._collection.get(
+            where={"$and": [{"doc_type": {"$eq": "paper"}}, {"visibility": {"$eq": "private"}}]},
+            include=["metadatas"],
+        )
+        private_sources = sorted({m.get("source", "?") for m in stray["metadatas"]})
+        if private_sources:
+            print(
+                f"\n⚠️  {len(private_sources)} paper(s) are marked private, but papers "
+                "must always be public.\n   Re-add each as a note (kb remove + kb add "
+                "--doc-type note) or make it public:"
+            )
+            for src in private_sources:
+                print(f"   - {src}")
+    except Exception:
+        pass
+
 
 def _resolve_local_file(source: str, meta: dict) -> "Path | None":
     """
@@ -324,7 +453,9 @@ def cmd_remove(args: argparse.Namespace) -> None:
     print(f"  Source: {args.source}")
     print(f"  Chunks: {len(ids)}")
     if args.delete_file:
-        if local_file and local_file.exists():
+        if doc_type != "paper":
+            print("  File:   will NOT be deleted (note files are never deleted by jarvis)")
+        elif local_file and local_file.exists():
             print(f"  File:   {local_file}  ← will be PERMANENTLY DELETED")
         else:
             print("  File:   no local file found (only database entry will be removed)")
@@ -339,11 +470,10 @@ def cmd_remove(args: argparse.Namespace) -> None:
     store.delete(ids)
     print(f"Removed \"{title}\" ({len(ids)} chunk(s)) from the knowledge base.")
     if args.delete_file:
-        if local_file and local_file.exists():
-            local_file.unlink()
-            print(f"Deleted file: {local_file}")
-        else:
-            print("No local file found — database entry only was removed.")
+        from .store import delete_local_file
+
+        _, file_msg = delete_local_file(local_file, doc_type)
+        print(file_msg)
 
 
 def cmd_clear(args: argparse.Namespace) -> None:
@@ -512,7 +642,7 @@ def main() -> None:
     )
     p_add.add_argument(
         "--provider", default="",
-        help=f"'anthropic' or Ollama model name (default: {cfg.provider})",
+        help=f"'anthropic' or 'ollama' (default: {cfg.provider})",
     )
     p_add.add_argument(
         "--full-text", action="store_true", dest="full_text",
@@ -533,7 +663,7 @@ def main() -> None:
     p_remove.add_argument("source", help="Source URL of the document to remove")
     p_remove.add_argument(
         "--delete-file", action="store_true", dest="delete_file",
-        help="Also delete the local file (for vault notes and local PDFs only)",
+        help="Also delete the local file (paper PDFs only — note files are never deleted)",
     )
     sub.add_parser("clear", help="Delete all documents (prompts for confirmation)")
 
@@ -550,6 +680,9 @@ def main() -> None:
     # reindex
     sub.add_parser("reindex", help="Re-embed all chunks with the configured embed_model (no LLM calls)")
 
+    # sync-status
+    sub.add_parser("sync-status", help="Show jarvis-sync daemon health and last job outcomes")
+
     args = parser.parse_args()
     dispatch = {
         "add":         lambda: cmd_add(args),
@@ -561,6 +694,7 @@ def main() -> None:
         "update-path": lambda: cmd_update_path(args),
         "index-vault": lambda: cmd_index_vault(args),
         "reindex":     lambda: cmd_reindex(args),
+        "sync-status": cmd_sync_status,
     }
     dispatch[args.command]()
 

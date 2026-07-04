@@ -2,23 +2,26 @@
 LLM provider abstraction.
 
 Two concrete adapters satisfy the ChatProvider protocol:
-  OllamaProvider   — local Ollama model
-  AnthropicProvider — Anthropic Claude (API key or OAuth token)
+  OllamaProvider    — local model served by Ollama (http://localhost:11434)
+  AnthropicProvider — Anthropic Claude (API key)
 
 Both implement:
   complete(messages, max_tokens, context_length)  — single-shot text completion
   summarize(title, source)                         — paper summary, PDF-aware
   agentic_turn(messages, tools, dispatch_fn, system) — full tool-calling loop
+  describe_image(image_bytes, context)             — caption a PDF figure
 
 Use make_provider() to construct the right adapter from a spec string:
-  make_provider("ollama")        → OllamaProvider using config ollama_model
-  make_provider("anthropic")     → AnthropicProvider using config anthropic_model
-  make_provider("gemma4:27b")    → OllamaProvider with that specific model
+  make_provider("ollama")     → OllamaProvider using config ollama_model
+  make_provider("anthropic")  → AnthropicProvider using config anthropic_model
+
+Ollama must be running (the macOS login-item app or `ollama serve`). For full
+functionality the configured model needs tool-calling and vision support —
+figure captioning and vision-based summaries depend on the vision capability.
 """
 
 import base64
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
@@ -43,8 +46,6 @@ class ChatProvider(Protocol):
         Generate a dense paper summary.
 
         source: plain text (abstract) or a Path to a PDF file.
-        PDF files are sent directly to the model — no pre-conversion needed,
-        provided the model supports document input.
         """
         ...
 
@@ -64,10 +65,29 @@ class ChatProvider(Protocol):
         """
         ...
 
+    def describe_image(self, image_bytes: bytes, context: str) -> str:
+        """
+        Caption one image (a figure lifted from a PDF) so it can be indexed as
+        searchable text. context is free text — usually the document title —
+        that helps the model ground the description.
+        """
+        ...
+
 
 # ── Prompt loading ─────────────────────────────────────────────────────────────
 
 _SUMMARY_PROMPT: str | None = None
+
+# Shared by both providers' describe_image(), so figure captions read the same
+# regardless of which model produced them. {context} is the document title.
+_FIGURE_CAPTION_PROMPT = (
+    "This image is a figure from a research paper or document titled "
+    "\"{context}\". Describe what the figure shows in 2-4 dense, factual "
+    "sentences a researcher could later search for: name the kind of figure "
+    "(plot, diagram, micrograph, table, schematic), its axes or components, "
+    "and the main result or relationship it conveys. Do not add generic "
+    "commentary or caveats."
+)
 
 
 def _get_summary_prompt() -> str:
@@ -79,13 +99,36 @@ def _get_summary_prompt() -> str:
     return _SUMMARY_PROMPT
 
 
+def _message_to_dict(message) -> dict:
+    """Normalise an ollama pydantic Message to a JSON-serialisable dict."""
+    if hasattr(message, "model_dump"):
+        return message.model_dump(exclude_none=True)
+    return message
+
+
 # ── Ollama adapter ─────────────────────────────────────────────────────────────
 
 
 class OllamaProvider:
-    def __init__(self, model: str, options: dict | None = None) -> None:
+    """
+    Talks to a local Ollama server (http://localhost:11434 by default).
+
+    Ollama keeps the model resident across the CLI, webapp, and sync daemon,
+    and honours a per-request context window (num_ctx), so complete() can pass
+    the caller's requested context straight through. Tool calling and vision
+    both depend on the configured model supporting them.
+    """
+
+    def __init__(self, model: str) -> None:
         self.model = model
-        self.options = options or {}
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            import ollama
+
+            self._client = ollama.Client()
+        return self._client
 
     def complete(
         self,
@@ -93,29 +136,26 @@ class OllamaProvider:
         max_tokens: int = 2048,
         context_length: int | None = None,
     ) -> str:
-        import ollama
-
-        opts = dict(self.options)
-        if context_length:
-            opts["num_ctx"] = context_length
-
+        client = self._get_client()
+        # Ollama honours a per-request context window; only set it when asked.
+        options = {"num_ctx": context_length} if context_length else {}
         try:
-            response = ollama.chat(
-                model=self.model,
-                messages=messages,
-                options=opts or None,
-            )
-            return response["message"]["content"]
+            response = client.chat(model=self.model, messages=messages, options=options)
+            return response["message"]["content"] or ""
         except Exception as exc:
             raise LLMError(f"Ollama complete failed: {exc}") from exc
 
     def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
         if isinstance(source, Path):
-            pdf_b64 = base64.b64encode(source.read_bytes()).decode()
-            messages: list[dict] = [{"role": "user", "content": prompt, "images": [pdf_b64]}]
+            # Ollama has no document-input API, and the conversion is cheap
+            # (pymupdf4llm, no ML models), so feed it the markdown text.
+            from .kb.convert import pdf_to_markdown
+
+            text = pdf_to_markdown(source)
         else:
-            messages = [{"role": "user", "content": f"{prompt}\n\nAbstract/text:\n{source}"}]
+            text = source
+        messages = [{"role": "user", "content": f"{prompt}\n\nAbstract/text:\n{text}"}]
         return self.complete(messages, max_tokens=max_tokens)
 
     def agentic_turn(
@@ -125,33 +165,56 @@ class OllamaProvider:
         dispatch_fn: Callable[[str, dict], str],
         system: str = "",
     ) -> str:
-        import ollama
-
-        client = ollama.Client()
+        client = self._get_client()
         while True:
             full = ([{"role": "system", "content": system}] + messages) if system else messages
             try:
-                response = client.chat(model=self.model, messages=full, tools=tools, format=None)
-            except ollama.ResponseError as exc:
+                response = client.chat(model=self.model, messages=full, tools=tools)
+            except Exception as exc:
                 raise LLMError(f"Ollama agentic turn failed: {exc}") from exc
 
             message = response["message"]
-            if not message.get("tool_calls"):
-                reply = message["content"]
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                reply = message.get("content") or ""
                 messages.append({"role": "assistant", "content": reply})
                 return reply
 
-            messages.append(message)
-            for tc in message["tool_calls"]:
-                fn = tc["function"]
+            # The ollama client returns a pydantic Message — normalise it to a
+            # plain dict so session history stays JSON-serialisable.
+            messages.append(_message_to_dict(message))
+            for tc in tool_calls:
+                # Ollama hands back arguments as a mapping already (not a JSON
+                # string like the OpenAI wire format), so use it directly; only
+                # parse if some model variant ever returns a string.
+                arguments = tc.function.arguments
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
                 try:
-                    result = dispatch_fn(fn["name"], fn["arguments"])
+                    result = dispatch_fn(tc.function.name, dict(arguments))
                 except PrivacyError as exc:
                     # Remove the assistant message we just added so the
                     # conversation history stays in a valid state for future turns.
                     messages.pop()
                     return str(exc)
-                messages.append({"role": "tool", "content": result})
+                messages.append(
+                    {"role": "tool", "tool_name": tc.function.name, "content": result}
+                )
+
+    def describe_image(self, image_bytes: bytes, context: str) -> str:
+        client = self._get_client()
+        prompt = _FIGURE_CAPTION_PROMPT.format(context=context or "untitled document")
+        try:
+            response = client.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
+            )
+            return response["message"]["content"] or ""
+        except Exception as exc:
+            raise LLMError(f"Ollama describe_image failed: {exc}") from exc
 
 
 # ── Anthropic adapter ──────────────────────────────────────────────────────────
@@ -197,7 +260,7 @@ class AnthropicProvider:
 
         raise AuthenticationError(
             "No Anthropic credentials found.\n"
-            "  Set ANTHROPIC_API_KEY env var or add api_key to [auth] in ~/.seshat/config.toml"
+            "  Set ANTHROPIC_API_KEY env var or add api_key to [auth] in ~/.jarvis/config.toml"
         )
 
     def complete(
@@ -295,6 +358,28 @@ class AnthropicProvider:
                 messages.append({"role": "assistant", "content": reply})
                 return reply
 
+    def describe_image(self, image_bytes: bytes, context: str) -> str:
+        client = self._get_client()
+        prompt = _FIGURE_CAPTION_PROMPT.format(context=context or "untitled document")
+        # PDF figures are extracted as PNG bytes (see digest/kb/images.py), so
+        # the media type is fixed.
+        image_b64 = base64.b64encode(image_bytes).decode()
+        content = [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+            },
+            {"type": "text", "text": prompt},
+        ]
+        try:
+            response = client.messages.create(
+                model=self.model, max_tokens=1024,
+                messages=[{"role": "user", "content": content}],
+            )
+            return next((b.text for b in response.content if b.type == "text"), "")
+        except Exception as exc:
+            raise LLMError(f"Anthropic describe_image failed: {exc}") from exc
+
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
@@ -302,15 +387,13 @@ class AnthropicProvider:
 def make_provider(
     spec: str = "ollama",
     model: str | None = None,
-    options: dict | None = None,
 ) -> "OllamaProvider | AnthropicProvider":
     """
     Construct a ChatProvider from a spec string.
 
     spec:
-      "anthropic"      → AnthropicProvider with config anthropic_model (or model override)
-      "ollama"         → OllamaProvider with config ollama_model (or model override)
-      "<model name>"   → OllamaProvider with that specific model (e.g. "gemma4:27b")
+      "anthropic" → AnthropicProvider with config anthropic_model (or model override)
+      "ollama"    → OllamaProvider with config ollama_model (or model override)
     """
     from .config import get_config
 
@@ -318,7 +401,6 @@ def make_provider(
 
     if spec == "anthropic":
         return AnthropicProvider(model=model or cfg.anthropic_model)
-
-    # "ollama" or a bare model name
-    ollama_model = model or (cfg.ollama_model if spec == "ollama" else spec)
-    return OllamaProvider(model=ollama_model, options=options or {})
+    if spec == "ollama":
+        return OllamaProvider(model=model or cfg.ollama_model)
+    raise ValueError(f"Unknown provider spec: {spec!r} (expected 'ollama' or 'anthropic')")

@@ -9,7 +9,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="webapp",
-        description="Seshat web UI — starts a local server at http://127.0.0.1:8080.",
+        description="Jarvis web UI — starts a local server at http://127.0.0.1:8080.",
     )
     parser.add_argument(
         "--provider",

@@ -10,22 +10,35 @@ Document schema
   page_content : str   — chunked text (embedded for similarity search)
   metadata:
     date_added  : str  — ISO timestamp of when the chunk was indexed
-    doc_type    : str  — "paper" | "note" | "pdf"
-    visibility  : str  — "public" | "private"
-    source      : str  — arXiv/DOI URL for papers, "local" for notes/PDFs
+    doc_type    : str  — "paper" | "note" | "chat" (past chat exchanges)
+    visibility  : str  — "public" | "private" (papers are always public)
+    source      : str  — arXiv/DOI URL for papers, file:/// URI for local
+                         PDFs, "local" for vault notes, "session:<id>" for
+                         chat exchanges
     title       : str  — display title (optional)
     authors     : str  — comma-separated authors, papers only (optional)
     score       : int  — relevance score 0-10, papers only (optional)
     track       : str  — research track label, papers only (optional)
-    file_path   : str  — vault-relative path, notes/PDFs only (optional)
+    file_path   : str  — vault-relative path for notes, absolute for PDFs (optional)
     content_hash: str  — SHA-256 of full file, used for change detection
     chunk_index : int  — position of this chunk within its source document
     section     : str  — markdown header breadcrumb ("H1 › H2"), "" if none
+    storage_mode: str  — "summary" | "full_text" (optional)
+    modified_at : str  — ISO mtime of the source file, vault notes only (optional)
+
+  PDF annotation and figure chunks (see add_annotations / add_figures)
+  additionally carry:
+    annotation_kind : str — "highlight" | "comment" | "figure" (absent on body chunks)
+    page            : int — 1-indexed PDF page the annotation/figure came from
+    note_text       : str — the user's typed comment, "" if none (always "" for figures)
+  They share source/file_path/doc_type/visibility with the parent PDF's body
+  chunks, so every existing delete path sweeps them along automatically.
+  Figure chunks store a vision-model caption prefixed "[FIGURE p.N]".
 
 Privacy model
 -------------
-  "public"  — accessible to all providers (Ollama and Anthropic)
-  "private" — accessible to local Ollama only
+  "public"  — accessible to all providers (local Ollama and Anthropic)
+  "private" — accessible to the local model only
 
   search_with_privacy_check() enforces this at query time:
   - cloud provider  → searches public docs only; reports whether private
@@ -33,8 +46,11 @@ Privacy model
   - local provider  → searches all docs without restriction
 """
 
+import fcntl
 import hashlib
 import re
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,13 +64,47 @@ from langchain_text_splitters import (
 from sentence_transformers import CrossEncoder
 
 from ..config import get_config
-from ..errors import RAGError
+from ..errors import LLMError, RAGError
 
 COLLECTION_NAME = "knowledge_base"
 
 _embeddings: HuggingFaceEmbeddings | None = None
 _reranker: CrossEncoder | None = None
 _store: Chroma | None = None
+
+# Tracks write-lock nesting per thread so composite operations (refresh_vault
+# calling add_texts, etc.) don't deadlock on their own flock.
+_write_lock_state = threading.local()
+
+
+@contextmanager
+def _kb_write_lock():
+    """
+    Cross-process advisory lock serialising ChromaDB writes.
+
+    The daemon, webapp, and CLI all open the same PersistentClient directory,
+    and Chroma's SQLite backend is not safe for concurrent multi-process
+    writers. Every write path takes this flock on <rag_dir>/.write.lock;
+    reads stay unlocked (SQLite WAL handles concurrent readers).
+    """
+    if getattr(_write_lock_state, "depth", 0):
+        _write_lock_state.depth += 1
+        try:
+            yield
+        finally:
+            _write_lock_state.depth -= 1
+        return
+
+    lock_path = get_config().rag_dir / ".write.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _write_lock_state.depth = 1
+        try:
+            yield
+        finally:
+            _write_lock_state.depth = 0
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 # ── Singletons ────────────────────────────────────────────────────────────────
@@ -219,9 +269,153 @@ def add_texts(
         documents.append(Document(page_content=page_content, metadata=metadata))
     s = store or get_store()
     try:
-        return s.add_documents(documents)
+        with _kb_write_lock():
+            return s.add_documents(documents)
     except Exception as exc:
         raise RAGError(f"Failed to add documents: {exc}") from exc
+
+
+def add_annotations(
+    pdf_path: Path,
+    doc_type: str,
+    visibility: str,
+    source: str,
+    title: str = "",
+    file_path: str = "",
+    store: Chroma | None = None,
+) -> list[str]:
+    """
+    Extract highlights/typed comments from a PDF and index each as its own
+    searchable chunk. Returns the chunk IDs ([] when the PDF has none).
+
+    The embedded text is prefixed "[HIGHLIGHT p.N]" or "[USER NOTE p.N]" so
+    retrieval (and the chat agent reading the results) can tell user-marked
+    passages apart from ordinary body prose. Metadata mirrors the parent
+    PDF's body chunks (same source/file_path/doc_type/visibility) so deletes
+    and re-ingests sweep annotations together with the body.
+    """
+    from .annotations import extract_annotations
+
+    extracted = extract_annotations(pdf_path)
+    if not extracted:
+        return []
+
+    documents = []
+    for index, ann in enumerate(extracted):
+        if ann["kind"] == "highlight":
+            page_content = f"[HIGHLIGHT p.{ann['page']}] {ann['text']}".strip()
+            if ann["note_text"]:
+                page_content += f"\nUser note: {ann['note_text']}"
+        else:
+            page_content = f"[USER NOTE p.{ann['page']}] {ann['note_text']}"
+        metadata = {
+            "date_added": datetime.now(timezone.utc).isoformat(),
+            "doc_type": doc_type,
+            "visibility": visibility,
+            "source": source,
+            "title": title,
+            "annotation_kind": ann["kind"],
+            "page": ann["page"],
+            "note_text": ann["note_text"],
+            "chunk_index": index,
+            "section": "",
+        }
+        if file_path:
+            metadata["file_path"] = file_path
+        documents.append(Document(page_content=page_content, metadata=metadata))
+
+    s = store or get_store()
+    try:
+        with _kb_write_lock():
+            return s.add_documents(documents)
+    except Exception as exc:
+        raise RAGError(f"Failed to add annotations: {exc}") from exc
+
+
+def add_figures(
+    pdf_path: Path,
+    doc_type: str,
+    visibility: str,
+    source: str,
+    provider_obj,
+    provider_str: str,
+    title: str = "",
+    file_path: str = "",
+    store: Chroma | None = None,
+) -> list[str]:
+    """
+    Caption a PDF's embedded figures with the active provider's vision model
+    and index one chunk per figure. Returns the chunk IDs ([] when there are
+    no figures, captioning is disabled, or the privacy guard blocks it).
+
+    The embedded text is prefixed "[FIGURE p.N]" so retrieval can tell captions
+    apart from body prose. Metadata mirrors the parent PDF's body chunks (same
+    source/file_path/doc_type/visibility, annotation_kind="figure") so deletes
+    and re-ingests sweep figures together with the body and annotations.
+
+    Privacy guard: images of a private note must never reach a cloud model, so
+    when visibility is "private" and the provider is Anthropic, captioning is
+    skipped entirely with a visible warning and nothing is written. Papers are
+    always public, so paper figures caption under either provider.
+
+    Per-figure captioning failures warn and skip that one figure — a single bad
+    image never aborts the ingest.
+    """
+    cfg = get_config()
+    if not cfg.figure_captions:
+        return []
+
+    if visibility == "private" and provider_str == "anthropic":
+        print(
+            "  ⚠️  skipping figure captioning — images of a private note must not "
+            "reach a cloud provider (switch to the local model to caption them)",
+            flush=True,
+        )
+        return []
+
+    from .images import extract_figures
+
+    figures = extract_figures(
+        pdf_path,
+        max_figures=cfg.figure_max_per_doc,
+        min_pixels=cfg.figure_min_pixels,
+    )
+    if not figures:
+        return []
+
+    documents = []
+    for index, figure in enumerate(figures):
+        try:
+            caption = provider_obj.describe_image(figure["image_bytes"], context=title)
+        except LLMError as exc:
+            print(f"  ⚠️  figure caption failed (p.{figure['page']}): {exc}", flush=True)
+            continue
+        page_content = f"[FIGURE p.{figure['page']}] {caption}".strip()
+        metadata = {
+            "date_added": datetime.now(timezone.utc).isoformat(),
+            "doc_type": doc_type,
+            "visibility": visibility,
+            "source": source,
+            "title": title,
+            "annotation_kind": "figure",
+            "page": figure["page"],
+            "note_text": "",
+            "chunk_index": index,
+            "section": "",
+        }
+        if file_path:
+            metadata["file_path"] = file_path
+        documents.append(Document(page_content=page_content, metadata=metadata))
+
+    if not documents:
+        return []
+
+    s = store or get_store()
+    try:
+        with _kb_write_lock():
+            return s.add_documents(documents)
+    except Exception as exc:
+        raise RAGError(f"Failed to add figures: {exc}") from exc
 
 
 def _source_exists(source: str, store: Chroma) -> bool:
@@ -235,6 +429,28 @@ def _source_exists(source: str, store: Chroma) -> bool:
         return False
 
 
+def _normalise_title(title: str) -> str:
+    """Lowercase and collapse whitespace so near-identical titles compare equal."""
+    return re.sub(r"\s+", " ", title.strip().lower())
+
+
+def _title_exists(title: str, store: Chroma) -> bool:
+    """
+    Return True if a paper with this title is already indexed, matching on the
+    normalised title. A paper can now arrive via two sources (arXiv + bioRxiv)
+    with different URLs, so source-URL dedup alone is no longer enough. This
+    scans stored paper metadata — fine at personal-KB scale.
+    """
+    if not title:
+        return False
+    target = _normalise_title(title)
+    try:
+        result = store._collection.get(where={"doc_type": {"$eq": "paper"}}, include=["metadatas"])
+        return any(_normalise_title(m.get("title", "")) == target for m in result["metadatas"])
+    except Exception:
+        return False
+
+
 def add_paper(
     paper: dict,
     dense_summary: str,
@@ -242,11 +458,17 @@ def add_paper(
     track: str = "",
     store: Chroma | None = None,
     storage_mode: str = "summary",
+    allow_duplicate: bool = False,
 ) -> list[str]:
-    """Add a paper to the knowledge base. Papers are always public. Skips if already indexed."""
+    """
+    Add a paper to the knowledge base. Papers are always public. Skips (returns
+    []) if a paper with the same source URL or the same title is already
+    indexed, unless allow_duplicate is set (the user explicitly chose to add it
+    anyway).
+    """
     s = store or get_store()
     source = paper.get("link", "")
-    if _source_exists(source, s):
+    if not allow_duplicate and (_source_exists(source, s) or _title_exists(paper.get("title", ""), s)):
         return []
     content = f"{paper.get('title', '')}\n{source}\n\n{dense_summary}"
     return add_texts(
@@ -268,27 +490,31 @@ def add_paper(
 def add_papers_batch(
     entries: list[tuple[dict, dict]],
     store: Chroma | None = None,
-) -> int:
+) -> tuple[int, int]:
     """
     Batch-add papers from a digest scoring run.
     Reuses existing summary+why fields — no extra LLM call.
-    Returns count of papers added.
+    Returns (added, skipped): skipped papers were already in the KB (matched by
+    source URL or title), so add_paper returned no chunk ids for them.
     """
     s = store or get_store()
-    count = 0
+    added = skipped = 0
     for paper, selected in entries:
         summary = "\n\n".join(
             filter(None, [selected.get("summary", ""), selected.get("why", "")])
         )
-        add_paper(
+        ids = add_paper(
             paper=paper,
             dense_summary=summary,
             score=selected.get("score", 0),
             track=selected.get("track", ""),
             store=s,
         )
-        count += 1
-    return count
+        if ids:
+            added += 1
+        else:
+            skipped += 1
+    return added, skipped
 
 
 def delete_by_metadata(
@@ -299,13 +525,36 @@ def delete_by_metadata(
     """Delete all chunks matching a metadata key=value pair. Returns count deleted."""
     s = store or get_store()
     try:
-        result = s._collection.get(where={key: {"$eq": value}})
-        ids = result["ids"]
-        if ids:
-            s.delete(ids)
-        return len(ids)
+        with _kb_write_lock():
+            result = s._collection.get(where={key: {"$eq": value}})
+            ids = result["ids"]
+            if ids:
+                s.delete(ids)
+            return len(ids)
     except Exception as exc:
         raise RAGError(f"Delete failed: {exc}") from exc
+
+
+def delete_local_file(local_file: "Path | None", doc_type: str) -> tuple[bool, str]:
+    """
+    Single choke point for deleting a document's on-disk file.
+
+    Hard rule: only paper PDFs are ever deleted — never notes, not even when
+    a human passes --delete-file. Note files (vault .md or note-type PDFs)
+    are the user's own writing; jarvis removes their index entries but never
+    touches the files. Returns (deleted, message).
+    """
+    if local_file is None or not local_file.exists():
+        return False, "No local file found — database entry only was removed."
+    if doc_type != "paper":
+        return False, (
+            f"Note files are never deleted by jarvis — {local_file} was left in "
+            "place (index entry removed). Delete the file yourself if you mean it."
+        )
+    if local_file.suffix.lower() != ".pdf":
+        return False, f"Only paper PDF files can be deleted — {local_file} was left in place."
+    local_file.unlink()
+    return True, f"Deleted file: {local_file}"
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
@@ -316,6 +565,7 @@ def search(
     n_results: int = 5,
     visibility: str | None = None,
     doc_type: str | None = None,
+    annotation_kind: str | None = None,
     store: Chroma | None = None,
     rerank: bool = True,
 ) -> list[Document]:
@@ -336,6 +586,8 @@ def search(
         conditions.append({"visibility": {"$eq": visibility}})
     if doc_type:
         conditions.append({"doc_type": {"$eq": doc_type}})
+    if annotation_kind:
+        conditions.append({"annotation_kind": {"$eq": annotation_kind}})
 
     filter_dict = None
     if len(conditions) == 1:
@@ -386,6 +638,9 @@ def search_with_privacy_check(
                          doc_type=doc_type, store=s)
         try:
             # A cheap existence probe — order doesn't matter, so skip re-ranking.
+            # The retrieved private document stays in local process memory only;
+            # nothing beyond len(...) is used, and the probe runs before any
+            # cloud request, so private content cannot leak through this path.
             private_check = search(query, n_results=1, visibility="private",
                                    doc_type=doc_type, store=s, rerank=False)
             has_private = len(private_check) > 0
@@ -447,9 +702,67 @@ def update_file_path(source: str, new_path: str, store: Chroma | None = None) ->
         updated_metadatas.append({**meta, "file_path": new_path_str, "source": new_source})
 
     try:
-        s._collection.update(ids=ids, metadatas=updated_metadatas)
+        with _kb_write_lock():
+            s._collection.update(ids=ids, metadatas=updated_metadatas)
     except Exception as exc:
         raise RAGError(f"Failed to update metadata: {exc}") from exc
+
+    return len(ids)
+
+
+def update_visibility(file_path: str, new_visibility: str, store: Chroma | None = None) -> int:
+    """
+    Update the visibility metadata for all chunks of a vault note, without
+    touching content or re-embedding. Used by refresh_vault when a file's
+    classification changes (e.g. private_vault_dirs edited in config) even
+    though its content and path did not.
+    """
+    s = store or get_store()
+    try:
+        result = s._collection.get(
+            where={"file_path": {"$eq": file_path}}, include=["metadatas"]
+        )
+    except Exception as exc:
+        raise RAGError(f"Failed to look up file_path: {exc}") from exc
+
+    ids = result["ids"]
+    if not ids:
+        return 0
+
+    updated_metadatas = [{**m, "visibility": new_visibility} for m in result["metadatas"]]
+    try:
+        with _kb_write_lock():
+            s._collection.update(ids=ids, metadatas=updated_metadatas)
+    except Exception as exc:
+        raise RAGError(f"Failed to update visibility: {exc}") from exc
+
+    return len(ids)
+
+
+def update_chat_title(session_id: str, new_title: str, store: Chroma | None = None) -> int:
+    """
+    Update the title metadata for all indexed chat chunks of one session, so a
+    renamed session shows its new name in search_chat_history results. Metadata
+    only — no content change, no re-embedding. Returns the chunk count updated.
+    """
+    s = store or get_store()
+    try:
+        result = s._collection.get(
+            where={"session_id": {"$eq": session_id}}, include=["metadatas"]
+        )
+    except Exception as exc:
+        raise RAGError(f"Failed to look up session chunks: {exc}") from exc
+
+    ids = result["ids"]
+    if not ids:
+        return 0
+
+    updated_metadatas = [{**m, "title": new_title} for m in result["metadatas"]]
+    try:
+        with _kb_write_lock():
+            s._collection.update(ids=ids, metadatas=updated_metadatas)
+    except Exception as exc:
+        raise RAGError(f"Failed to update chat title: {exc}") from exc
 
     return len(ids)
 
@@ -529,6 +842,39 @@ def index_vault_file(
     )
 
 
+def _caption_figures_for_note(
+    pdf_path: Path,
+    visibility: str,
+    title: str,
+    file_path: str,
+    store: Chroma,
+) -> None:
+    """
+    Caption a re-indexed PDF note's figures, building the provider lazily only
+    when the note actually has figures (so text-only notes never pay for a
+    provider construction). The private-note privacy guard lives in add_figures
+    itself. Never raises — a captioning failure must not abort the vault sync.
+    """
+    cfg = get_config()
+    if not cfg.figure_captions:
+        return
+    try:
+        from .images import extract_figures
+
+        if not extract_figures(pdf_path, max_figures=1, min_pixels=cfg.figure_min_pixels):
+            return
+        from ..llm import make_provider
+
+        provider = make_provider(cfg.provider)
+        add_figures(
+            pdf_path, doc_type="note", visibility=visibility,
+            source=pdf_path.as_uri(), provider_obj=provider,
+            provider_str=cfg.provider, title=title, file_path=file_path, store=store,
+        )
+    except Exception as exc:
+        print(f"  ⚠️  figure captioning failed for {pdf_path.name}: {exc}", flush=True)
+
+
 def refresh_vault(
     vault_root: Path,
     store: Chroma | None = None,
@@ -541,20 +887,20 @@ def refresh_vault(
     """
     s = store or get_store()
 
-    # Build map of currently indexed notes: file_path → content_hash
+    # Build map of currently indexed notes: file_path → (content_hash, visibility)
     try:
         result = s._collection.get(
             where={"doc_type": {"$eq": "note"}},
             include=["metadatas"],
         )
-        indexed: dict[str, str] = {}
+        indexed: dict[str, tuple[str, str]] = {}
         for meta in result["metadatas"]:
             fp = meta.get("file_path", "")
             # Skip PDF notes — they have absolute paths and are handled in Phase 2.
             # Including them here caused them to be incorrectly deleted because
             # absolute paths never match the relative paths in `current`.
             if fp and not fp.endswith(".pdf") and fp not in indexed:
-                indexed[fp] = meta.get("content_hash", "")
+                indexed[fp] = (meta.get("content_hash", ""), meta.get("visibility", "public"))
     except Exception:
         indexed = {}
 
@@ -571,14 +917,24 @@ def refresh_vault(
     added = updated = deleted = 0
 
     for rel_path, (file_path, file_hash) in current.items():
-        stored_hash = indexed.get(rel_path)
-        if stored_hash is None:
+        stored = indexed.get(rel_path)
+        if stored is None:
             index_vault_file(file_path, vault_root, s)
             added += 1
-        elif stored_hash != file_hash:
+            continue
+        stored_hash, stored_visibility = stored
+        if stored_hash != file_hash:
             delete_by_metadata("file_path", rel_path, s)
             index_vault_file(file_path, vault_root, s)
             updated += 1
+        else:
+            # Content unchanged, but the classification rule may have changed
+            # (private_vault_dirs config edits). Stale visibility would let a
+            # cloud provider keep seeing a note that is now private.
+            current_visibility = get_visibility(file_path, vault_root)
+            if current_visibility != stored_visibility:
+                update_visibility(rel_path, current_visibility, s)
+                updated += 1
 
     for rel_path in indexed:
         if rel_path not in current:
@@ -597,7 +953,13 @@ def refresh_vault(
         pdf_notes: dict[str, dict] = {}
         for meta in pdf_result["metadatas"]:
             fp = meta.get("file_path", "")
-            if fp and fp.endswith(".pdf") and fp not in pdf_notes:
+            if not fp or not fp.endswith(".pdf"):
+                continue
+            # Prefer a body chunk's metadata: annotation chunks carry no
+            # content_hash, and using one here would look like a perpetual
+            # "file changed" signal.
+            existing = pdf_notes.get(fp)
+            if existing is None or (not existing.get("content_hash") and meta.get("content_hash")):
                 pdf_notes[fp] = meta
     except Exception:
         pdf_notes = {}
@@ -610,29 +972,45 @@ def refresh_vault(
         current_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
         if current_hash == meta.get("content_hash", ""):
             continue
-        import tempfile
-        from ..arxiv.convert import convert_pdf
+        from ..errors import ConversionError
+        from .convert import pdf_to_markdown
         print(f"  PDF note changed, re-indexing: {pdf_path.name}", flush=True)
         delete_by_metadata("file_path", abs_path_str, s)
-        with tempfile.TemporaryDirectory() as tmp:
-            # temp dir (and converted .md) deleted automatically on exit
-            tmp_path = Path(tmp)
-            convert_pdf(pdf_path, tmp_path)
-            md_path = tmp_path / f"{pdf_path.stem}.md"
-            if md_path.exists():
-                add_texts(
-                    content=md_path.read_text(encoding="utf-8"),
-                    doc_type="note",
-                    visibility=meta.get("visibility", "public"),
-                    source=pdf_path.as_uri(),
-                    extra_metadata={
-                        "title": meta.get("title", pdf_path.stem),
-                        "file_path": abs_path_str,
-                        "content_hash": current_hash,
-                        "storage_mode": "full_text",
-                    },
-                    store=s,
-                )
-                updated += 1
+        # Annotations first: a scanned PDF whose body can't convert can still
+        # carry highlights worth keeping.
+        note_visibility = meta.get("visibility", "public")
+        note_title = meta.get("title", pdf_path.stem)
+        add_annotations(
+            pdf_path,
+            doc_type="note",
+            visibility=note_visibility,
+            source=pdf_path.as_uri(),
+            title=note_title,
+            file_path=abs_path_str,
+            store=s,
+        )
+        _caption_figures_for_note(pdf_path, note_visibility, note_title, abs_path_str, s)
+        try:
+            full_text = pdf_to_markdown(pdf_path)
+        except ConversionError as exc:
+            # Skip the body but keep the refresh going — one bad file
+            # shouldn't abort the whole vault sync. Without body chunks the
+            # stored hash stays empty, so conversion is retried next refresh.
+            print(f"  ⚠️  {exc}", flush=True)
+            continue
+        add_texts(
+            content=full_text,
+            doc_type="note",
+            visibility=meta.get("visibility", "public"),
+            source=pdf_path.as_uri(),
+            extra_metadata={
+                "title": meta.get("title", pdf_path.stem),
+                "file_path": abs_path_str,
+                "content_hash": current_hash,
+                "storage_mode": "full_text",
+            },
+            store=s,
+        )
+        updated += 1
 
     return added, updated, deleted

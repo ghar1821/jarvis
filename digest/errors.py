@@ -1,6 +1,7 @@
 """Domain exceptions and retry utility."""
 
 import functools
+import random
 import time
 from typing import Callable, TypeVar
 
@@ -21,6 +22,10 @@ class LLMError(PaperDigestError):
 
 class RAGError(PaperDigestError):
     """Vector database operation failed."""
+
+
+class ConversionError(PaperDigestError):
+    """PDF-to-Markdown conversion produced no usable text (e.g. scanned/image-only PDF)."""
 
 
 class AuthenticationError(PaperDigestError):
@@ -44,13 +49,15 @@ def with_retries(
     exceptions: tuple[type[Exception], ...] = (Exception,),
 ) -> Callable[[F], F]:
     """
-    Decorator: retry a function up to max_attempts times with linear backoff.
+    Decorator: retry a function up to max_attempts times with exponential backoff.
 
-    Each failed attempt waits backoff * attempt seconds before the next try.
-    Prints a warning on each failure. Raises the last exception if all attempts fail.
+    Each failed attempt waits backoff * 2**(attempt-1) seconds, plus up to 25%
+    random jitter so repeated failures don't hammer a struggling service in
+    lockstep. Prints a warning on each failure. Raises the last exception if
+    all attempts fail.
 
     Usage:
-        @with_retries(max_attempts=5, backoff=2.0, exceptions=(requests.RequestException,))
+        @with_retries(max_attempts=5, backoff=2.0, exceptions=(FetchError,))
         def fetch(...): ...
     """
 
@@ -64,7 +71,7 @@ def with_retries(
                 except exceptions as exc:
                     last_exc = exc
                     if attempt < max_attempts:
-                        wait = backoff * attempt
+                        wait = backoff * 2 ** (attempt - 1) * random.uniform(1.0, 1.25)
                         print(
                             f"  Warning: {fn.__name__} failed (attempt {attempt}/{max_attempts}): {exc}. "
                             f"Retrying in {wait:.0f}s...",

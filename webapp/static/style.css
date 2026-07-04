@@ -1,0 +1,350 @@
+/* Dark theme only — a single palette, no light/dark toggle. Colours live in
+   custom properties so the whole scheme is defined in one place. */
+:root {
+  --bg: #111;
+  --surface: #1c1c1e;
+  --surface-2: #242426;
+  --surface-3: #2a2a2c;
+  --border: #333;
+  --text: #e6e6e6;
+  --text-dim: #999;
+  --text-faint: #777;
+  --accent: #4c8dff;
+  --accent-dim: #35507a;
+  --code-bg: #2a2a2c;
+  --error-bg: #2a1414;
+  --error-border: #6b2b2b;
+  --error-text: #ff8f8f;
+  --badge-bg: #2b2510;
+  --badge-border: #6b5a1e;
+  --badge-text: #e5c869;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: row;
+}
+
+/* ── Sidebar: sessions ── */
+#sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+#new-chat-btn { width: 100%; }
+
+#session-list { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: var(--text);
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.session-item:hover { background: var(--surface-2); }
+.session-item.active { background: var(--accent-dim); border-color: var(--accent); }
+.session-item.unresumable { opacity: 0.5; cursor: default; }
+.session-item .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-item .badge { flex-shrink: 0; font-size: 0.75rem; }
+.session-item .icon-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  padding: 0 2px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.session-item .icon-btn:hover { color: var(--text); }
+.session-item .icon-btn.pinned { color: var(--accent); }
+
+#main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+#header-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Header ⋮ menu ── */
+#menu-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 2px 8px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+#menu-btn:hover { background: var(--surface-2); color: var(--text); }
+
+#header-menu {
+  position: absolute;
+  top: 100%;
+  right: 12px;
+  margin-top: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  z-index: 20;
+  min-width: 180px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+#header-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  color: var(--text);
+  border: none;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+#header-menu button:hover { background: var(--surface-3); }
+
+.hidden { display: none; }
+
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.turn { max-width: 680px; width: 100%; }
+.turn.user    { align-self: flex-end; }
+.turn.assistant { align-self: flex-start; }
+
+.bubble {
+  /* Cap the readable line length at ~80 characters; long unbroken strings
+     still wrap via word-break. Alignment stays on .turn. */
+  max-width: min(80ch, 100%);
+  padding: 10px 14px;
+  border-radius: 10px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+.user .bubble      { background: var(--accent); color: #fff; white-space: pre-wrap; margin-left: auto; }
+.assistant .bubble { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); }
+
+/* Error bubble — shown when the /chat request itself fails */
+.assistant .bubble.error { background: var(--error-bg); border-color: var(--error-border); color: var(--error-text); }
+
+/* Markdown element styles inside assistant bubbles */
+.assistant .bubble p { margin-bottom: 0.55em; }
+.assistant .bubble p:last-child { margin-bottom: 0; }
+.assistant .bubble h1, .assistant .bubble h2, .assistant .bubble h3 {
+  font-weight: 600; margin: 0.8em 0 0.25em; line-height: 1.3;
+}
+.assistant .bubble h1 { font-size: 1.1em; }
+.assistant .bubble h2 { font-size: 1.0em; }
+.assistant .bubble h3 { font-size: 0.95em; }
+.assistant .bubble ul, .assistant .bubble ol { padding-left: 1.4em; margin: 0.4em 0; }
+.assistant .bubble li { margin-bottom: 0.15em; }
+.assistant .bubble code {
+  background: var(--code-bg); border-radius: 3px;
+  padding: 0.1em 0.35em; font-size: 0.88em;
+  font-family: ui-monospace, monospace;
+}
+.assistant .bubble pre {
+  background: var(--code-bg); border-radius: 6px;
+  padding: 0.7em 1em; margin: 0.5em 0; overflow-x: auto;
+}
+.assistant .bubble pre code { background: none; padding: 0; font-size: 0.85em; }
+.assistant .bubble hr { border: none; border-top: 1px solid var(--border); margin: 0.5em 0; }
+.assistant .bubble a { color: var(--accent); }
+
+/* Native <details> for collapsible tool calls — no JS needed to toggle */
+details {
+  margin-bottom: 6px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+}
+details summary { cursor: pointer; user-select: none; padding: 2px 0; }
+details pre {
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: var(--surface-3);
+  border-radius: 4px;
+  font-size: 0.76rem;
+  white-space: pre-wrap;
+  color: var(--text-dim);
+}
+
+.thinking {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 6px 2px;
+}
+
+#input-bar {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#input {
+  flex: 1;
+  padding: 9px 13px;
+  font-size: 0.95rem;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+#input:focus { border-color: var(--accent); }
+#input::placeholder { color: var(--text-faint); }
+
+button {
+  padding: 9px 18px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.45; cursor: default; }
+
+/* AI knowledge fallback toggle */
+.toggle-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-wrap input[type="checkbox"] { display: none; }
+.toggle-track {
+  width: 34px;
+  height: 18px;
+  background: var(--surface-3);
+  border-radius: 9px;
+  position: relative;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+.toggle-track::after {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  top: 2px;
+  left: 2px;
+  transition: left 0.2s;
+}
+.toggle-wrap input:checked ~ .toggle-track { background: var(--accent); }
+.toggle-wrap input:checked ~ .toggle-track::after { left: 18px; }
+
+/* Badge shown when the LLM falls back to its own training knowledge (also
+   reused by the deletion-confirmation box). */
+.own-knowledge-badge {
+  font-size: 0.78rem;
+  color: var(--badge-text);
+  background: var(--badge-bg);
+  border: 1px solid var(--badge-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin-bottom: 6px;
+}
+
+/* ── Response-style modal ── */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+}
+.modal-box {
+  position: relative;
+  z-index: 1;
+  width: min(90vw, 460px);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-box label { font-size: 0.82rem; color: var(--text-dim); }
+.modal-box textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  padding: 9px 11px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.modal-box textarea:focus { border-color: var(--accent); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions #style-cancel { background: var(--surface-3); color: var(--text); }

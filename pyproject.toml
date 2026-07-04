@@ -1,11 +1,9 @@
 [project]
-name = "seshat"
+name = "jarvis"
 version = "0.1.0"
 description = "Personal knowledge base with arXiv paper digest and LLM agent"
 requires-python = ">=3.12"
 dependencies = [
-    "marker-pdf>=1.10.2",
-    "ollama>=0.6.1",
     "requests>=2.33.1",
     "anthropic>=0.46.0",
     "chromadb>=0.6.0",
@@ -15,6 +13,13 @@ dependencies = [
     "langchain-text-splitters>=0.3.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
+    "apscheduler>=3.10,<4",
+    "watchdog>=6.0.0",
+    "arxiv>=4.0.0",
+    "pymupdf4llm>=1.28.0",
+    "pymupdf>=1.28.0",
+    "tomlkit>=0.15.0",
+    "ollama>=0.6.2",
 ]
 
 [build-system]
@@ -26,7 +31,8 @@ include = ["digest*", "vault_chat*", "webapp*"]
 
 [project.scripts]
 run-digest  = "digest.pipeline.run:main"
-convert-pdf = "digest.arxiv.convert:main"
+jarvis-sync = "digest.daemon:main"
+convert-pdf = "digest.kb.convert:main"
 vault-chat  = "vault_chat.chat:main"
 kb          = "digest.kb.cli:main"
 webapp      = "webapp.run:main"
