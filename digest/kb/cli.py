@@ -253,7 +253,7 @@ def cmd_sync_status() -> None:
     log_file = Path.home() / ".jarvis" / "logs" / "sync.log"
 
     if not STATUS_FILE.exists():
-        print("Daemon has never run. See docs/LAUNCHD_SETUP.md to set it up.")
+        print("Daemon has never run. Start it with: uv run jarvis-sync")
         return
 
     status = read_status()

@@ -343,6 +343,7 @@ async function sendMessage() {
   if (!text) return;
 
   inputEl.value = '';
+  resizeInput();
   sendBtn.disabled = true;
 
   // User message appears immediately
@@ -505,7 +506,18 @@ document.getElementById('ai-toggle').addEventListener('change', function () {
   });
 });
 
+// Grows the textarea to fit its content (up to the CSS max-height, where it
+// scrolls instead). Reset height to 'auto' first so shrinking (e.g. after
+// deleting a line) is measured correctly, not just growth.
+function resizeInput() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = `${inputEl.scrollHeight}px`;
+}
+
 sendBtn.addEventListener('click', sendMessage);
+inputEl.addEventListener('input', resizeInput);
 inputEl.addEventListener('keydown', e => {
+  // Enter sends; Shift+Enter falls through to the textarea's own default
+  // behaviour and inserts a newline.
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });

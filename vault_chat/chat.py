@@ -17,12 +17,27 @@ Auth for Anthropic:
   Option 2: add api_key to [auth] in ~/.jarvis/config.toml
 """
 
+import logging
 import sys
 from pathlib import Path
 
 from digest.config import get_config
 from digest.errors import LLMError, PrivacyError
 from digest.llm import make_provider
+
+# Tool failures are caught and turned into a short string for the LLM to
+# relay — but LLMs paraphrase rather than quote, so the real exception and
+# its traceback would otherwise vanish. Logged here (file only, not stderr,
+# so an interactive chat session isn't interrupted by a raw traceback) so a
+# failure is still diagnosable after the fact.
+_LOG_FILE = Path.home() / ".jarvis" / "logs" / "chat.log"
+log = logging.getLogger("vault-chat")
+if not log.handlers:
+    _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _handler = logging.FileHandler(_LOG_FILE)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
 
 # ── Tool definitions ───────────────────────────────────────────────────────────
 
@@ -420,6 +435,7 @@ def _retrieve_papers(args: dict, provider_str: str) -> tuple[str, bool]:
             store=get_store(),
         )
     except Exception as exc:
+        log.exception("retrieve_papers tool failed")
         return f"[retrieve_papers error: {exc}]", False
 
     # Query matched private content only — hard stop to prevent further probing.
@@ -459,6 +475,7 @@ def _search_notes(args: dict, provider_str: str) -> tuple[str, bool]:
             store=get_store(),
         )
     except Exception as exc:
+        log.exception("search_notes tool failed")
         return f"[search_notes error: {exc}]", False
 
     # Query matched private notes only — hard stop to prevent further probing.
@@ -699,6 +716,7 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             f"  Source: {file_source}"
         )
     except Exception as exc:
+        log.exception("add_document tool failed")
         return f"[add_document error: {exc}]"
 
 
@@ -811,6 +829,7 @@ def _remove_document(args: dict, vault: Path, request_confirmation=None) -> str:
             return "User declined the deletion. Nothing was removed."
         return execute_remove(action, store)
     except Exception as exc:
+        log.exception("remove_document tool failed")
         return f"[remove_document error: {exc}]"
 
 
@@ -830,6 +849,7 @@ def _list_papers(args: dict) -> str:
             )
         return "\n".join(lines)
     except Exception as exc:
+        log.exception("list_papers tool failed")
         return f"[list_papers error: {exc}]"
 
 
@@ -847,6 +867,7 @@ def _kb_stats() -> str:
             f"  {chunks} total chunks"
         )
     except Exception as exc:
+        log.exception("kb_stats tool failed")
         return f"[kb_stats error: {exc}]"
 
 
@@ -864,6 +885,7 @@ def _update_file_path(args: dict) -> str:
         resolved = str(Path(new_path).expanduser().resolve())
         return f"Updated {n} chunk(s) — new path: {resolved}"
     except Exception as exc:
+        log.exception("update_file_path tool failed")
         return f"[update_file_path error: {exc}]"
 
 
@@ -884,6 +906,7 @@ def _search_chat_history(args: dict, provider_str: str, session=None) -> str:
             store=get_store(),
         )
     except Exception as exc:
+        log.exception("search_chat_history tool failed")
         return f"[search_chat_history error: {exc}]"
 
     if has_private and not results:
@@ -934,6 +957,7 @@ def _index_vault_tool(vault: Path) -> str:
         added, updated, deleted = refresh_vault(vault, get_store())
         return f"Vault indexed: +{added} new, ~{updated} changed, -{deleted} removed"
     except Exception as exc:
+        log.exception("index_vault tool failed")
         return f"[index_vault error: {exc}]"
 
 
@@ -1043,6 +1067,7 @@ def _auto_refresh_vault(vault: Path) -> None:
                 flush=True,
             )
     except Exception as exc:
+        log.exception("vault auto-refresh failed")
         print(f"Warning: vault index refresh failed: {exc}", flush=True)
 
 

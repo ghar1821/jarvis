@@ -1,7 +1,7 @@
 """
 Tests for digest/daemon.py — the jarvis-sync background daemon.
 
-The daemon's scheduler loop and watchdog observer are launchd/runtime
+The daemon's scheduler loop and watchdog observer are process-runtime
 plumbing; what's tested here are the pure decision functions and job bodies:
 catch-up detection, file-stability polling, inbox ingestion/dedup, config
 validation, and the status file. PDF fixtures are generated in-test (cheap,

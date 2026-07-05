@@ -4,7 +4,94 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — daemon tz fix, Ollama revert, bioRxiv, figure captioning, dark UI
+## [current] — webapp bug fixes: modal visibility, session rename/pin, tool-call logging
+
+Three bugs found while testing the webapp after the launchd-removal change,
+plus the observability gap that made the second one hard to diagnose.
+
+### Fixed
+- **Response-style modal always visible, never closed**: `.hidden { display:
+  none; }` and `.modal { display: flex; ... }` (`webapp/static/style.css`)
+  have equal CSS specificity, so whichever rule appears later in the file
+  wins regardless of which classes are actually applied — `.modal` (later in
+  the file) always beat `.hidden`. Added `.modal.hidden { display: none; }`
+  so the combined-class rule wins on its own merits, independent of source
+  order.
+- **Session rename and pin silently broken in the webapp**: `sessions_pin`
+  and `sessions_rename` (`webapp/app.py`) declared their request bodies as
+  quoted forward references (`req: "PinRequest"`, `req: "RenameRequest"`)
+  while those Pydantic classes were defined later in the file. FastAPI
+  couldn't resolve the annotation at route-registration time, so it treated
+  `req` as a required **query parameter** instead of a JSON body — every
+  call with a real body 422'd with `"loc": ["query", "req"]`. Moved all
+  `*Request` model classes above the routes that use them and dropped the
+  quotes; the underlying `rename_session()` / `set_pinned()` functions were
+  never broken, only their HTTP wiring was.
+- **Tool-call failures were unrecoverable after the fact**: every tool
+  wrapper in `vault_chat/chat.py` caught `Exception` broadly and returned a
+  short string (e.g. `"[kb_stats error: ...]"`) for the LLM to relay — but
+  the LLM paraphrases rather than quotes, and nothing was ever logged, so a
+  real failure (e.g. a transient ChromaDB lock during a concurrent
+  `jarvis-sync` ingest) surfaced to the user as something as vague as
+  "there is an internal error with the database" with no way to find out
+  what actually happened. Added a `log.exception(...)` call at each of the
+  ten `except Exception` sites, writing to a new `~/.jarvis/logs/chat.log`
+  (file only, not echoed to the terminal, so an interactive session isn't
+  interrupted by a raw traceback) with the full exception and stack trace.
+  Shared by `vault-chat` and the webapp, since both dispatch through the
+  same `_dispatch_tool`.
+- **Code blocks ignored the 80-character cap**: `.assistant .bubble pre`
+  used `overflow-x: auto` — correct for a "don't reflow my code" viewer, but
+  the original request was for the 80-char cap to apply with no exceptions.
+  A long unbroken line (e.g. reproduced pseudocode from a paper) scrolled
+  sideways instead of wrapping, reading as "just continues on one line".
+  Switched to `white-space: pre-wrap; overflow-wrap: break-word;` so code
+  wraps like everything else, breaking mid-token if a single run of
+  characters has no natural break point.
+- **Message input couldn't wrap or hold a newline at all**: `#input`
+  (`webapp/index.html`) was a native `<input type="text">`, which is a
+  single-line control by construction — no CSS or JS can make it wrap or
+  accept a literal `\n`, regardless of the 80-char work above (which only
+  ever touched the rendered message *bubbles*, not the compose box). This
+  is what the original TODO item was actually about. Switched to a
+  `<textarea>` that grows with content up to a max height (then scrolls),
+  reset back to one line after each send (`resizeInput()` in
+  `webapp/static/app.js`). The existing Enter-sends / Shift+Enter-newline
+  keydown handler needed no changes — it was already textarea-shaped, it
+  just had no textarea to act on.
+
+---
+
+## [previous] — remove launchd support from jarvis-sync
+
+`jarvis-sync` no longer assumes it is run under launchd. The daemon has no
+launchd-specific code (KeepAlive-style restart-on-crash was always launchd's
+job, not the daemon's), but the docs and log setup did assume it — that
+assumption is now gone.
+
+### Changed
+- **Logging is self-contained**: `digest/daemon.py` `main()` now sets up
+  `logging.FileHandler(~/.jarvis/logs/sync.log)` directly (creating the
+  `logs/` directory if needed), alongside a `StreamHandler` to stderr. Log
+  output no longer depends on launchd's `StandardOutPath`/`StandardErrorPath`
+  redirecting stderr for you — running `uv run jarvis-sync` in a plain
+  terminal now produces the same log file on its own.
+- **Module docstring and `kb sync-status`'s "never run" message** no longer
+  point at a LaunchAgent — they describe running `uv run jarvis-sync`
+  directly and note that restart-on-crash is left to whatever keeps the
+  process alive (a terminal multiplexer, a process manager, or nothing).
+- **`docs/LAUNCHD_SETUP.md` removed.** README's daemon section replaces it
+  with plain "run it in a terminal" instructions; DESIGN.md's file tree,
+  command table, and daemon architecture section drop the launchd
+  references accordingly.
+
+### Removed
+- The user's own `com.putri.jarvis.sync` LaunchAgent (unloaded and its plist
+  deleted, outside the repo) — no longer documented or supported.
+
+---
+
+## [previous] — daemon tz fix, Ollama revert, bioRxiv, figure captioning, dark UI
 
 Fixes the launchd crash-loop, reverts the local provider from llama.cpp back to
 Ollama, adds bioRxiv as a digest source with knowledge-base title deduplication,

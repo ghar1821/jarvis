@@ -106,6 +106,34 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost
 app.mount("/static", StaticFiles(directory=_ROOT / "static"), name="static")
 
 
+# Request bodies — defined before any route so FastAPI can resolve each
+# parameter's type at route-registration time. A model referenced by name
+# before it exists (even via a quoted forward reference) makes FastAPI treat
+# the parameter as a query param instead of a JSON body.
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ConfigRequest(BaseModel):
+    kb_only: bool
+
+
+class PinRequest(BaseModel):
+    pinned: bool
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+class SettingsRequest(BaseModel):
+    response_style: str
+
+
+class ConfirmActionRequest(BaseModel):
+    confirmed: bool
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     return HTMLResponse((_ROOT / "index.html").read_text())
@@ -164,7 +192,7 @@ async def sessions_resume(session_id: str) -> dict:
 
 
 @app.post("/sessions/{session_id}/pin")
-async def sessions_pin(session_id: str, req: "PinRequest") -> dict:
+async def sessions_pin(session_id: str, req: PinRequest) -> dict:
     try:
         set_pinned(session_id, req.pinned)
     except (FileNotFoundError, ValueError):
@@ -173,7 +201,7 @@ async def sessions_pin(session_id: str, req: "PinRequest") -> dict:
 
 
 @app.post("/sessions/{session_id}/rename")
-async def sessions_rename(session_id: str, req: "RenameRequest") -> dict:
+async def sessions_rename(session_id: str, req: RenameRequest) -> dict:
     from digest.kb.store import get_store, update_chat_title
 
     try:
@@ -206,30 +234,6 @@ async def sessions_delete(session_id: str) -> dict:
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────
-
-
-class ChatRequest(BaseModel):
-    message: str
-
-
-class ConfigRequest(BaseModel):
-    kb_only: bool
-
-
-class PinRequest(BaseModel):
-    pinned: bool
-
-
-class RenameRequest(BaseModel):
-    title: str
-
-
-class SettingsRequest(BaseModel):
-    response_style: str
-
-
-class ConfirmActionRequest(BaseModel):
-    confirmed: bool
 
 
 @app.post("/config")

@@ -55,8 +55,7 @@ A personal research tool that:
 │
 ├── docs/
 │   ├── DESIGN.md                    # This file
-│   ├── CHANGELOG.md
-│   └── LAUNCHD_SETUP.md             # launchd setup for jarvis-sync
+│   └── CHANGELOG.md
 └── pyproject.toml
 ```
 
@@ -109,7 +108,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | Command | Module | Purpose |
 |---|---|---|
 | `uv run run-digest` | `digest.pipeline.run:main` | Run the weekly digest pipeline once |
-| `uv run jarvis-sync` | `digest.daemon:main` | Start the background sync daemon (normally run by launchd) |
+| `uv run jarvis-sync` | `digest.daemon:main` | Start the background sync daemon (foreground; run directly, no service manager) |
 | `uv run vault-chat` | `vault_chat.chat:main` | Start the KB agent chat session |
 | `uv run kb` | `digest.kb.cli:main` | Manage the knowledge base (CLI) |
 | `uv run convert-pdf` | `digest.kb.convert:main` | Convert a PDF to Markdown (standalone) |
@@ -126,7 +125,8 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | `~/.jarvis/state/sync_status.json` | `jarvis-sync` daemon/job status (read by `kb sync-status`) |
 | `~/.jarvis/sessions/` | Persistent chat sessions, one JSON file each (dir 0700, files 0600) |
 | `~/.jarvis/skills/` | User-defined skill `.md` files (configurable via `skills_dir`) |
-| `~/.jarvis/logs/sync.log` | Daemon log (per the launchd plist) |
+| `~/.jarvis/logs/sync.log` | `jarvis-sync` daemon log (written directly by the daemon; also echoed to stderr) |
+| `~/.jarvis/logs/chat.log` | Chat-tool failures — full exception + traceback for every caught tool error, shared by `vault-chat` and the webapp (file only, not echoed to the terminal) |
 | `~/Documents/papers/digest/` | Weekly digest `.md` output files (configurable) |
 
 ---
@@ -364,14 +364,14 @@ The standalone `convert-pdf` CLI (entry point `digest.kb.convert:main`) accepts 
 
 ## Sync daemon — `digest/daemon.py` (`jarvis-sync`)
 
-One supervised long-running process, kept alive by launchd (`KeepAlive` — launchd only restarts it; all scheduling lives inside the daemon, where catch-up can be handled properly). See `docs/LAUNCHD_SETUP.md` for the plists.
+One supervised long-running process, run directly with `uv run jarvis-sync` — it stays in the foreground; all scheduling lives inside the daemon, where catch-up can be handled properly. Restart-on-crash is not the daemon's concern: it's whatever keeps the process running (a terminal multiplexer, a process manager, or nothing at all).
 
 **Process architecture:**
 - Main thread: APScheduler `BlockingScheduler` running two jobs — the weekly digest (`CronTrigger(day_of_week=digest_day, hour=digest_hour)`, `coalesce=True`, `misfire_grace_time=3600` so a run missed during sleep fires on wake) and the vault refresh (`IntervalTrigger`, also run once at startup).
 - A watchdog `Observer` thread watching `pdf_watch_dir` for `*.pdf` created/moved events (cloud-sync clients write to a temp name then rename, so `on_moved` matters as much as `on_created`).
 - A single ingest worker thread draining a `queue.Queue` of PDF paths — one conversion at a time. Each queued file is polled with `wait_for_stable()` (size+mtime unchanged over consecutive checks) before ingesting, because cloud-sync clients and slow copies write PDFs incrementally.
 
-**Status file** — `~/.jarvis/state/sync_status.json` records the daemon pid/start time and each job's `last_run` / `last_success` / `last_error` (written atomically). `kb sync-status` reads it, checks pid liveness, and tails the log. Every job body catches its own exceptions and records the outcome — one failing job never takes the daemon down. Fatal setup problems (invalid `[sync]` config, embedding-model mismatch) exit non-zero at startup so launchd restarts visibly rather than limping.
+**Status file** — `~/.jarvis/state/sync_status.json` records the daemon pid/start time and each job's `last_run` / `last_success` / `last_error` (written atomically). `kb sync-status` reads it, checks pid liveness, and tails the log. Every job body catches its own exceptions and records the outcome — one failing job never takes the daemon down. Fatal setup problems (invalid `[sync]` config, embedding-model mismatch) exit non-zero at startup with the reason logged to `~/.jarvis/logs/sync.log` and stderr.
 
 **Digest catch-up** — `digest_is_overdue(trigger, last_success, now)`: at daemon start, if a scheduled fire time has passed since the persisted `last_success` stamp (machine was powered off across the slot), the digest runs immediately. On the very first start there is no baseline, so it waits for the next slot rather than surprise-running. The misfire grace handles sleep; the stamp handles power-off.
 

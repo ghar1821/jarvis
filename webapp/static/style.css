@@ -190,7 +190,11 @@ header {
 }
 .assistant .bubble pre {
   background: var(--code-bg); border-radius: 6px;
-  padding: 0.7em 1em; margin: 0.5em 0; overflow-x: auto;
+  padding: 0.7em 1em; margin: 0.5em 0;
+  /* Wrap instead of horizontal-scrolling — the 80-char cap applies to code
+     blocks too, with no exceptions (long unspaced tokens still break). */
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 .assistant .bubble pre code { background: none; padding: 0; font-size: 0.85em; }
 .assistant .bubble hr { border: none; border-top: 1px solid var(--border); margin: 0.5em 0; }
@@ -237,11 +241,20 @@ details pre {
   flex: 1;
   padding: 9px 13px;
   font-size: 0.95rem;
+  font-family: inherit;
+  line-height: 1.4;
   background: var(--surface-2);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
   outline: none;
+  /* A <textarea>, not <input> — a native single-line input can neither wrap
+     text nor hold a newline character, no matter what CSS/JS is applied.
+     Height grows with content up to max-height, then scrolls; app.js resets
+     it back to one line after each send. */
+  resize: none;
+  max-height: 200px;
+  overflow-y: auto;
 }
 #input:focus { border-color: var(--accent); }
 #input::placeholder { color: var(--text-faint); }
@@ -313,6 +326,10 @@ button:disabled { opacity: 0.45; cursor: default; }
   align-items: center;
   justify-content: center;
 }
+/* .modal and .hidden both set display, at equal specificity — without this,
+   whichever rule is later in the file wins regardless of which classes are
+   actually applied, so the modal would ignore the hidden class entirely. */
+.modal.hidden { display: none; }
 .modal-backdrop {
   position: absolute;
   inset: 0;

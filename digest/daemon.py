@@ -1,7 +1,8 @@
 """
 jarvis-sync — supervised background daemon.
 
-One long-running process, kept alive by launchd (KeepAlive), owning three jobs:
+Run directly in a terminal with `uv run jarvis-sync` — it stays in the
+foreground and owns three jobs:
 
   1. Weekly arXiv digest (APScheduler cron trigger). Runs missed while asleep
      fire on wake via misfire handling; runs missed while powered off are
@@ -15,7 +16,12 @@ One long-running process, kept alive by launchd (KeepAlive), owning three jobs:
 Every job body catches its own exceptions and records the outcome in
 ~/.jarvis/state/sync_status.json (read by `kb sync-status`); one failing job
 never takes the daemon down. Fatal setup problems (bad config, embedding-model
-mismatch) exit non-zero so launchd restarts visibly.
+mismatch) exit non-zero (see the message printed to the log for why).
+
+Logging goes to ~/.jarvis/logs/sync.log by default, plus stderr so a
+foreground run shows the same messages live. Restart-on-crash is up to
+whatever keeps the process running (your terminal, a process manager, etc.)
+— the daemon itself makes no assumptions about that.
 
 The daemon does not manage other daemons: if the provider is local and
 Ollama is down, the digest job fails with a pointer to the docs.
@@ -37,6 +43,7 @@ from .config import Config, get_config, warn_if_config_readable
 
 STATE_DIR = Path.home() / ".jarvis" / "state"
 STATUS_FILE = STATE_DIR / "sync_status.json"
+LOG_FILE = Path.home() / ".jarvis" / "logs" / "sync.log"
 
 VALID_DIGEST_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
@@ -401,10 +408,13 @@ def _build_scheduler(cfg: Config):
 
 
 def main() -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
+        # File first so it's always captured; stderr too so a foreground
+        # `uv run jarvis-sync` shows the same messages live.
+        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stderr)],
     )
 
     warn_if_config_readable()

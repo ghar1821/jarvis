@@ -62,7 +62,6 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture documentation.
 ├── docs/
 │   ├── DESIGN.md
 │   ├── CHANGELOG.md
-│   ├── LAUNCHD_SETUP.md
 │   └── RENAME.md
 └── pyproject.toml
 ```
@@ -81,7 +80,7 @@ uv sync
 ollama pull qwen3-vl:30b
 ```
 
-`qwen3-vl:30b` is the default (a vision + thinking MoE that fits a 36GB M3 Max); confirm the exact tag with `ollama list`, since Ollama's registry names can shift. Ollama runs as a macOS login-item app or via `ollama serve` — no LaunchAgent needed. To keep the sync daemon running permanently via launchd, see [docs/LAUNCHD_SETUP.md](docs/LAUNCHD_SETUP.md). Summary mode converts the PDF to markdown locally (via `pymupdf4llm`) before summarising, so it does not need the PDF-document API.
+`qwen3-vl:30b` is the default (a vision + thinking MoE that fits a 36GB M3 Max); confirm the exact tag with `ollama list`, since Ollama's registry names can shift. Ollama runs as a macOS login-item app or via `ollama serve`. Run `uv run jarvis-sync` directly in a terminal to keep the sync daemon going (see "Background sync daemon" below). Summary mode converts the PDF to markdown locally (via `pymupdf4llm`) before summarising, so it does not need the PDF-document API.
 
 **Upgrading an existing config:** old configs with `provider = "llamacpp"` and `llamacpp_url` / `llamacpp_model` should switch back to `provider = "ollama"` and `ollama_model` (see [Configuration](#configuration)). Old configs may also carry a stale `rag_dir = "~/.seshat/rag"` — fix it to `~/.jarvis/rag`.
 
@@ -370,7 +369,13 @@ One failing job never takes the daemon down; check health any time with:
 uv run kb sync-status
 ```
 
-Run the daemon permanently under launchd (`KeepAlive`) — setup, plists, and troubleshooting are in [docs/LAUNCHD_SETUP.md](docs/LAUNCHD_SETUP.md). The daemon does not start Ollama for you; run Ollama as a login-item app or `ollama serve`.
+Run it directly in a terminal:
+
+```bash
+uv run jarvis-sync
+```
+
+It logs to `~/.jarvis/logs/sync.log` (and to the terminal) by default, and stays in the foreground — `Ctrl-C` to stop it. There is no built-in service/daemon management (no launchd, no auto-restart-on-crash): if you want it to survive closing the terminal or to restart automatically, run it under a terminal multiplexer (`tmux`/`screen`) or a process manager of your choice. The daemon does not start Ollama for you either; run Ollama as a login-item app or `ollama serve`.
 
 ---
 
