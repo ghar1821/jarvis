@@ -1,5 +1,5 @@
 """
-Tests for digest/kb/annotations.py — PDF highlight/comment extraction.
+Tests for jarvis/kb/annotations.py — PDF highlight/comment extraction.
 
 Fixture PDFs are generated in-test with PyMuPDF itself (the same annotation
 objects Preview/Foxit write), so no binary fixtures are committed and the
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pymupdf
 
-from digest.kb.annotations import extract_annotations
+from jarvis.kb.annotations import extract_annotations
 
 SENTENCE = "The quick brown fox jumps over the lazy dog."
 

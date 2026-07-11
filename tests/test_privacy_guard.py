@@ -1,5 +1,5 @@
 """
-Tests for the chat-layer privacy enforcement in vault_chat/chat.py.
+Tests for the chat-layer privacy enforcement in jarvis/chat/chat.py.
 
 These cover the guards that sit between the LLM's tool calls and the data:
 - read_file: vault containment, private-dir hard stop, symlink resolution
@@ -16,10 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from digest.config import Config
-from digest.errors import PrivacyError
-from digest.kb.store import add_texts
-from vault_chat.chat import _add_document, _search_notes, read_file
+from jarvis.core.config import Config
+from jarvis.core.errors import PrivacyError
+from jarvis.kb.store import add_texts
+from jarvis.chat.chat import _add_document, _search_notes, read_file
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def vault(tmp_path, monkeypatch):
     (tmp_path / "public" / "open.md").write_text("# Open\nPublic content.")
     (tmp_path / "private" / "secret.md").write_text("# Secret\nPrivate content.")
     monkeypatch.setattr(
-        "digest.kb.store.get_config",
+        "jarvis.kb.store.get_config",
         lambda: Config(private_vault_dirs=["private"]),
     )
     return tmp_path
@@ -107,7 +107,7 @@ def test_search_notes_appends_caveat_when_private_matches_excluded(store, monkey
     Input:  one public and one private note about the same topic, anthropic
     Expected output: public hit + caveat string; private text absent
     """
-    monkeypatch.setattr("digest.kb.store.get_store", lambda: store)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     add_texts(content="Public overview of the quantum sensing project.",
               doc_type="note", visibility="public", source="local",
               extra_metadata={"file_path": "projects/quantum.md", "title": "Quantum"},
@@ -134,7 +134,7 @@ def test_search_notes_hard_stops_when_only_private_matches(store, monkeypatch):
     Input:  a single private note, anthropic provider
     Expected output: PrivacyError
     """
-    monkeypatch.setattr("digest.kb.store.get_store", lambda: store)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     add_texts(content="Private thoughts on the reorganisation.",
               doc_type="note", visibility="private", source="local",
               extra_metadata={"file_path": "private/reorg.md"}, store=store)
@@ -151,7 +151,7 @@ def test_search_notes_local_provider_gets_no_caveat(store, monkeypatch):
     Input:  public + private notes, local provider
     Expected output: both hits, no caveat text, saw_private=True
     """
-    monkeypatch.setattr("digest.kb.store.get_store", lambda: store)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     add_texts(content="Public note about conference travel.", doc_type="note",
               visibility="public", source="local",
               extra_metadata={"file_path": "travel.md"}, store=store)
@@ -201,7 +201,7 @@ def test_add_document_private_note_pdf_is_allowed(store, tmp_path, monkeypatch):
     """
     import pymupdf
 
-    monkeypatch.setattr("digest.kb.store.get_store", lambda: store)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     doc = pymupdf.open()
     page = doc.new_page()
     page.insert_text((72, 72), "Confidential lab notebook entry.", fontsize=12)

@@ -17,8 +17,13 @@ The corpus deliberately includes:
   - confusable near-neighbours (image classification vs image generation;
     "gradient descent" note vs "policy gradient" paper) to catch coarse matching
   - acronym / proper-noun targets (LoRA, Dr. Tanaka) that pure dense retrieval
-    tends to miss — the sentinel for whether hybrid BM25 is ever worth adding
-    (see docs/DESIGN.md, "Deferred retrieval improvements").
+    tends to miss — this is what hybrid BM25+RRF retrieval (see
+    jarvis/kb/store.py::_hybrid_search, gated by [rag] hybrid) targets
+  - author-name queries (e.g. "papers by Vaswani"), which only the
+    embed_header prepended to every paper chunk can satisfy — the dense
+    summary text itself never mentions an author's name
+
+Runs with the default config (hybrid=True), the same as production.
 """
 
 import uuid
@@ -27,7 +32,7 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from digest.kb.store import add_paper, add_texts, search
+from jarvis.kb.store import add_paper, add_texts, search
 
 # Same gitignored store directory the other KB tests use (see conftest.py).
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
@@ -35,55 +40,59 @@ TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
 
 # ── Fixture corpus ───────────────────────────────────────────────────────────
 
-# Paper summaries: (source, title, dense_summary). Stored via add_paper in
-# summary mode (title + link + summary → one or two chunks).
+# Paper summaries: (source, title, dense_summary, authors). authors defaults to ""
+# except where a golden query below specifically targets an author's name — the
+# summary text alone never mentions authors, so the header embedded by
+# add_paper() is the only thing that can make an author-name query hit.
+# Stored via add_paper in summary mode (title + link + authors + summary → one or two chunks).
 _PAPERS = [
     ("paper-transformers", "Attention Is All You Need",
      "We introduce the Transformer, a sequence model based entirely on self-attention "
      "that dispenses with recurrence and convolutions. Multi-head attention lets the "
-     "model capture long-range dependencies between tokens in parallel."),
+     "model capture long-range dependencies between tokens in parallel.",
+     "Ashish Vaswani, Noam Shazeer, Niki Parmar"),
     ("paper-cnn", "Deep Convolutional Networks for Image Classification",
      "A deep convolutional neural network classifies natural images into categories. "
      "Stacked convolutional filters and pooling layers learn a hierarchy of visual "
-     "features from pixels to objects."),
+     "features from pixels to objects.", ""),
     ("paper-vit", "An Image is Worth 16x16 Words: Vision Transformers",
      "A vision transformer splits an image into fixed-size patches, embeds each patch, "
      "and applies a standard transformer encoder with self-attention over the patch "
-     "sequence to classify the image, using no convolutions at all."),
+     "sequence to classify the image, using no convolutions at all.", ""),
     ("paper-segmentation", "Semantic Segmentation with Encoder-Decoder Networks",
      "A fully convolutional encoder-decoder network assigns a class label to every pixel "
      "of an image, producing a dense segmentation mask instead of a single image-level "
-     "category."),
+     "category.", ""),
     ("paper-rl", "Policy Gradient Methods for Reinforcement Learning",
      "We study policy gradient algorithms that optimise an agent's expected reward by "
      "following the gradient of the policy. The method learns control policies through "
-     "trial-and-error interaction with the environment."),
+     "trial-and-error interaction with the environment.", ""),
     ("paper-lora", "LoRA: Low-Rank Adaptation of Large Language Models",
      "LoRA freezes the pretrained weights of a large language model and injects trainable "
      "low-rank matrices into each layer, drastically cutting the number of parameters "
-     "needed to fine-tune the model for a downstream task."),
+     "needed to fine-tune the model for a downstream task.", "Edward Hu, Yelong Shen"),
     ("paper-diffusion", "Denoising Diffusion Probabilistic Models",
      "Diffusion models generate images by learning to reverse a gradual noising process. "
      "Starting from pure noise, the model iteratively denoises the sample until a "
-     "realistic image emerges."),
+     "realistic image emerges.", ""),
     ("paper-gnn", "Graph Neural Networks for Relational Data",
      "Graph neural networks propagate information along the edges of a graph, learning "
      "node representations that account for the structure of relationships between "
-     "entities."),
+     "entities.", ""),
     ("paper-bert", "BERT: Pretraining Deep Bidirectional Transformers",
      "BERT pretrains a bidirectional transformer using a masked language modelling "
      "objective, predicting randomly masked tokens from their surrounding context to "
-     "learn general-purpose language representations."),
+     "learn general-purpose language representations.", ""),
     ("paper-federated", "Privacy-Preserving Federated Learning",
      "Federated learning trains a shared model across many devices without moving raw "
-     "data off each device, aggregating only model updates to preserve user privacy."),
+     "data off each device, aggregating only model updates to preserve user privacy.", ""),
     ("paper-protein", "Predicting Three-Dimensional Protein Structure from Sequence",
      "A deep network predicts the folded three-dimensional structure of a protein "
      "directly from its amino-acid sequence, reaching near-experimental accuracy on "
-     "structure prediction benchmarks."),
+     "structure prediction benchmarks.", ""),
     ("paper-scrna", "Clustering Cells from Single-Cell RNA Sequencing",
      "We cluster cells profiled by single-cell RNA sequencing into cell types based on "
-     "their gene-expression signatures, revealing heterogeneity within a tissue sample."),
+     "their gene-expression signatures, revealing heterogeneity within a tissue sample.", ""),
 ]
 
 # Markdown notes: (source, markdown_text). Stored via add_texts as full-text notes
@@ -161,6 +170,11 @@ _GOLDEN = [
     ("BERT", "paper-bert"),
     ("aggregating model updates without sharing raw data across devices", "paper-federated"),
     ("adaptive per-parameter learning rate", "note-optimisers"),
+    # Author-name queries — the summary text never mentions an author, so
+    # only the embed_header (title + authors, prepended to every chunk) can
+    # make these hit. This is the sentinel for the embed-header migration.
+    ("papers by Vaswani", "paper-transformers"),
+    ("paper written by Edward Hu on low-rank adaptation", "paper-lora"),
 ]
 
 K = 5
@@ -201,8 +215,9 @@ def quality_store(embeddings):
         embedding_function=embeddings,
         persist_directory=str(TEST_CHROMA_DIR),
     )
-    for source, title, summary in _PAPERS:
-        add_paper({"link": source, "title": title}, dense_summary=summary, store=store)
+    for source, title, summary, authors in _PAPERS:
+        add_paper({"link": source, "title": title, "authors": authors},
+                  dense_summary=summary, store=store)
     for source, text in _NOTES:
         add_texts(content=text, doc_type="note", visibility="public",
                   source=source, store=store)

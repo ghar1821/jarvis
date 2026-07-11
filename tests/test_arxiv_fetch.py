@@ -1,5 +1,5 @@
 """
-Tests for digest/arxiv/fetch.py — arXiv retrieval via the `arxiv` package.
+Tests for jarvis/digest/arxiv/fetch.py — arXiv retrieval via the `arxiv` package.
 
 The arxiv.Client is a genuine network boundary (live HTTP to export.arxiv.org),
 so these tests stub `_client.results` and construct arxiv.Result objects
@@ -14,13 +14,13 @@ from datetime import datetime, timezone
 import arxiv
 import pytest
 
-import digest.arxiv.fetch as fetch_mod
-import digest.errors
-from digest.arxiv.fetch import _to_paper, deduplicate, fetch_arxiv, fetch_arxiv_paper
-from digest.errors import FetchError
+import jarvis.digest.arxiv.fetch as fetch_mod
+import jarvis.core.errors
+from jarvis.digest.arxiv.fetch import _to_paper, deduplicate, fetch_arxiv, fetch_arxiv_paper
+from jarvis.core.errors import FetchError
 
 
-def _make_result(title="A Paper", summary="An abstract.", primary_category="cs.LG"):
+def _make_result(title="A Paper", summary="An abstract.", primary_category="cs.LG", doi=""):
     result = arxiv.Result(
         entry_id="http://arxiv.org/abs/2301.07041v1",
         title=title,
@@ -30,6 +30,7 @@ def _make_result(title="A Paper", summary="An abstract.", primary_category="cs.L
         updated=datetime(2023, 1, 17, tzinfo=timezone.utc),
         primary_category=primary_category,
         categories=[primary_category],
+        doi=doi,
     )
     return result
 
@@ -37,7 +38,7 @@ def _make_result(title="A Paper", summary="An abstract.", primary_category="cs.L
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
     """Skip real backoff sleeps in every test in this module."""
-    monkeypatch.setattr(digest.errors.time, "sleep", lambda _: None)
+    monkeypatch.setattr(jarvis.core.errors.time, "sleep", lambda _: None)
 
 
 def test_to_paper_maps_result_fields():
@@ -58,6 +59,17 @@ def test_to_paper_maps_result_fields():
     assert paper["authors"] == "Ada Lovelace, Alan Turing"
     assert paper["published"] == "2023-01-17"
     assert paper["source"] == "arXiv:cs.LG"
+    assert paper["doi"] == ""  # arxiv.Result.doi defaults to "" when the API has none
+
+
+def test_to_paper_surfaces_doi_when_arxiv_result_has_one():
+    """
+    Some arXiv entries carry a DOI (e.g. once published in a journal) —
+    _to_paper must pass it straight through into the paper dict.
+    """
+    result = _make_result(doi="10.1234/example.doi")
+    paper = _to_paper(result, "arXiv:cs.LG")
+    assert paper["doi"] == "10.1234/example.doi"
 
 
 def test_fetch_arxiv_returns_papers(monkeypatch):

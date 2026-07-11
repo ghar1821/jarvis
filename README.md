@@ -11,22 +11,23 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture documentation.
 ## What it does
 
 **Automated paper discovery and background sync**
-- The `jarvis-sync` daemon fetches papers weekly from configured arXiv categories — with catch-up if the machine was asleep or powered off at the scheduled time
+- The `jarvis-sync` daemon fetches papers weekly from configured arXiv categories — with catch-up (re-checked every 6 hours) if the machine was asleep or powered off at the scheduled time
 - Scores and ranks them with the configured LLM against a custom relevance prompt
-- Writes a tiered Markdown digest; papers scoring ≥ 9 are automatically indexed into the knowledge base
-- Watches a PDF inbox folder: any PDF dropped in is auto-indexed; the vault index is refreshed periodically
+- Writes a tiered Markdown digest and indexes it by tier: score ≥ 9 papers are stored **full text** (the PDF is downloaded and chunked), 8–8.9 as summary entries, and the digest document itself is indexed too — so even below-threshold papers stay searchable
+- Scans a PDF inbox folder every `pdf_watch_minutes` (default 30): any PDF dropped in is auto-indexed within one interval; the vault index is refreshed periodically
 
 **Personal knowledge base**
 - Stores papers as LLM-generated summaries (~1000 words) or as full chunked text for deep querying
 - Indexes your Obsidian vault notes alongside papers in a single local vector store (runs entirely on your machine)
 - Extracts highlights and typed notes from annotated PDFs and makes them searchable (see [PDF annotations](#pdf-annotations))
-- Retrieval combines BGE embeddings, section-aware chunking, and a cross-encoder reranker for accurate matches — all local, no external calls
+- Retrieval combines BGE embeddings, hybrid BM25 keyword search (reciprocal-rank fusion), section-aware chunking, and a cross-encoder reranker for accurate matches — all local, no external calls
+- Titles, authors, and DOI are auto-inferred for local PDFs and surfaced in search results; `kb set-meta` or asking the agent lets you correct any that got inferred wrong
 - Privacy model: vault folders marked private are accessible to the local model only — never sent to cloud APIs. Papers are always public; only notes can be private
 
 **Conversational agent (`vault-chat` and web UI)**
 - Query your knowledge base in natural language
 - Add papers by arXiv URL or local PDF mid-conversation
-- Remove entries, trigger vault re-indexing, and check stats through the same chat interface — deletions always require a human confirmation, and note files are never deleted from disk
+- Remove entries, trigger vault re-indexing, and check stats through the same chat interface — deletions always require a human confirmation, and jarvis can never delete a file on disk (database entries only)
 - Persistent chat sessions: resume, pin, delete, and search past conversations
 - User-defined skills and a configurable response style
 - Runs against a local model via Ollama or Anthropic Claude (switchable per session)
@@ -37,32 +38,41 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture documentation.
 ## Repository structure
 
 ```
-├── digest/
-│   ├── config.py, errors.py, llm.py   # Shared infrastructure
-│   ├── daemon.py                       # jarvis-sync background daemon
-│   ├── arxiv/                          # arXiv fetching and PDF download
-│   │   ├── fetch.py
-│   │   └── convert.py
-│   ├── pipeline/                       # Automated weekly digest
-│   │   ├── run.py, score.py, format.py
-│   │   └── prompts/prompt_filter_score.md
-│   └── kb/                             # Knowledge base management
-│       ├── store.py, cli.py
-│       ├── convert.py                  # PDF → Markdown (pymupdf4llm)
-│       ├── annotations.py              # PDF highlight/note extraction
-│       └── prompts/paper_summary.md
-├── vault_chat/
-│   ├── chat.py                         # Conversational KB agent
-│   ├── sessions.py                     # Persistent chat sessions
-│   └── skills.py                       # User-defined skills
-├── webapp/
-│   ├── app.py, run.py                  # FastAPI web UI (localhost:8080)
-│   ├── index.html                      # Chat UI page
-│   └── static/                         # style.css, app.js
+├── jarvis/
+│   ├── core/                            # Shared infrastructure
+│   │   └── config.py, errors.py, llm.py
+│   ├── digest/                          # Automated weekly digest
+│   │   ├── arxiv/                       # arXiv fetching and PDF download
+│   │   │   ├── fetch.py
+│   │   │   └── convert.py
+│   │   ├── biorxiv/                     # bioRxiv fetching
+│   │   │   └── fetch.py
+│   │   ├── pipeline/
+│   │   │   ├── run.py, score.py, format.py
+│   │   │   └── prompts/prompt_filter_score.md
+│   │   └── import_digest.py             # `kb add-digest` implementation
+│   ├── kb/                              # Knowledge base management
+│   │   ├── store.py, cli.py
+│   │   ├── convert.py                   # PDF → Markdown (pymupdf4llm)
+│   │   ├── annotations.py               # PDF highlight/note extraction
+│   │   └── prompts/paper_summary.md
+│   ├── sync/                            # jarvis-sync background daemon
+│   │   ├── daemon.py
+│   │   └── status.py                    # `kb sync-status` implementation
+│   ├── chat/
+│   │   ├── chat.py                      # Conversational KB agent
+│   │   ├── sessions.py                  # Persistent chat sessions
+│   │   └── skills.py                    # User-defined skills
+│   └── webapp/
+│       ├── app.py, run.py               # FastAPI web UI (localhost:8080)
+│       ├── index.html                   # Chat UI page
+│       └── static/                      # style.css, app.js
 ├── docs/
 │   ├── DESIGN.md
-│   ├── CHANGELOG.md
-│   └── RENAME.md
+│   ├── TESTING.md
+│   ├── TODO.md
+│   ├── ROADMAP.md
+│   └── CHANGELOG.md
 └── pyproject.toml
 ```
 
@@ -84,7 +94,7 @@ ollama pull qwen3-vl:30b
 
 **Upgrading an existing config:** old configs with `provider = "llamacpp"` and `llamacpp_url` / `llamacpp_model` should switch back to `provider = "ollama"` and `ollama_model` (see [Configuration](#configuration)). Old configs may also carry a stale `rag_dir = "~/.seshat/rag"` — fix it to `~/.jarvis/rag`.
 
-**Upgrading an existing knowledge base:** the default embedding model is now `BAAI/bge-small-en-v1.5`. Run `uv run kb reindex` once to re-embed your existing chunks — the app refuses to search a knowledge base built with a different embedding model until you do. This re-embeds stored chunk text only (no LLM calls, nothing re-downloaded). To also benefit from the newer section-aware chunking, run `uv run kb index-vault --force` for vault notes.
+**Upgrading an existing knowledge base:** the default embedding model is now `BAAI/bge-small-en-v1.5`. Run `uv run kb reindex` once to re-embed your existing chunks — the app refuses to search a knowledge base built with a different embedding model until you do. This re-embeds stored chunk text only (no LLM calls, nothing re-downloaded). To also benefit from the newer section-aware chunking, run `uv run kb index-vault --force` for vault notes. **`uv run kb reindex` is also required after upgrading to hybrid retrieval** (see "Retrieval quality" below) — the same run both clears any pre-existing index corruption and prepends the title/authors header to old paper chunks so author-name queries work against them too. If you suspect the knowledge base index is corrupted (searches failing with an internal ChromaDB error), run `uv run kb doctor` to diagnose it before reaching for `kb reindex` blind.
 
 ---
 
@@ -113,7 +123,8 @@ chunk_size = 1024
 chunk_overlap = 128
 rerank_model = "cross-encoder/ms-marco-MiniLM-L6-v2"                        # cross-encoder reranker; "" to disable
 rerank_top_n = 25                                                          # candidates fetched before re-ranking
-figure_captions = true                                                     # caption PDF figures at ingest (needs a vision model); false to disable
+hybrid = true                                                              # hybrid dense+BM25 retrieval (RRF-fused); false = dense-only
+figure_captions = false                                                    # caption PDF figures at ingest (off by default; opt in per document with kb add --figures)
 figure_max_per_doc = 20                                                    # cap on figures captioned per document
 figure_min_pixels = 40000                                                  # skip images smaller than this (logos, rules)
 
@@ -128,10 +139,11 @@ compact_after_tokens = 12000     # compact long sessions past this estimated con
 compact_keep_exchanges = 6       # recent turns kept verbatim when compacting
 
 [sync]
-pdf_watch_dir = "~/Documents/papers/inbox"  # PDF inbox for jarvis-sync; omit to disable the watcher
+pdf_watch_dir = "~/Documents/papers/inbox"  # PDF inbox for jarvis-sync; omit to disable the scan
+pdf_watch_minutes = 30           # minutes between PDF inbox scans
 vault_refresh_minutes = 30
 digest_day = "mon"               # day of week for the weekly digest
-digest_hour = 2
+digest_hour = 5
 
 [auth]
 api_key = ""                     # Anthropic API key (alternative to ANTHROPIC_API_KEY env var)
@@ -208,22 +220,27 @@ The sidebar lists stored chat sessions: click to resume, rename (✎), pin to pr
 
 A **DB only** toggle (on by default) restricts the agent to the knowledge base. Switch it off to allow the model to fall back to its training knowledge — an amber status badge appears whenever this happens.
 
-When the agent requests a deletion, the webapp shows a Confirm/Cancel dialog — nothing is removed until you click Confirm. The model can only ask; the decision is always yours.
+Each assistant response has a hover-revealed copy button (top-right of the bubble) that copies the whole reply to the clipboard as raw markdown. Selecting text inside a response and copying it natively (Cmd+C/Ctrl+C) also yields markdown notation — not the rendered HTML — so pasting into an Obsidian note (or any markdown editor) keeps formatting like bold, code, and lists intact. There is no built-in "save to vault" feature; the workflow is copy from jarvis, paste into your own notes.
+
+When the agent requests a deletion, the webapp shows a Confirm/Cancel dialog — nothing is removed until you click Confirm. The model can only ask; the decision is always yours. The dialog always states that only the database entry is removed — jarvis has no code path that deletes a file on disk.
+
+If any papers have auto-inferred (not yet human-verified) title/authors/DOI, a dismissible banner appears under the header naming the count — ask the agent to review them, or fix individual entries with `kb set-meta`.
 
 Available tools the agent can call:
 
 | Tool | What it does |
 |---|---|
-| `retrieve_papers` | Semantic search over indexed papers |
+| `retrieve_papers` | Semantic search over indexed papers and weekly digest documents |
 | `search_notes` | Semantic search over vault notes |
 | `search_chat_history` | Semantic search over past conversations |
 | `read_file` | Read a specific vault file in full |
 | `read_skill` | Load a user-defined skill's full instructions (only available when skills exist) |
-| `add_document` | Add a paper by arXiv URL or local PDF |
-| `remove_document` | Preview a removal, then request it — a human must confirm (terminal prompt or webapp dialog) before anything is deleted; only paper PDFs can be deleted from disk, note files never are |
+| `add_document` | Add a paper by arXiv URL or local PDF — title/authors/DOI auto-inferred for local PDFs unless given explicitly; `with_figures` opts into figure captioning, and re-adding the same source replaces the old entry |
+| `remove_document` | One call: immediately requests removal — a human must confirm (terminal prompt or webapp dialog) before anything is deleted; database entry only, jarvis can never delete a file on disk |
 | `list_papers` | List all indexed papers |
 | `kb_stats` | Paper, note, and chunk counts |
 | `update_file_path` | Update stored path for a moved or renamed local file |
+| `update_document_metadata` | Correct an auto-inferred title/authors/DOI, metadata-only |
 | `index_vault` | Incremental vault sync (the destructive clean rebuild is CLI-only: `kb index-vault --force`) |
 | `use_own_knowledge` | Called by the LLM before answering from training knowledge (only available when DB only is off) |
 
@@ -265,7 +282,9 @@ Re-saving a PDF after adding annotations re-indexes it automatically: the inbox 
 
 ### PDF figure captioning
 
-Text embeddings can't see images, so figures in a PDF would otherwise be lost. On every PDF ingest (the same sites as annotations) each embedded figure is captioned by the active provider's **vision model** and indexed as a `[FIGURE p.N]` chunk, so the agent can answer "what does the figure on page 4 show?". Requires a vision-capable model — the default `qwen3-vl:30b` qualifies; a text-only model will error per figure and skip it. Turn it off with `[rag] figure_captions = false`; tune volume with `figure_max_per_doc` and `figure_min_pixels` (tiny images like logos are skipped).
+Text embeddings can't see images, so figures in a PDF would otherwise be lost. When enabled, each embedded figure is captioned by the active provider's **vision model** and indexed as a `[FIGURE p.N]` chunk, so the agent can answer "what does the figure on page 4 show?". Requires a vision-capable model — the default `qwen3-vl:30b` qualifies; a text-only model will error per figure and skip it.
+
+**Off by default** — every figure costs a vision-model call. Opt in per document with `kb add --figures`, or in chat by asking for the paper to be added "with figures" (the agent passes `with_figures=true`). To add figures to a paper that is already indexed, ask the agent to re-add it with figures — the re-add **replaces** the old entry rather than duplicating it (same via `kb add <source> --figures` + `y` at the duplicate prompt). Flip `[rag] figure_captions = true` to caption everything automatically (including the sync daemon's inbox ingests); tune volume with `figure_max_per_doc` and `figure_min_pixels` (tiny images like logos are skipped).
 
 Privacy: figures of a **private** note are never captioned under the Anthropic provider — the images would reach the cloud. Switch to the local model to caption them. Papers are always public, so paper figures caption under either provider.
 
@@ -279,17 +298,28 @@ uv run kb index-vault
 uv run kb index-vault --vault-path ~/path/to/vault --force
 
 # Re-embed all chunks with the configured embed_model (no LLM calls).
-# Run once after upgrading or after changing embed_model / query_prefix.
+# Run once after upgrading, after changing embed_model / query_prefix, after
+# adopting hybrid retrieval, or to clear a corrupted index (see `kb doctor`).
 uv run kb reindex
+
+# Diagnose knowledge base health (embed model mismatch, index corruption)
+uv run kb doctor
 
 # Add a paper by arXiv URL
 uv run kb add https://arxiv.org/abs/2406.04093
 uv run kb add https://arxiv.org/abs/2406.04093 --score 9 --track "Track 1"
 uv run kb add https://arxiv.org/abs/2406.04093 --full-text   # store full PDF text
 
+# Caption and index the figures too (off by default — one vision call per figure).
+# To reingest an already-indexed paper with figures, run this and answer y to the
+# duplicate prompt: the old entry is REPLACED (same source), never duplicated.
+uv run kb add https://arxiv.org/abs/2406.04093 --full-text --figures
+
 # Add a local PDF (--doc-type paper or note; papers are always public,
-# so --visibility private requires --doc-type note)
+# so --visibility private requires --doc-type note). Title/authors/DOI are
+# auto-inferred from the PDF's first pages unless given explicitly.
 uv run kb add paper.pdf --doc-type paper --full-text
+uv run kb add paper.pdf --authors "Ada Lovelace" --doi "10.1234/example"
 uv run kb add notes.pdf --doc-type note --visibility private
 
 # Override the provider used for summary generation
@@ -302,16 +332,20 @@ uv run kb add-digest ~/Documents/papers/digest/ --min-score 7
 # Inspect
 uv run kb list
 uv run kb list --limit 100
-uv run kb stats          # also warns about legacy private papers (papers must be public)
-uv run kb sync-status    # jarvis-sync daemon health and last job outcomes
+uv run kb list --unverified   # only papers with auto-inferred metadata
+uv run kb stats                # also warns about unverified metadata and legacy private papers
+uv run kb sync-status          # jarvis-sync daemon health and last job outcomes
+
+# Correct an auto-inferred title/authors/DOI (metadata only, no re-embedding)
+uv run kb set-meta https://arxiv.org/abs/2406.04093 --authors "Ada Lovelace, Alan Turing"
 
 # Clear everything (prompts for confirmation, no files deleted)
 uv run kb clear
 
-# Remove (shows preview and asks for confirmation; --delete-file removes the
-# source file too, but only for paper PDFs — note files are never deleted)
+# Remove (shows a preview and asks for confirmation; database entry only —
+# jarvis has no code path that deletes a file on disk)
 uv run kb remove https://arxiv.org/abs/2406.04093
-uv run kb remove file:///path/to/paper.pdf --delete-file
+uv run kb remove file:///path/to/paper.pdf
 ```
 
 ### Weekly digest
@@ -320,7 +354,13 @@ uv run kb remove file:///path/to/paper.pdf --delete-file
 uv run run-digest
 ```
 
-Fetches papers from arXiv and bioRxiv, scores them against the relevance prompt, writes a tiered Markdown digest to `output_dir`, and automatically indexes papers with score ≥ 9 into the knowledge base. bioRxiv is pulled by category (only real bioRxiv categories like `bioinformatics` filter server-side) plus free-text keywords for topics with no category (cytometry, spatial transcriptomics, scRNA-seq); the same paper arriving from two sources is deduplicated by title before indexing. Scoring uses whichever provider `[chat] provider` names; with the local provider, Ollama must be running. Normally you never run this by hand — the sync daemon schedules it (see [Background sync daemon](#background-sync-daemon-jarvis-sync)).
+Fetches papers from arXiv and bioRxiv, scores them against the relevance prompt, writes a tiered Markdown digest to `output_dir`, and indexes into the knowledge base by tier:
+
+- **Score ≥ 9** — indexed **full text**: the arXiv PDF is downloaded and chunked (no extra LLM call). bioRxiv papers (DOI links, no downloadable PDF URL) and any failed download fall back to a summary entry built from the digest's own text — one 404 never fails the run.
+- **Score 8–8.9** — indexed as summary entries reusing the digest's summary text (no extra LLM call).
+- **Score < 8** — not indexed individually, but the digest `.md` itself is indexed as a searchable document (with a `file://` link back to the file), so every paper the digest mentions can still be found by the agent's `retrieve_papers`.
+
+bioRxiv is pulled by category (only real bioRxiv categories like `bioinformatics` filter server-side) plus free-text keywords for topics with no category (cytometry, spatial transcriptomics, scRNA-seq); the same paper arriving from two sources is deduplicated by title before indexing. Scoring uses whichever provider `[chat] provider` names; with the local provider, Ollama must be running. Normally you never run this by hand — the sync daemon schedules it (see [Background sync daemon](#background-sync-daemon-jarvis-sync)).
 
 ### Anthropic authentication
 
@@ -351,16 +391,17 @@ Converts arXiv PDFs (by URL or local file) to Markdown using pymupdf4llm. Text o
 
 One supervised process handles all background work:
 
-- **Weekly arXiv digest** (default Monday 02:00, configurable via `[sync]`) — with catch-up: a run missed while the Mac was asleep fires on wake, and a run missed while powered off runs at the next daemon start.
-- **PDF inbox watcher** — any PDF dropped into `pdf_watch_dir` is auto-indexed as a public full-text paper, annotations included. Re-saving a PDF with new annotations re-indexes it (byte-hash change detection). The folder is an inbox, not a mirror: removing a file never deletes its knowledge base entry.
+- **Weekly arXiv digest** (default Monday 05:00, configurable via `[sync]`) — with catch-up: a run missed while the Mac was asleep fires on wake, and a run missed while powered off is picked up by an overdue re-check that runs at daemon start **and every 6 hours** — no restart needed.
+- **Periodic PDF inbox scan** — every `pdf_watch_minutes` (default 30), any PDF in `pdf_watch_dir` is auto-indexed as a public full-text paper, annotations included; new files appear in the knowledge base within one interval. Re-saving a PDF with new annotations re-indexes it (byte-hash change detection), costing at most one re-ingest per interval no matter how often you save. The folder is an inbox, not a mirror: removing a file never deletes its knowledge base entry.
 - **Periodic vault refresh** — the incremental Obsidian sync, every `vault_refresh_minutes` (default 30).
 
 ```toml
 [sync]
 pdf_watch_dir = "~/Documents/papers/inbox"
+pdf_watch_minutes = 30
 vault_refresh_minutes = 30
 digest_day = "mon"
-digest_hour = 2
+digest_hour = 5
 ```
 
 One failing job never takes the daemon down; check health any time with:

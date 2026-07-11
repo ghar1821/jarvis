@@ -1,5 +1,5 @@
 """
-Tests for vault_chat/sessions.py — persistent chat sessions.
+Tests for jarvis/chat/sessions.py — persistent chat sessions.
 
 Filesystem behaviour uses tmp_path; anything touching the vector store uses
 the real per-test Chroma collection from conftest.py. The compaction test
@@ -10,10 +10,10 @@ import json
 
 import pytest
 
-from digest.config import Config
-from digest.errors import PrivacyError
-from digest.kb.store import add_texts, search_with_privacy_check
-from vault_chat.sessions import (
+from jarvis.core.config import Config
+from jarvis.core.errors import PrivacyError
+from jarvis.kb.store import add_texts, search_with_privacy_check
+from jarvis.chat.sessions import (
     Session,
     check_resume,
     delete_session,
@@ -278,7 +278,7 @@ def test_update_chat_title_updates_indexed_chunks(tmp_path, store):
     Renaming propagates to the session's indexed chat chunks so past-conversation
     search shows the new name.
     """
-    from digest.kb.store import update_chat_title
+    from jarvis.kb.store import update_chat_title
 
     session = _session_with_turns(0)
     session.turn_starts.append(0)

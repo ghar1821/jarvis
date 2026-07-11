@@ -14,12 +14,12 @@ dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
     "apscheduler>=3.10,<4",
-    "watchdog>=6.0.0",
     "arxiv>=4.0.0",
     "pymupdf4llm>=1.28.0",
     "pymupdf>=1.28.0",
     "tomlkit>=0.15.0",
     "ollama>=0.6.2",
+    "rank-bm25>=0.2.2",
 ]
 
 [build-system]
@@ -27,15 +27,15 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["digest*", "vault_chat*", "webapp*"]
+include = ["jarvis*"]
 
 [project.scripts]
-run-digest  = "digest.pipeline.run:main"
-jarvis-sync = "digest.daemon:main"
-convert-pdf = "digest.kb.convert:main"
-vault-chat  = "vault_chat.chat:main"
-kb          = "digest.kb.cli:main"
-webapp      = "webapp.run:main"
+run-digest  = "jarvis.digest.pipeline.run:main"
+jarvis-sync = "jarvis.sync.daemon:main"
+convert-pdf = "jarvis.kb.convert:main"
+vault-chat  = "jarvis.chat.chat:main"
+kb          = "jarvis.kb.cli:main"
+webapp      = "jarvis.webapp.run:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

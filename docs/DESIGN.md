@@ -15,46 +15,58 @@ A personal research tool that:
 ## Repository layout
 
 ```
-├── digest/                          # Python package
-│   ├── config.py                    # Central configuration (incl. tomlkit write-back)
-│   ├── errors.py                    # Domain exceptions + retry decorator
-│   ├── llm.py                       # LLM provider abstraction
-│   ├── daemon.py                    # `jarvis-sync` background daemon
+├── jarvis/                          # Python package
+│   ├── core/                        # Shared infrastructure
+│   │   ├── config.py                # Central configuration (incl. tomlkit write-back)
+│   │   ├── errors.py                # Domain exceptions + retry decorator
+│   │   └── llm.py                   # LLM provider abstraction
 │   │
-│   ├── arxiv/                       # arXiv paper fetching
-│   │   ├── fetch.py                 # Fetch papers via the `arxiv` package
-│   │   └── convert.py               # Parse arXiv URLs + download PDFs
+│   ├── digest/                      # Automated weekly digest
+│   │   ├── arxiv/                   # arXiv paper fetching
+│   │   │   ├── fetch.py             # Fetch papers via the `arxiv` package
+│   │   │   └── convert.py           # Parse arXiv URLs + download PDFs
+│   │   ├── biorxiv/                 # bioRxiv paper fetching
+│   │   │   └── fetch.py             # Category + keyword search over the details API
+│   │   ├── pipeline/
+│   │   │   ├── run.py               # Entry point: orchestrates full digest run
+│   │   │   ├── score.py             # LLM-based paper scoring
+│   │   │   ├── format.py            # Markdown digest renderer
+│   │   │   └── prompts/
+│   │   │       └── prompt_filter_score.md
+│   │   └── import_digest.py         # `kb add-digest` implementation
 │   │
-│   ├── pipeline/                    # Automated weekly digest
-│   │   ├── run.py                   # Entry point: orchestrates full digest run
-│   │   ├── score.py                 # LLM-based paper scoring
-│   │   ├── format.py                # Markdown digest renderer
+│   ├── kb/                          # Knowledge base management
+│   │   ├── store.py                 # Vector store operations (LangChain + ChromaDB)
+│   │   ├── cli.py                   # `kb` CLI entry point
+│   │   ├── convert.py               # PDF → Markdown (pymupdf4llm) + `convert-pdf` CLI
+│   │   ├── annotations.py           # PDF highlight/typed-note extraction (PyMuPDF)
+│   │   ├── images.py                # PDF figure extraction (PyMuPDF)
+│   │   ├── metadata.py              # Title/authors/DOI inference for local PDFs
 │   │   └── prompts/
-│   │       └── prompt_filter_score.md
+│   │       └── paper_summary.md
 │   │
-│   └── kb/                          # Knowledge base management
-│       ├── store.py                 # Vector store operations (LangChain + ChromaDB)
-│       ├── cli.py                   # `kb` CLI entry point
-│       ├── convert.py               # PDF → Markdown (pymupdf4llm) + `convert-pdf` CLI
-│       ├── annotations.py           # PDF highlight/typed-note extraction (PyMuPDF)
-│       └── prompts/
-│           └── paper_summary.md
-│
-├── vault_chat/
-│   ├── chat.py                      # `vault-chat` entry point (KB agent)
-│   ├── sessions.py                  # Persistent sessions: save/resume/pin/prune/compact
-│   └── skills.py                    # User-defined skills (list + read)
-│
-├── webapp/
-│   ├── app.py                       # FastAPI application (routes, SSE stream, session state)
-│   ├── index.html                   # Chat UI page
-│   ├── static/                      # style.css + app.js (vanilla JS, no build step)
-│   └── run.py                       # `webapp` entry point (uvicorn launcher)
+│   ├── sync/                        # Background sync daemon
+│   │   ├── daemon.py                # `jarvis-sync` entry point
+│   │   └── status.py                # `kb sync-status` implementation
+│   │
+│   ├── chat/
+│   │   ├── chat.py                  # `vault-chat` entry point (KB agent)
+│   │   ├── sessions.py              # Persistent sessions: save/resume/pin/prune/compact
+│   │   └── skills.py                # User-defined skills (list + read)
+│   │
+│   └── webapp/
+│       ├── app.py                   # FastAPI application (routes, SSE stream, session state)
+│       ├── index.html               # Chat UI page
+│       ├── static/                  # style.css + app.js (vanilla JS, no build step)
+│       └── run.py                   # `webapp` entry point (uvicorn launcher)
 │
 ├── tests/                           # See docs/TESTING.md
 │
 ├── docs/
 │   ├── DESIGN.md                    # This file
+│   ├── TESTING.md
+│   ├── TODO.md
+│   ├── ROADMAP.md
 │   └── CHANGELOG.md
 └── pyproject.toml
 ```
@@ -63,18 +75,20 @@ A personal research tool that:
 
 | Module | Concern |
 |---|---|
-| `digest/arxiv/` | Fetching papers from the arXiv API; downloading PDFs |
-| `digest/biorxiv/` | Fetching recent preprints from the bioRxiv API (category + keyword) |
-| `digest/pipeline/` | Weekly automated digest: scoring, formatting, orchestration |
-| `digest/kb/` | Knowledge base: vector store, PDF conversion, annotation + figure extraction, the `kb` CLI |
-| `digest/daemon.py` | `jarvis-sync`: scheduled digest, PDF inbox watcher, periodic vault refresh |
-| `vault_chat/chat.py` | Conversational agent: query and manage via natural language |
-| `vault_chat/sessions.py` | Persistent chat sessions: persistence, privacy flag, retention, compaction, rename |
-| `vault_chat/skills.py` | User-defined skills: discovery and on-demand loading |
-| `webapp/` | Browser-based chat UI: FastAPI routes, SSE stream, session state, frontend |
-| `digest/llm.py` | Shared: LLM provider abstraction (Ollama + Anthropic) |
-| `digest/config.py` | Shared: central configuration |
-| `digest/errors.py` | Shared: domain exceptions and retry decorator |
+| `jarvis/digest/arxiv/` | Fetching papers from the arXiv API; downloading PDFs |
+| `jarvis/digest/biorxiv/` | Fetching recent preprints from the bioRxiv API (category + keyword) |
+| `jarvis/digest/pipeline/` | Weekly automated digest: scoring, formatting, orchestration |
+| `jarvis/digest/import_digest.py` | `kb add-digest`: bulk-import papers from digest Markdown files |
+| `jarvis/kb/` | Knowledge base: vector store, PDF conversion, annotation + figure extraction, the `kb` CLI |
+| `jarvis/sync/daemon.py` | `jarvis-sync`: scheduled digest (+ 6-hourly catch-up), periodic PDF inbox scan, periodic vault refresh |
+| `jarvis/sync/status.py` | `kb sync-status`: reports daemon liveness and per-job outcomes |
+| `jarvis/chat/chat.py` | Conversational agent: query and manage via natural language |
+| `jarvis/chat/sessions.py` | Persistent chat sessions: persistence, privacy flag, retention, compaction, rename |
+| `jarvis/chat/skills.py` | User-defined skills: discovery and on-demand loading |
+| `jarvis/webapp/` | Browser-based chat UI: FastAPI routes, SSE stream, session state, frontend |
+| `jarvis/core/llm.py` | Shared: LLM provider abstraction (Ollama + Anthropic) |
+| `jarvis/core/config.py` | Shared: central configuration |
+| `jarvis/core/errors.py` | Shared: domain exceptions and retry decorator |
 
 ---
 
@@ -87,16 +101,16 @@ A personal research tool that:
 | `langchain-text-splitters` | `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter` for section-aware chunking |
 | `chromadb` | Underlying persistent vector store (SQLite + HNSW) |
 | `sentence-transformers` | Local embedding model (`BAAI/bge-small-en-v1.5`) and cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L6-v2`) |
+| `rank-bm25` | Sparse (BM25) ranking for hybrid retrieval, fused with dense results by reciprocal rank fusion (`[rag] hybrid`) |
 | `anthropic` | Anthropic Claude API client |
 | `ollama` | Client for the local Ollama server (chat, tools, vision) |
 | `arxiv` | arXiv API client with built-in paging, per-page retries, and courtesy delay |
 | `pymupdf4llm` | Fast rule-based PDF-to-Markdown conversion (no ML models) |
 | `pymupdf` | PDF annotation extraction (`page.annots()`, quad geometry) and figure extraction (`page.get_images`) |
-| `apscheduler` | Cron/interval scheduling inside the `jarvis-sync` daemon |
-| `watchdog` | Filesystem events for the PDF inbox watcher |
+| `apscheduler` | Cron/interval scheduling inside the `jarvis-sync` daemon (all four jobs, including the periodic PDF inbox scan) |
 | `tomlkit` | Comment-preserving `config.toml` write-back (settings persistence) |
 | `requests` | HTTP client (arXiv PDF download, bioRxiv API, Ollama health check) |
-| `fastapi` | Web framework for the browser UI (`webapp/`) |
+| `fastapi` | Web framework for the browser UI (`jarvis/webapp/`) |
 | `uvicorn` | ASGI server that runs the FastAPI app |
 
 ---
@@ -107,12 +121,12 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 
 | Command | Module | Purpose |
 |---|---|---|
-| `uv run run-digest` | `digest.pipeline.run:main` | Run the weekly digest pipeline once |
-| `uv run jarvis-sync` | `digest.daemon:main` | Start the background sync daemon (foreground; run directly, no service manager) |
-| `uv run vault-chat` | `vault_chat.chat:main` | Start the KB agent chat session |
-| `uv run kb` | `digest.kb.cli:main` | Manage the knowledge base (CLI) |
-| `uv run convert-pdf` | `digest.kb.convert:main` | Convert a PDF to Markdown (standalone) |
-| `uv run webapp` | `webapp.run:main` | Start the web UI at `http://127.0.0.1:8080` |
+| `uv run run-digest` | `jarvis.digest.pipeline.run:main` | Run the weekly digest pipeline once |
+| `uv run jarvis-sync` | `jarvis.sync.daemon:main` | Start the background sync daemon (foreground; run directly, no service manager) |
+| `uv run vault-chat` | `jarvis.chat.chat:main` | Start the KB agent chat session |
+| `uv run kb` | `jarvis.kb.cli:main` | Manage the knowledge base (CLI) |
+| `uv run convert-pdf` | `jarvis.kb.convert:main` | Convert a PDF to Markdown (standalone) |
+| `uv run webapp` | `jarvis.webapp.run:main` | Start the web UI at `http://127.0.0.1:8080` |
 
 ---
 
@@ -131,7 +145,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 
 ---
 
-## Configuration — `digest/config.py`
+## Configuration — `jarvis/core/config.py`
 
 Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars.
 
@@ -148,7 +162,8 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `chunk_overlap` | `128` | — | Overlap between chunks |
 | `rerank_model` | `cross-encoder/ms-marco-MiniLM-L6-v2` | — | Cross-encoder reranker; `""` disables re-ranking |
 | `rerank_top_n` | `25` | — | Candidates fetched before re-ranking down to `n_results` |
-| `figure_captions` | `True` | — | Caption PDF figures at ingest (needs a vision model); `False` disables |
+| `hybrid` | `True` | — | Hybrid dense+BM25 retrieval fused by reciprocal-rank fusion; `False` reproduces the pre-hybrid dense-only pipeline exactly |
+| `figure_captions` | `False` | — | Caption PDF figures at ingest (needs a vision model). Off by default — each figure costs a vision call; opt in per document via `kb add --figures` or the chat tool's `with_figures` |
 | `figure_max_per_doc` | `20` | — | Cap on figures captioned per document |
 | `figure_min_pixels` | `40000` | — | Skip embedded images smaller than this (logos, rules) |
 | `biorxiv_cats` | `[("bioinformatics", 100)]` | — | bioRxiv server-side categories (TOML key `biorxiv_categories`) |
@@ -162,10 +177,11 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `response_style` | `""` | — | Free-text style instruction appended to the system prompt |
 | `compact_after_tokens` | `12000` | — | Session compaction threshold (estimated context tokens) |
 | `compact_keep_exchanges` | `6` | — | Recent turns kept verbatim when compacting |
-| `pdf_watch_dir` | `None` | `PDF_WATCH_DIR` | PDF inbox watched by `jarvis-sync`; `None` disables the watcher |
+| `pdf_watch_dir` | `None` | `PDF_WATCH_DIR` | PDF inbox scanned periodically by `jarvis-sync`; `None` disables the scan |
+| `pdf_watch_minutes` | `30` | — | Minutes between PDF inbox scans (≥ 1); inbox latency is at most one interval |
 | `vault_refresh_minutes` | `30` | — | Daemon vault refresh interval |
 | `digest_day` | `mon` | — | Digest day of week (APScheduler token) |
-| `digest_hour` | `2` | — | Digest hour (0–23) |
+| `digest_hour` | `5` | — | Digest hour (0–23) |
 | `anthropic_api_key` | `""` | `ANTHROPIC_API_KEY` | Anthropic API key (alternative to env var) |
 
 Two config helpers matter beyond `load_config()`:
@@ -175,7 +191,7 @@ Two config helpers matter beyond `load_config()`:
 
 ---
 
-## Knowledge base — `digest/kb/store.py`
+## Knowledge base — `jarvis/kb/store.py`
 
 Single LangChain + ChromaDB collection (`knowledge_base`).
 
@@ -185,12 +201,18 @@ Single LangChain + ChromaDB collection (`knowledge_base`).
 page_content : str   — chunked text (embedded)
 metadata:
   date_added  : str  — ISO timestamp
-  doc_type    : str  — "paper" | "note" | "chat" (past chat exchanges)
+  doc_type    : str  — "paper" | "note" | "chat" (past chat exchanges) |
+                       "digest" (indexed weekly digest .md files)
   visibility  : str  — "public" | "private" (papers are always public)
   source      : str  — arXiv/DOI URL for papers; "local" for vault .md notes;
-                       file:/// URI for local PDFs; "session:<id>" for chat exchanges
+                       file:/// URI for local PDFs and digest files;
+                       "session:<id>" for chat exchanges
   title       : str  — display title (optional)
   authors     : str  — papers only (optional)
+  doi         : str  — papers only (optional); regex/LLM-inferred for local PDFs,
+                       passed through from the arXiv API result when present
+  meta_inferred: bool — title/authors/doi came from auto-inference and has not
+                       been human-verified yet (papers only, optional)
   score       : int  — relevance 0–10, papers only (optional)
   track       : str  — research track, papers only (optional)
   storage_mode: str  — "summary" | "full_text" (optional)
@@ -212,7 +234,8 @@ Annotation and figure chunks share `source`/`file_path`/`doc_type`/`visibility` 
 - arXiv URL → always `"paper"`
 - Local PDF → user must specify `"paper"` or `"note"` via `--doc-type`
 - Vault `.md` files → always `"note"`
-- Chat exchanges (indexed per turn by `vault_chat/sessions.py`) → `"chat"`
+- Chat exchanges (indexed per turn by `jarvis/chat/sessions.py`) → `"chat"`
+- Weekly digest `.md` files (indexed by the digest pipeline) → `"digest"`. Deliberately not `"note"`: `refresh_vault` deletes note entries whose vault-relative path no longer exists, and a digest's absolute path would look exactly like that and get wiped on the next sync. Searched by `retrieve_papers` alongside papers (`doc_type=["paper", "digest"]`).
 
 **`storage_mode` rules:**
 - `"note"` documents are always `full_text`
@@ -247,14 +270,15 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 |---|---|
 | `get_store()` | Process-wide Chroma singleton; tags the collection with `embed_model` and enforces the mismatch guard |
 | `build_embeddings(model_name, query_prefix)` | Construct a normalised HuggingFace embedding model with an optional query-side prefix |
-| `add_paper(paper, summary, score, track)` | Add paper (always public); idempotent by source URL |
+| `add_paper(paper, summary, score, track)` | Add paper (always public); idempotent by source URL; content includes an authors line so author-name queries can match |
 | `add_papers_batch(entries)` | Batch add from digest; no extra LLM call |
-| `add_texts(content, doc_type, visibility, source, ...)` | Low-level: section-aware chunk and add |
+| `add_texts(content, doc_type, visibility, source, ..., embed_header="")` | Low-level: section-aware chunk and add; `embed_header` is prepended to the embedded text of every chunk (metadata untouched) |
 | `add_annotations(pdf_path, doc_type, visibility, source, ...)` | Extract highlights/typed notes from a PDF and index each as its own chunk (see Annotations) |
-| `search(query, n_results, visibility, doc_type, annotation_kind, rerank=True)` | Semantic search with filters, then optional cross-encoder re-ranking |
+| `search(query, n_results, visibility, doc_type, annotation_kind, rerank=True)` | Hybrid (dense+BM25, gated by `[rag] hybrid`) or dense-only search with filters, then optional cross-encoder re-ranking; `doc_type` accepts one type or a list (`$in` filter, e.g. `["paper", "digest"]`); raises `KBCorruptionError` on a stale-id failure |
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
-| `delete_local_file(local_file, doc_type)` | Single choke point for on-disk deletion — only ever unlinks paper PDFs, never note files (see Security) |
+| `update_paper_metadata(source, title, authors, doi)` | Metadata-only correction of a paper's title/authors/doi; clears `meta_inferred` |
+| `count_unverified_papers()` | Count papers whose metadata is still auto-inferred and unverified |
 | `count()` · `count_unique_documents()` · `list_papers()` | Inspection |
 | `update_file_path(source, new_path)` | Update `file_path` (and `source` URI) for all chunks matching a source; no re-embedding |
 | `update_visibility(file_path, new_visibility)` | Metadata-only reclassification of a note's chunks; no re-embedding |
@@ -264,7 +288,7 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 
 **Cross-process write lock (`_kb_write_lock`).** The daemon, webapp, and CLI all open the same ChromaDB `PersistentClient` directory, and Chroma's SQLite backend is not safe for concurrent multi-process writers. Every write path takes an advisory `flock` on `<rag_dir>/.write.lock` (re-entrant per thread, so composite operations like `refresh_vault` → `add_texts` don't self-deadlock). Reads stay unlocked — SQLite WAL handles concurrent readers.
 
-### Annotations — `digest/kb/annotations.py`
+### Annotations — `jarvis/kb/annotations.py`
 
 macOS Preview and Foxit Reader both write standard ISO 32000 annotation objects into the page `/Annots` array on save, so one generic reader (PyMuPDF's `page.annots()`) covers both apps.
 
@@ -285,39 +309,49 @@ macOS Preview and Foxit Reader both write standard ISO 32000 annotation objects 
 
 **Where it is wired in:** `kb add` (local PDFs and arXiv full-text), the chat `add_document` tool, `refresh_vault` Phase 2 (PDF notes), and the daemon's inbox ingest. Annotations are indexed *before* body conversion, so a scanned PDF whose body fails to convert still keeps its highlights. Re-saving a PDF with new annotations changes its byte hash, which triggers a full re-index through the existing change-detection paths.
 
-### Figure captioning — `digest/kb/images.py` + `add_figures`
+### Figure captioning — `jarvis/kb/images.py` + `add_figures`
 
 Text embeddings can't see images, so figures would be lost when a PDF is chunked as text. `extract_figures(pdf_path, max_figures, min_pixels)` pulls embedded raster images back out (PyMuPDF `page.get_images` + `doc.extract_image`), normalises each to PNG, deduplicates by xref, and drops images below `min_pixels` (logos, rules). It is a pure extraction function with no store/provider knowledge — the same shape as `annotations.py`.
 
 `add_figures(...)` (in `store.py`) captions each figure via the active provider's `describe_image()` and indexes one chunk per figure — `page_content = "[FIGURE p.N] <caption>"`, `annotation_kind="figure"`, sharing `source`/`file_path`/`doc_type`/`visibility` with the parent PDF so deletes and re-ingests sweep figures along. Behaviour:
 
-- **Kill-switch / limits:** `[rag] figure_captions` (default true), `figure_max_per_doc`, `figure_min_pixels`.
-- **Privacy guard:** when `visibility == "private"` and the provider is `anthropic`, captioning is skipped entirely with a visible `⚠️` warning and no chunk is written — the images must never reach the cloud. Papers are always public, so paper figures caption under either provider.
+- **Off by default, opt-in per document:** `[rag] figure_captions` defaults to `false` (each figure costs a vision-model call). `add_figures` takes a keyword-only `enabled: bool | None = None` — `None` follows the config, `True` forces captioning for this one document. The opt-ins are `kb add --figures` and the chat tool's `with_figures=true`; the daemon inbox and `refresh_vault` stay config-gated (they pass nothing, so they no-op by default). `figure_max_per_doc` and `figure_min_pixels` bound cost/noise when captioning runs.
+- **Reingest an existing paper with figures:** re-adding the *same source* with the duplicate override replaces the old entry — chat: `add_document(source, mode="full_text", with_figures=true)` → duplicate notice → re-call with `allow_duplicate=true`; CLI: `kb add <source> --figures --full-text` and answer `y`. The old chunks are deleted by source first (body, annotations, and figures share `source`, so the whole entry is swept); a same-title-but-different-source duplicate deletes nothing and adds a separate entry.
+- **Privacy guard:** when `visibility == "private"` and the provider is `anthropic`, captioning is skipped entirely with a visible `⚠️` warning and no chunk is written — the images must never reach the cloud. `enabled=True` never overrides this guard, only the config kill-switch. Papers are always public, so paper figures caption under either provider.
 - **Failure tolerance:** a per-figure `LLMError` warns and skips that one figure; the ingest never aborts.
 - **Where it is wired in:** the same sites as annotations. The daemon and `refresh_vault` build the provider **lazily** — they peek with `extract_figures(..., max_figures=1)` first and only construct a provider when a PDF actually has a qualifying figure.
 
 ### Retrieval pipeline
 
-A query flows through three stages, all local — no data leaves the machine:
+A query flows through four stages, all local — no data leaves the machine:
 
-1. **Chunking (index time).** `add_texts` splits content on markdown headers (`MarkdownHeaderTextSplitter`) and then by size (`RecursiveCharacterTextSplitter`). Each chunk stores its `chunk_index` and a `section` breadcrumb, and the breadcrumb is prepended to the embedded text so a query naming both the document topic and a section can match. Headerless content (paper summaries) passes through unchanged as a single unlabelled chunk.
-2. **Dense retrieval.** The query is embedded with a BGE-style model (`embed_model`), prefixed by `query_prefix` on the query side only. ChromaDB returns the top `rerank_top_n` candidates after applying the `visibility`/`doc_type` metadata filters.
-3. **Re-ranking.** A cross-encoder (`rerank_model`) scores each `(query, chunk)` pair jointly and reorders the candidates, returning the top `n_results`. Re-ranking is far more accurate than the bi-encoder's independent embeddings at deciding which chunk is actually most relevant. It runs **after** the visibility filter, so it never widens what a cloud provider can see; set `rerank_model = ""` to disable it.
+1. **Chunking (index time).** `add_texts` splits content on markdown headers (`MarkdownHeaderTextSplitter`) and then by size (`RecursiveCharacterTextSplitter`). Each chunk stores its `chunk_index` and a `section` breadcrumb, and the breadcrumb is prepended to the embedded text so a query naming both the document topic and a section can match. Headerless content (paper summaries) passes through unchanged as a single unlabelled chunk. When the caller passes `embed_header` (papers only — the title, or `"{title} — {authors}"`), it is prepended to the embedded text of **every** chunk, not just the first, so an author-name or title-word query can match any chunk of a long paper.
+2. **Hybrid retrieval.** Gated by `[rag] hybrid` (default `true`). When enabled, `_hybrid_search` fetches the ChromaDB candidate pool filtered by `visibility`/`doc_type` first, then ranks it two ways over that same filtered pool: dense (the query embedded with a BGE-style model, `embed_model`, prefixed by `query_prefix` on the query side only) and sparse (a BM25 index rebuilt fresh per query, via `rank-bm25`). The two rankings are fused by reciprocal rank fusion (`_reciprocal_rank_fusion`, `c=60`, identity by chunk id) — an id's score is the sum of `1/(c+rank)` across whichever ranking(s) it appears in. Because the sparse index and the dense query both operate on the already-filtered pool, privacy holds by construction — no id outside the filtered pool can ever be scored or returned. Setting `hybrid = false` skips straight to plain `similarity_search`, reproducing the pre-hybrid pipeline byte-for-byte.
+3. **Re-ranking.** A cross-encoder (`rerank_model`) scores each `(query, chunk)` pair jointly and reorders the (dense or fused) candidates, returning the top `n_results`. Re-ranking is far more accurate than the bi-encoder's independent embeddings at deciding which chunk is actually most relevant. It runs **after** the visibility filter, so it never widens what a cloud provider can see; set `rerank_model = ""` to disable it.
+4. **Corruption detection.** If ChromaDB raises with `"Error finding id"` in the message — a stale HNSW reference to a chunk id that no longer exists — `search()` raises `KBCorruptionError` instead of a generic `RAGError`, naming `uv run kb reindex` as the fix (chunk texts are already stored, so nothing is lost). This is not retried automatically: retrying persistent corruption just hides it. `uv run kb doctor` diagnoses this proactively (open store → count → search-probe) without waiting for a real query to hit it; on a badly corrupted store even `count()` can hard-segfault the process (a Rust-side ChromaDB crash, uncatchable in Python) — `kb doctor` dying abruptly is itself the diagnosis, not a bug in the doctor command.
 
-**Embedding-model guard.** ChromaDB records `embed_model` in the collection metadata when the collection is first created. `get_store()` compares that tag against the configured model and raises `RAGError` on any mismatch — including legacy collections created before the tag existed. This prevents silently comparing vectors from two incompatible embedding spaces. The fix is always `uv run kb reindex`, which re-embeds every stored chunk (no LLM calls, chunk texts are already stored) into a fresh collection and swaps it in atomically.
+**Embedding-model guard.** ChromaDB records `embed_model` in the collection metadata when the collection is first created. `get_store()` compares that tag against the configured model and raises `RAGError` on any mismatch — including legacy collections created before the tag existed. This prevents silently comparing vectors from two incompatible embedding spaces. The fix is always `uv run kb reindex`, which re-embeds every stored chunk (no LLM calls, chunk texts are already stored) into a fresh collection and swaps it in atomically. `kb reindex` also migrates old paper chunks that predate the `embed_header` convention: it prepends `"{title} — {authors}"` to any `doc_type="paper"` body chunk that doesn't already start with its title, so author-name queries work against papers indexed before this migration too (idempotent — a chunk already carrying the header is left alone).
+
+### Metadata inference — `jarvis/kb/metadata.py`
+
+Local PDFs arrive with nothing but a filename, so `infer_pdf_metadata(pdf_path, provider)` reads the first ~2 pages and asks the active provider (one small `complete()` call) to extract a title and author list. A DOI is looked for with a regex (`10.\d{4,9}/\S+`) first — cheap and exact when printed on the page — and the LLM is only asked to guess one when the regex misses. Degrades to `{}` on any LLM failure: inference is best-effort, never fatal to the add.
+
+`resolve_pdf_metadata(...)` is the policy every add path (`kb add`, chat `add_document`, daemon `ingest_pdf`) shares, applied in order: (1) explicit `--title`/`--authors`/`--doi` overrides always win, skipping inference entirely once all three are given; (2) the privacy guard — a private note's text must never reach a cloud provider, so inference is skipped under Anthropic with a visible warning, leaving the filename stem as the title; (3) automatic inference for whatever is still unset. Papers are always public, so inference always runs for papers regardless of provider. Fields inferred this way are flagged `meta_inferred: true`.
+
+**Verified-metadata loop.** `kb set-meta <source> [--title] [--authors] [--doi]` and the matching `update_document_metadata` chat tool apply a human correction metadata-only (no re-embedding) and clear `meta_inferred`. Reminders surface the unverified count in three places: `kb stats`, the webapp header (`GET /info` → `unverified_count` → a dismissible banner), and one `vault-chat` startup line.
 
 ### Deferred retrieval improvements
 
-These were designed but intentionally not built, to keep the retrieval stack simple. Each has a concrete trigger for revisiting so the decision has a paper trail. The `tests/test_retrieval_quality.py` golden set is the instrument that makes the triggers observable — its acronym/proper-noun queries (`LoRA`, `BERT`, `Dr. Tanaka`) are the sentinel for the keyword-recall gap.
+These were designed but intentionally not built, to keep the retrieval stack simple. Each has a concrete trigger for revisiting so the decision has a paper trail. The `tests/test_retrieval_quality.py` golden set is the instrument that makes the triggers observable.
 
-- **Hybrid BM25 + reciprocal-rank fusion.** *Trigger:* the golden set's acronym/proper-noun queries regress after the current pipeline. *Sketch:* add `rank-bm25`; build a BM25 index **per query** over the pre-filtered ChromaDB candidate set (`_collection.get(where=filter_dict, ...)`) so the visibility filter is applied before the sparse index exists — privacy holds by construction; fuse dense + sparse rankings with a ~15-line RRF helper (`c=60`, identity by chunk id) and feed the result to the existing reranker; gate behind a single `hybrid: bool` config flag. No index-sync problem at this corpus size (rebuild ≈ 50–200 ms). Chroma's `where_document={"$contains": ...}` was rejected as the simpler option — it is unranked substring filtering, so it narrows recall rather than adding keyword recall.
+- **Better embedding/rerank models.** *Trigger:* hybrid BM25+RRF (above) isn't enough — the golden set's harder queries still regress. *Sketch:* both are drop-in config changes — `embed_model = "BAAI/bge-base-en-v1.5"` or `bge-large` (requires another `uv run kb reindex`) and `rerank_model = "BAAI/bge-reranker-v2-m3"`.
 - **Multi-query expansion.** *Trigger:* evidence that pre-rerank recall@`rerank_top_n` is the bottleneck. *Why deferred:* needs an LLM call per search inside the currently LLM-free `store.py`, and the agentic chat loop already reformulates queries across tool calls.
 - **MMR (diversity re-ranking).** *Trigger:* top results dominated by near-duplicate chunks of one document. *Why deferred:* conflicts with cross-encoder ordering; the cheaper first fix would be a per-source cap applied after re-ranking.
 - **Score thresholds.** *Why deferred:* cosine scores are poorly calibrated and corpus-dependent, and the reranker already sinks irrelevant results. Revisit only if junk results demonstrably pollute answers.
 
 ---
 
-## arXiv module — `digest/arxiv/`
+## arXiv module — `jarvis/digest/arxiv/`
 
 `fetch.py` uses the `arxiv` package (lukasschwab/arxiv.py) rather than hand-rolled Atom-feed parsing. The library's `Client` exists to work around the arXiv API's known flakiness: it pages requests, retries responses that come back empty despite HTTP 200, and enforces the 3-second courtesy delay arXiv's terms ask for. A single shared client is used so the courtesy delay applies across successive category fetches. This replaced a raw `requests` implementation whose failure mode was silent: the empty-feed-with-200 bug bypassed retries and produced a digest with 0 papers.
 
@@ -333,11 +367,11 @@ Retry layering (two levels, deliberately):
 - `parse_arxiv_url(url)` — extract arXiv ID from any URL format
 - `download_arxiv_pdf(arxiv_id, dest_dir)` — download PDF
 
-PDF-to-Markdown conversion lives in `digest/kb/convert.py` (see below).
+PDF-to-Markdown conversion lives in `jarvis/kb/convert.py` (see below).
 
 ---
 
-## bioRxiv module — `digest/biorxiv/`
+## bioRxiv module — `jarvis/digest/biorxiv/`
 
 `fetch.py` pulls recent preprints from the bioRxiv details API
 (`https://api.biorxiv.org/details/biorxiv/{start}/{end}/{cursor}/json`), which
@@ -352,30 +386,34 @@ Both are wrapped in `@with_retries(exceptions=(FetchError,))`; an empty first pa
 
 ---
 
-## PDF conversion — `digest/kb/convert.py`
+## PDF conversion — `jarvis/kb/convert.py`
 
 `pdf_to_markdown(pdf_path) -> str` converts via **pymupdf4llm** — fast, rule-based extraction with no ML model downloads (replacing marker-pdf; orders of magnitude faster, at the accepted cost of lower fidelity on complex layouts and equations). Returning a string means no call site needs an intermediate `.md` file or temp-dir round-trip.
 
 A PDF that yields no extractable text — typically a scanned/image-only PDF without an OCR text layer — raises `ConversionError` rather than silently indexing an empty document. There is no OCR fallback. Image extraction is not performed (nothing consumed it; `write_images=True` is the one-line reinstatement if ever wanted).
 
-The standalone `convert-pdf` CLI (entry point `digest.kb.convert:main`) accepts a local path or arXiv URL and writes the Markdown to a file for manual use.
+The standalone `convert-pdf` CLI (entry point `jarvis.kb.convert:main`) accepts a local path or arXiv URL and writes the Markdown to a file for manual use.
 
 ---
 
-## Sync daemon — `digest/daemon.py` (`jarvis-sync`)
+## Sync daemon — `jarvis/sync/daemon.py` (`jarvis-sync`)
 
 One supervised long-running process, run directly with `uv run jarvis-sync` — it stays in the foreground; all scheduling lives inside the daemon, where catch-up can be handled properly. Restart-on-crash is not the daemon's concern: it's whatever keeps the process running (a terminal multiplexer, a process manager, or nothing at all).
 
-**Process architecture:**
-- Main thread: APScheduler `BlockingScheduler` running two jobs — the weekly digest (`CronTrigger(day_of_week=digest_day, hour=digest_hour)`, `coalesce=True`, `misfire_grace_time=3600` so a run missed during sleep fires on wake) and the vault refresh (`IntervalTrigger`, also run once at startup).
-- A watchdog `Observer` thread watching `pdf_watch_dir` for `*.pdf` created/moved events (cloud-sync clients write to a temp name then rename, so `on_moved` matters as much as `on_created`).
-- A single ingest worker thread draining a `queue.Queue` of PDF paths — one conversion at a time. Each queued file is polled with `wait_for_stable()` (size+mtime unchanged over consecutive checks) before ingesting, because cloud-sync clients and slow copies write PDFs incrementally.
+**Process architecture:** one thread — an APScheduler `BlockingScheduler` running four jobs. There is no filesystem-event watcher and no worker thread/queue any more; everything is a scheduled job body.
+
+| Job id | Trigger | What it does |
+|---|---|---|
+| `digest` | `CronTrigger(day_of_week=digest_day, hour=digest_hour)`, `coalesce=True`, `misfire_grace_time=3600` | Weekly digest; a run missed during sleep fires on wake |
+| `digest_catchup` | `IntervalTrigger(hours=6)` + once at startup | Re-reads the persisted `last_success` stamp and runs the digest if a slot was missed while powered off |
+| `vault_refresh` | `IntervalTrigger(minutes=vault_refresh_minutes)` + once at startup | Incremental Obsidian vault sync |
+| `pdf_scan` | `IntervalTrigger(minutes=pdf_watch_minutes)` + once at startup; only registered when `pdf_watch_dir` is set | Sweep the PDF inbox and ingest new/changed PDFs serially |
 
 **Status file** — `~/.jarvis/state/sync_status.json` records the daemon pid/start time and each job's `last_run` / `last_success` / `last_error` (written atomically). `kb sync-status` reads it, checks pid liveness, and tails the log. Every job body catches its own exceptions and records the outcome — one failing job never takes the daemon down. Fatal setup problems (invalid `[sync]` config, embedding-model mismatch) exit non-zero at startup with the reason logged to `~/.jarvis/logs/sync.log` and stderr.
 
-**Digest catch-up** — `digest_is_overdue(trigger, last_success, now)`: at daemon start, if a scheduled fire time has passed since the persisted `last_success` stamp (machine was powered off across the slot), the digest runs immediately. On the very first start there is no baseline, so it waits for the next slot rather than surprise-running. The misfire grace handles sleep; the stamp handles power-off.
+**Digest catch-up** — `run_digest_catchup_job(trigger)` re-reads `jobs.digest.last_success` from the status file and calls `digest_is_overdue(trigger, last_success, now)`: if a scheduled fire time has passed since the stamp (machine was powered off across the slot), the digest runs immediately. It runs once at daemon start and then every 6 hours (job id `digest_catchup`) — a missed Monday fires within hours of the machine coming back, not at the next restart or the next Monday. On the very first start there is no baseline, so it waits for the next slot rather than surprise-running. The misfire grace handles sleep; the stamp + interval re-check handle power-off. **Double-fire guard:** the cron job and the catch-up job are separate APScheduler ids, so `max_instances=1` cannot stop them overlapping — `run_digest_job` acquires a module-level `threading.Lock` non-blocking at the top and returns early (with a log line) if another digest run holds it.
 
-**Inbox semantics** — the watch dir is an *inbox, not a mirror*: removing a file never deletes its KB entry. `ingest_pdf()` indexes each PDF as a public full-text paper (annotations first, so a scanned PDF whose body can't convert still keeps its highlights), deduplicated by byte hash: unchanged file → skipped; changed bytes (e.g. new annotations saved into the file) → old chunks replaced. A startup sweep queues PDFs already sitting in the folder (idempotent thanks to the dedup). Dotfiles, `~$` lock files, and `.icloud` placeholders are skipped. The daemon refuses to start if `pdf_watch_dir` is set but missing — silently `mkdir`-ing a typo'd path would watch the wrong place.
+**Inbox semantics** — the watch dir is an *inbox, not a mirror*: removing a file never deletes its KB entry. Every `pdf_watch_minutes`, `run_pdf_scan_job` lists the inbox (`scan_watch_dir`, skipping dotfiles, `~$` lock files, and `.icloud` placeholders), checks each file is done being written (`wait_for_stable`, short parameters — a file still changing is left for the next cycle rather than waited on), and calls `ingest_pdf()` inline with a per-file try/except. `ingest_pdf()` indexes each PDF as a public full-text paper (annotations first, so a scanned PDF whose body can't convert still keeps its highlights), deduplicated by byte hash: unchanged file → skipped at zero LLM cost, which is what makes the periodic sweep idempotent; changed bytes (e.g. new annotations saved into the file) → old chunks replaced. Saving highlights repeatedly therefore costs at most one re-ingest per interval instead of one per save — that is the point of the periodic design. Title/authors/DOI are auto-inferred (`resolve_pdf_metadata`, see Knowledge base) — inbox PDFs are always public papers, so a provider is built unconditionally for this and reused for figure captioning rather than constructed twice (captioning itself is config-gated and off by default). New PDFs appear in the KB within one scan interval. The daemon refuses to start if `pdf_watch_dir` is set but missing — silently `mkdir`-ing a typo'd path would watch the wrong place.
 
 **Why the cross-process write lock exists** — the daemon runs alongside the webapp and CLI, all writing to the same Chroma store; Chroma's SQLite backend is not multi-process-writer safe, hence the `flock`-based `_kb_write_lock` in `store.py`.
 
@@ -383,7 +421,7 @@ The daemon does not manage other daemons: if the provider is local and Ollama is
 
 ---
 
-## Digest pipeline — `digest/pipeline/`
+## Digest pipeline — `jarvis/digest/pipeline/`
 
 `run.py` orchestrates:
 ```
@@ -397,16 +435,27 @@ filter_and_score(papers, provider, max_results, PROMPT_PATH)
   ↓
 format_digest()  →  ~/Documents/papers/digest/digest-{date}.md
   ↓
-add_papers_batch(score >= 9)  →  knowledge base
+index_digest_file()             →  the digest .md itself, doc_type="digest"
+index_scored_papers()           →  score-tiered knowledge-base indexing
 ```
 
+**Indexing tiers** (`index_scored_papers`):
+
+| Score | What is indexed |
+|---|---|
+| `>= 9` | Full text via `ingest_full_text_paper`: dedup by source/title first → arXiv PDF downloaded to a temp dir → `pdf_to_markdown` → annotations + figures (config-gated) + chunked body with `{title, authors, doi, score, track, storage_mode: "full_text"}` and the title/authors embed header. **No `summarize()` call.** bioRxiv links (doi.org — no derivable PDF URL) and any download/conversion failure fall back to a summary entry built from the scoring run's own summary+why text, with a visible warning; one 404 never fails the digest job. Outcome counts (full-text / summary-fallback / skipped) are printed |
+| `8 <= s < 9` | Summary entry via `add_papers_batch` — reuses the scoring run's summary+why, zero extra LLM calls |
+| `< 8` | Not indexed per-paper; discoverable only through the indexed digest document |
+
+**Digest document** (`index_digest_file`): the digest `.md` is indexed as `doc_type="digest"` with a `file://` source pointing at the file on disk, title `"Paper Digest — YYYY-MM-DD"`, and `storage_mode="full_text"` — so every paper it mentions (including the `< 8` tier) is searchable via `retrieve_papers`, which queries `doc_type=["paper", "digest"]`. See the `doc_type` rules above for why this is not `"note"`. There is no dedup against previously indexed digests: a manual same-day re-run of `run-digest` writes a second `digest-{date}.md` file and indexes it as a second digest document (each file gets its own `file://` source) — accepted because normal operation writes exactly one digest file per scheduled slot, and the catch-up job that could otherwise double-fire is lock-guarded (see `jarvis/sync/daemon.py`).
+
 `score.py` — `filter_and_score()` sends all abstracts in one large prompt, parses JSON response. Under the local provider this requests a large `context_length`, which `OllamaProvider` passes through as `num_ctx`. The daemon's digest job additionally checks that Ollama is reachable (`GET /api/tags`) before starting.
-`format.py` — `format_digest()` renders tiered Markdown digest.
+`format.py` — `format_digest()` renders tiered Markdown digest (the "Generated HH:MM" line uses the actual run time).
 `prompts/prompt_filter_score.md` — scoring rubric loaded at run time.
 
 ---
 
-## LLM providers — `digest/llm.py`
+## LLM providers — `jarvis/core/llm.py`
 
 `ChatProvider` protocol — four methods used across the system:
 
@@ -445,7 +494,7 @@ A single `_FIGURE_CAPTION_PROMPT` is shared by both providers' `describe_image()
 
 ---
 
-## KB agent — `vault_chat/chat.py`
+## KB agent — `jarvis/chat/chat.py`
 
 Single `run_session(vault, kb_only=True, session=None)` loop using `provider.agentic_turn()`. Every tool call is printed to the terminal (`→ tool_name(args)`) so the user sees each step. Each turn runs through the persistent `Session` (see Sessions below): compaction check, turn recorded, saved after the reply. CLI flags `--list-sessions` and `--resume <id>` list and resume stored sessions.
 
@@ -467,14 +516,15 @@ Single `run_session(vault, kb_only=True, session=None)` loop using `provider.age
 
 | Tool | Concern | Cloud provider behaviour |
 |---|---|---|
-| `retrieve_papers` | Search indexed papers | Public only; `PrivacyError` if query only matches private content |
+| `retrieve_papers` | Search indexed papers and digest documents (`doc_type=["paper", "digest"]`) | Public only; `PrivacyError` if query only matches private content |
 | `search_notes` | Search vault notes | Public only; `PrivacyError` if query only matches private content; static caveat line appended when private matches were excluded from mixed results |
 | `search_chat_history` | Search past conversations (`doc_type="chat"`), excluding the running session | Public sessions only; `PrivacyError` if query only matches private sessions |
 | `read_file` | Read one vault file in full (after search identifies it) | `PrivacyError` for files whose resolved path is in `private_vault_dirs` |
 | `read_skill` | Load a user-defined skill's full instructions; only in the tools list when skills exist | Any (skills are the user's own trusted files) |
-| `add_document` | Add a paper or PDF; requires `doc_type` for local PDFs; two storage modes (see below); rejects private papers; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` | Any |
+| `add_document` | Add a paper or PDF; requires `doc_type` for local PDFs; two storage modes (see below); rejects private papers; title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry (old chunks deleted first), which is the reingest-with-figures path | Any |
 | `update_file_path` | Update stored path for a local document without re-embedding | Any |
-| `remove_document` | Preview → request removal; a **human** must confirm out-of-band before anything is deleted (see Security) | Any |
+| `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only; clears `meta_inferred` | Any |
+| `remove_document` | One call: immediately shows a **human** confirmation prompt; only that human answer executes the removal — database entry only, files on disk are never touched (see Security) | Any |
 | `list_papers` | List indexed papers | Any |
 | `kb_stats` | Document and chunk counts | Any |
 | `index_vault` | Incremental vault sync (new/changed/deleted files). No `force` option — the destructive clean rebuild is CLI-only (`kb index-vault --force`) | Any |
@@ -495,19 +545,19 @@ Notes (`doc_type="note"`) are **always** stored as `full_text` regardless of wha
 
 For local PDFs, `doc_type` (`"paper"` or `"note"`), `visibility` (`"public"` / `"private"`, note-type only — private papers are rejected), and an optional `title` override are also accepted.
 
-**Duplicate handling** — a paper can now arrive via arXiv and bioRxiv under different URLs, so `add_paper` and the manual-add paths skip on a normalised-title match as well as a source-URL match (`_title_exists` in `store.py`). The digest batch skips silently and reports `(added, skipped)`; `kb add` prompts `[y/N]`; the chat `add_document` tool returns an ask-the-user message and only proceeds when re-invoked with `allow_duplicate=true`.
+**Duplicate handling** — a paper can now arrive via arXiv and bioRxiv under different URLs, so `add_paper` and the manual-add paths skip on a normalised-title match as well as a source-URL match (`_title_exists` in `store.py`). The digest batch skips silently and reports `(added, skipped)`; `kb add` prompts `[y/N]`; the chat `add_document` tool returns an ask-the-user message and only proceeds when re-invoked with `allow_duplicate=true`. **Re-adding replaces:** once the user opts in, a SAME-SOURCE duplicate has its old chunks deleted by source before the re-add (annotations and figures share `source`, so the whole old entry is swept) — the store never holds two copies of one source. A same-title-but-different-source duplicate deletes nothing and becomes a separate entry. This replace path is how an already-indexed paper gets reingested with figure captions on.
 
-### `remove_document` flow — human in the loop
+### `remove_document` flow — one-shot human confirmation
 
-1. Call without `confirmed` — returns a preview: title, type, source, chunk count, and a file line that **always** names the full local path (or "no local file") and states unambiguously whether the file is KEPT or "will be PERMANENTLY DELETED" — regardless of `delete_file`, so a database-only removal never looks like it might touch the file.
-2. The LLM presents the preview and asks the user.
-3. Call with `confirmed=true` — this **still does not delete**. It hands the decision to a human via a `request_confirmation` channel: a `y/N` prompt in the terminal CLI, or a Confirm/Cancel dialog in the webapp (whose Confirm hits `/confirm-action`, entirely outside the LLM tool loop). Only the human's answer executes `execute_remove()`.
+1. The model calls `remove_document(source)` **once**. The tool immediately builds a preview — title, type, source, chunk count, and a line that always names the full local path (or "no local file") and states the fixed invariant: `"Database entry only — files on disk are never touched by jarvis: <path>"` — and hands it to a human via a `request_confirmation` channel: a `y/N` prompt in the terminal CLI, or a Confirm/Cancel dialog in the webapp (whose Confirm hits `/confirm-action`, entirely outside the LLM tool loop).
+2. If the channel defers (webapp — returns `None`), the tool returns the preview plus an instruction not to call `remove_document` again for this request and not to claim the removal happened until the human confirms.
+3. Only the human's out-of-band answer executes `execute_remove()`, which deletes the DB chunks and returns "No files were touched."
 
-Two layers therefore sit between the model and a deletion; a prompt-injected `confirmed=true` call cannot delete anything on its own. On-disk file deletion goes through `delete_local_file()`, which only ever unlinks paper PDFs — note files are never deleted (see Security).
+There is no model-controllable `confirmed` flag left to inject — the tool schema doesn't accept one. **File deletion has been removed from the codebase wholesale** (see Security): `execute_remove()` has no code path that can touch a file, so the scary case ("did it just delete my PDF?") is made impossible rather than better-worded.
 
 ---
 
-## Sessions — `vault_chat/sessions.py`
+## Sessions — `jarvis/chat/sessions.py`
 
 One JSON file per session in `~/.jarvis/sessions/<id>.json` (dir 0700, files 0600, atomic writes). Each file holds **both** the provider wire-format `messages` (what the LLM sees) and the `display` list (what the human sees) — the two cannot be rebuilt from each other, and compaction deliberately shrinks only `messages`. Also stored: `pinned`, `private`, `provider`, `kb_only`, `turn_starts` (the `messages` index where each user turn began), and `indexed_exchanges` (how many exchange pairs are already in Chroma). Sessions are saved after every completed turn (crash-safe); empty sessions are never written.
 
@@ -525,7 +575,7 @@ One JSON file per session in `~/.jarvis/sessions/<id>.json` (dir 0700, files 060
 
 ---
 
-## Skills — `vault_chat/skills.py`
+## Skills — `jarvis/chat/skills.py`
 
 A skill is a plain `.md` file in `skills_dir` (default `~/.jarvis/skills`); the filename stem is the skill name and the first non-empty line (leading `#` stripped) is its one-line description. A missing or empty folder means the feature is off — the `read_skill` tool is not even advertised.
 
@@ -535,7 +585,7 @@ The design is **progressive disclosure**: the system prompt carries only `name: 
 
 ---
 
-## Web UI — `webapp/`
+## Web UI — `jarvis/webapp/`
 
 Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (localhost only).
 
@@ -608,9 +658,11 @@ Browser reads the stream via fetch() + ReadableStream
 
 **Threat model.** A single-user application bound to loopback that nonetheless ingests untrusted content: arXiv PDFs, downloaded papers, and anything dropped into the inbox can contain adversarial text aimed at the LLM (prompt injection). The protections are layered — some are hard guarantees, some are mitigations, and the docs below say which is which.
 
-**Human-in-the-loop for destructive actions (hard).** The model can *request* a deletion; only the human can *execute* it. `remove_document(confirmed=true)` never deletes — it routes through `request_confirmation`: a terminal `y/N` prompt in the CLI, a Confirm/Cancel dialog in the webapp whose Confirm hits `POST /confirm-action` outside the LLM tool loop. A prompt-injected deletion therefore cannot fire, no matter what the model is convinced to call.
+**Human-in-the-loop for destructive actions (hard).** The model can *request* a deletion; only the human can *execute* it. `remove_document(source)` is a single call that never deletes anything itself — it immediately routes the preview through `request_confirmation`: a terminal `y/N` prompt in the CLI, a Confirm/Cancel dialog in the webapp whose Confirm hits `POST /confirm-action` outside the LLM tool loop. There is no model-controllable `confirmed` boolean left to inject — one round-trip was removed, zero security layers were.
 
-**Note files are never deleted from disk (hard).** `delete_local_file()` is the single choke point for on-disk deletion, shared by `kb remove --delete-file` and the chat tool: it only ever unlinks **paper PDFs**. Note files (vault `.md` or note-type PDFs) are the user's own writing — jarvis removes index entries but never touches the files, not even for a human with `--delete-file`.
+**File deletion has been removed from the codebase wholesale (hard).** There is no code path anywhere in `jarvis/kb/store.py`, `jarvis/kb/cli.py`, or `jarvis/chat/chat.py` that unlinks a file — `delete_local_file()` and the `--delete-file` / `delete_file` params were deleted, not just disabled. `execute_remove()` only ever deletes ChromaDB chunks; the preview, the webapp dialog, and the system prompt all state the same invariant line verbatim: `"Database entry only — files on disk are never touched by jarvis: <path>"`, rendered visually distinct in the webapp dialog. This resolves what was previously an unclear-wording complaint by making the scary case impossible rather than better-worded.
+
+**Stale confirm-dialog token guard.** The one-shot flow makes it possible for an older, unclicked confirmation dialog to still be on screen when a newer removal is requested. `request_confirmation` tags each pending action with a fresh UUID token; `POST /confirm-action` 409s unless the posted token matches the currently pending one, so an old dialog's Confirm button can never fire against a different (newer) action.
 
 **Reduced LLM-facing surface.** The `index_vault` tool lost its destructive `force` option; the clean rebuild lives only in the human-driven CLI (`kb index-vault --force`).
 
@@ -624,7 +676,7 @@ The privacy model (papers-always-public invariant, `PrivacyError` hard stops, re
 
 ---
 
-## Error handling — `digest/errors.py`
+## Error handling — `jarvis/core/errors.py`
 
 ```
 PaperDigestError
@@ -646,18 +698,27 @@ PaperDigestError
 ### Background sync (`jarvis-sync`)
 
 ```
-weekly cron slot (or catch-up at start)  → run-digest job → status file
-PDF lands in pdf_watch_dir → watchdog event → queue → wait_for_stable()
-  → ingest_pdf(): hash dedup → add_annotations() → caption figures (lazy provider) → pdf_to_markdown() → add_texts()
-every vault_refresh_minutes → refresh_vault()
+weekly cron slot → run_digest_job (non-blocking lock guards double-fire)
+every 6 h (and at start) → run_digest_catchup_job: last_success stale? → run_digest_job
+every pdf_watch_minutes (and at start) → run_pdf_scan_job:
+  scan_watch_dir() → per file: wait_for_stable() (else leave for next cycle)
+  → ingest_pdf(): hash dedup → add_annotations() → caption figures (config-gated, off by default)
+  → pdf_to_markdown() → add_texts()
+every vault_refresh_minutes (and at start) → refresh_vault()
 ```
 
 ### Weekly digest
 
 ```
 arXiv (arxiv package) + bioRxiv (details API: categories + keywords)
-  → fetch → deduplicate (title) → score → format digest → index score≥9 papers
-  index skips papers already present by source URL or title; batch reports (added, skipped)
+  → fetch → deduplicate (title) → score → format digest (written to output_dir)
+  → index_digest_file(): the digest .md itself → doc_type="digest", file:// source
+  → index_scored_papers():
+      score >= 9   → ingest_full_text_paper(): dedup → arXiv PDF → full text
+                     (bioRxiv link / download failure → summary fallback, no LLM call)
+      8 <= s < 9   → add_papers_batch() summary entries (no LLM call)
+      score < 8    → per-paper: nothing (searchable via the digest document)
+  dedup skips papers already present by source URL or title
 ```
 
 ### Vault chat turn
@@ -670,12 +731,12 @@ User message → maybe_compact() → provider.agentic_turn() → tool loop → r
   search_chat_history             → search_with_privacy_check(doc_type="chat") → wrap
   read_file                       → resolved-path privacy check → filesystem read → wrap
   read_skill                      → validated name → skill file content
-  add_document (summary mode)     → fetch metadata → provider.summarize() → add_texts() (+ annotations for local PDFs)
+  add_document (summary mode)     → resolve_pdf_metadata() (local PDFs) → provider.summarize() → add_texts() (+ annotations)
   add_document (full_text mode)   → download PDF → pdf_to_markdown() → chunk → add_texts() + add_annotations()
-  add_document (note, local PDF)  → pdf_to_markdown() → chunk → add_texts() + add_annotations()
+  add_document (note, local PDF)  → resolve_pdf_metadata() → pdf_to_markdown() → chunk → add_texts() + add_annotations()
   update_file_path                → update file_path + source URI in all matching chunks; no re-embedding
-  remove_document (unconfirmed)   → lookup metadata → return preview
-  remove_document (confirmed)     → request_confirmation → human decides → execute_remove()
+  update_document_metadata        → update_paper_metadata(); clears meta_inferred; no re-embedding
+  remove_document                 → lookup metadata → build preview → request_confirmation → human decides → execute_remove()
   index_vault                     → refresh_vault() (incremental only)
   refresh_vault Phase 1           → compare hashes → index new/changed vault .md, delete removed,
                                     re-check visibility of unchanged notes (skips PDF notes)

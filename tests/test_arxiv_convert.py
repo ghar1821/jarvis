@@ -1,5 +1,5 @@
 """
-Tests for digest/arxiv/convert.py — parse_arxiv_url().
+Tests for jarvis/digest/arxiv/convert.py — parse_arxiv_url().
 
 parse_arxiv_url() accepts any arXiv URL and returns the bare paper ID
 (e.g. "2301.07041"). It handles the two common URL forms (/abs/ and /pdf/)
@@ -8,7 +8,7 @@ and preserves version suffixes (v1, v2, …). Returns None for non-arXiv URLs.
 These are pure-function tests: no network calls, no filesystem access.
 """
 
-from digest.arxiv.convert import parse_arxiv_url
+from jarvis.digest.arxiv.convert import parse_arxiv_url
 
 
 def test_parses_abs_url():

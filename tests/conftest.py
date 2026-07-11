@@ -28,8 +28,8 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from digest.config import Config
-from digest.kb.store import build_embeddings
+from jarvis.core.config import Config
+from jarvis.kb.store import build_embeddings
 
 # Persistent directory for the test ChromaDB store. Gitignored — never committed.
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"

@@ -1,5 +1,5 @@
 """
-Tests for digest/biorxiv/fetch.py — bioRxiv retrieval over the details API.
+Tests for jarvis/digest/biorxiv/fetch.py — bioRxiv retrieval over the details API.
 
 The bioRxiv API is a real network boundary (live HTTP to api.biorxiv.org), so
 these tests stub `requests.get` with fake responses shaped exactly like the
@@ -13,10 +13,10 @@ Retries use monkeypatched time.sleep so no real waiting happens.
 
 import pytest
 
-import digest.biorxiv.fetch as fetch_mod
-import digest.errors
-from digest.biorxiv.fetch import fetch_biorxiv, fetch_biorxiv_keywords
-from digest.errors import FetchError
+import jarvis.digest.biorxiv.fetch as fetch_mod
+import jarvis.core.errors
+from jarvis.digest.biorxiv.fetch import fetch_biorxiv, fetch_biorxiv_keywords
+from jarvis.core.errors import FetchError
 
 
 def _record(title="A Preprint", abstract="An abstract.", doi="10.1101/2026.01.01.123456",
@@ -68,7 +68,7 @@ def _fake_get_factory(pages):
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
     """Skip real backoff sleeps in every test in this module."""
-    monkeypatch.setattr(digest.errors.time, "sleep", lambda _: None)
+    monkeypatch.setattr(jarvis.core.errors.time, "sleep", lambda _: None)
 
 
 # ── Field mapping ──────────────────────────────────────────────────────────────

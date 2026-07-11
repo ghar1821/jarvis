@@ -1,5 +1,5 @@
 """
-Tests for digest/config.py — load_config() resolution order.
+Tests for jarvis/core/config.py — load_config() resolution order.
 
 load_config() builds a Config in three layers, each overriding the previous:
   1. Built-in defaults (hardcoded in the Config dataclass)
@@ -13,7 +13,7 @@ any environment variables changed during a test.
 
 import pytest
 
-from digest.config import load_config
+from jarvis.core.config import load_config
 
 
 def test_defaults_when_no_config_file(tmp_path):
@@ -30,7 +30,7 @@ def test_defaults_when_no_config_file(tmp_path):
         query_prefix    == the BGE search instruction
         rerank_model    == "cross-encoder/ms-marco-MiniLM-L6-v2"
         rerank_top_n    == 25
-        figure_captions == True
+        figure_captions == False   (off by default — vision calls cost per figure)
     """
     cfg = load_config(tmp_path / "nonexistent.toml")
     assert cfg.ollama_model == "qwen3-vl:30b"
@@ -41,9 +41,10 @@ def test_defaults_when_no_config_file(tmp_path):
     assert cfg.query_prefix == "Represent this sentence for searching relevant passages: "
     assert cfg.rerank_model == "cross-encoder/ms-marco-MiniLM-L6-v2"
     assert cfg.rerank_top_n == 25
-    assert cfg.figure_captions is True
+    assert cfg.figure_captions is False
     assert cfg.figure_max_per_doc == 20
     assert cfg.figure_min_pixels == 40000
+    assert cfg.hybrid is True
 
 
 def test_toml_values_override_defaults(tmp_path):
@@ -72,7 +73,8 @@ def test_rag_settings_override_defaults(tmp_path):
     """
     The [rag] section fields — including the retrieval-tuning and figure-caption
     ones — are read from the TOML. An empty rerank_model is honoured as the
-    disable switch, and figure_captions can be turned off.
+    disable switch, and figure_captions can be turned on globally (it now
+    defaults off).
 
     Input:  config.toml [rag] overriding embed_model, query_prefix, rerank_model,
             rerank_top_n, and the figure-caption knobs
@@ -86,7 +88,7 @@ def test_rag_settings_override_defaults(tmp_path):
         'query_prefix = ""\n'
         'rerank_model = ""\n'
         'rerank_top_n = 40\n'
-        'figure_captions = false\n'
+        'figure_captions = true\n'
         'figure_max_per_doc = 5\n'
         'figure_min_pixels = 10000\n'
     )
@@ -95,9 +97,23 @@ def test_rag_settings_override_defaults(tmp_path):
     assert cfg.query_prefix == ""
     assert cfg.rerank_model == ""
     assert cfg.rerank_top_n == 40
-    assert cfg.figure_captions is False
+    assert cfg.figure_captions is True
     assert cfg.figure_max_per_doc == 5
     assert cfg.figure_min_pixels == 10000
+
+
+def test_hybrid_defaults_true_and_parses_from_toml(tmp_path):
+    """
+    hybrid defaults to True (dense-only retrieval was the pre-hybrid
+    behaviour) and can be turned off via [rag] hybrid = false.
+    """
+    cfg = load_config(tmp_path / "nonexistent.toml")
+    assert cfg.hybrid is True
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[rag]\nhybrid = false\n')
+    cfg = load_config(config_file)
+    assert cfg.hybrid is False
 
 
 def test_biorxiv_settings_override_defaults(tmp_path):
@@ -162,14 +178,16 @@ def test_sync_section_defaults_and_overrides(tmp_path):
     """
     cfg = load_config(tmp_path / "nonexistent.toml")
     assert cfg.pdf_watch_dir is None
+    assert cfg.pdf_watch_minutes == 30
     assert cfg.vault_refresh_minutes == 30
     assert cfg.digest_day == "mon"
-    assert cfg.digest_hour == 2
+    assert cfg.digest_hour == 5
 
     config_file = tmp_path / "config.toml"
     config_file.write_text(
         '[sync]\n'
         'pdf_watch_dir = "~/papers/inbox"\n'
+        'pdf_watch_minutes = 15\n'
         'vault_refresh_minutes = 10\n'
         'digest_day = "fri"\n'
         'digest_hour = 6\n'
@@ -177,6 +195,7 @@ def test_sync_section_defaults_and_overrides(tmp_path):
     cfg = load_config(config_file)
     assert cfg.pdf_watch_dir is not None
     assert not str(cfg.pdf_watch_dir).startswith("~")
+    assert cfg.pdf_watch_minutes == 15
     assert cfg.vault_refresh_minutes == 10
     assert cfg.digest_day == "fri"
     assert cfg.digest_hour == 6

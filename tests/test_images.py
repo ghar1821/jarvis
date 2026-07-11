@@ -1,5 +1,5 @@
 """
-Tests for digest/kb/images.py (figure extraction) and store.add_figures
+Tests for jarvis/kb/images.py (figure extraction) and store.add_figures
 (vision captioning + indexing).
 
 Figure extraction runs on real generated PDFs (PyMuPDF, cheap, no mocking).
@@ -12,9 +12,9 @@ model, and that a per-figure failure doesn't abort the whole ingest.
 import pymupdf
 import pytest
 
-from digest.config import reset_config
-from digest.kb.images import extract_figures
-from digest.kb.store import add_figures, delete_by_metadata
+from jarvis.core.config import reset_config
+from jarvis.kb.images import extract_figures
+from jarvis.kb.store import add_figures, delete_by_metadata
 
 
 def _png_bytes(width: int, height: int, color=(200, 30, 30)) -> bytes:
@@ -49,7 +49,7 @@ class _FakeProvider:
         self.calls = 0
 
     def describe_image(self, image_bytes: bytes, context: str) -> str:
-        from digest.errors import LLMError
+        from jarvis.core.errors import LLMError
 
         current = self.calls
         self.calls += 1
@@ -90,7 +90,8 @@ def test_extract_figures_honours_max(tmp_path):
 def test_add_figures_indexes_caption_chunks(tmp_path, store):
     """
     Each figure becomes one chunk: page_content prefixed [FIGURE p.N], metadata
-    annotation_kind="figure" with the page number.
+    annotation_kind="figure" with the page number. enabled=True is the
+    per-document opt-in now that figure_captions defaults off.
     """
     pdf = tmp_path / "paper.pdf"
     _pdf_with_images(pdf, [(300, 300)])
@@ -99,7 +100,7 @@ def test_add_figures_indexes_caption_chunks(tmp_path, store):
     ids = add_figures(
         pdf, doc_type="paper", visibility="public", source=pdf.as_uri(),
         provider_obj=provider, provider_str="ollama", title="My Paper",
-        file_path=str(pdf), store=store,
+        file_path=str(pdf), store=store, enabled=True,
     )
     assert len(ids) == 1
     assert provider.calls == 1
@@ -114,6 +115,8 @@ def test_add_figures_private_anthropic_is_skipped(tmp_path, store, capsys):
     """
     A private note under the cloud provider skips captioning entirely: no
     chunk written, the vision model is never called, and a warning is printed.
+    enabled=True must NOT override this — the opt-in only bypasses the config
+    kill-switch, never the privacy guard.
     """
     pdf = tmp_path / "secret.pdf"
     _pdf_with_images(pdf, [(300, 300)])
@@ -122,7 +125,7 @@ def test_add_figures_private_anthropic_is_skipped(tmp_path, store, capsys):
     ids = add_figures(
         pdf, doc_type="note", visibility="private", source=pdf.as_uri(),
         provider_obj=provider, provider_str="anthropic", title="Secret",
-        file_path=str(pdf), store=store,
+        file_path=str(pdf), store=store, enabled=True,
     )
     assert ids == []
     assert provider.calls == 0
@@ -139,7 +142,7 @@ def test_add_figures_tolerates_per_figure_failure(tmp_path, store):
     ids = add_figures(
         pdf, doc_type="paper", visibility="public", source=pdf.as_uri(),
         provider_obj=provider, provider_str="ollama", title="Paper",
-        file_path=str(pdf), store=store,
+        file_path=str(pdf), store=store, enabled=True,
     )
     assert len(ids) == 2
     assert provider.calls == 3
@@ -153,7 +156,7 @@ def test_add_figures_respects_kill_switch(tmp_path, store, monkeypatch):
     provider = _FakeProvider(captions=["nope"])
 
     # Turn the kill-switch off by monkeypatching the loaded config.
-    import digest.kb.store as store_mod
+    import jarvis.kb.store as store_mod
     real_get_config = store_mod.get_config
 
     class _Cfg:
@@ -183,7 +186,7 @@ def test_delete_by_source_sweeps_figures(tmp_path, store):
     add_figures(
         pdf, doc_type="paper", visibility="public", source=pdf.as_uri(),
         provider_obj=provider, provider_str="ollama", title="Paper",
-        file_path=str(pdf), store=store,
+        file_path=str(pdf), store=store, enabled=True,
     )
     assert store._collection.get(where={"annotation_kind": {"$eq": "figure"}})["ids"]
 

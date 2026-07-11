@@ -1,5 +1,5 @@
 """
-Tests for digest/kb/store.py — knowledge base operations.
+Tests for jarvis/kb/store.py — knowledge base operations.
 
 All tests receive an isolated ChromaDB collection via the `store` fixture
 (see conftest.py) and pass it explicitly using the store= parameter that
@@ -19,6 +19,11 @@ Sections
 5. list_papers               — deduplication and chunk count
 6. update_file_path          — in-place metadata update
 7. refresh_vault             — incremental vault sync (add / update / delete / PDF notes)
+8. embedding-model guard
+9. re-ranking
+10. chunk metadata
+11. PDF annotations
+12. corruption detection / hybrid retrieval / verified-metadata loop
 """
 
 import uuid
@@ -27,22 +32,26 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from digest.config import Config
-from digest.errors import RAGError
-from digest.kb.store import (
+from jarvis.core.config import Config
+from jarvis.core.errors import KBCorruptionError, RAGError
+from jarvis.kb.store import (
     _check_embedding_model_matches,
+    _reciprocal_rank_fusion,
     _title_exists,
     add_annotations,
+    add_figures,
     add_paper,
     add_papers_batch,
     add_texts,
     count,
+    count_unverified_papers,
     delete_by_metadata,
     list_papers,
     refresh_vault,
     search,
     search_with_privacy_check,
     update_file_path,
+    update_paper_metadata,
     update_visibility,
 )
 
@@ -393,7 +402,7 @@ def test_refresh_vault_updates_visibility_when_config_reclassifies_dir(
             visibility is "private"
     """
     monkeypatch.setattr(
-        "digest.kb.store.get_config",
+        "jarvis.kb.store.get_config",
         lambda: Config(private_vault_dirs=["private"]),
     )
     (tmp_path / "confidential").mkdir()
@@ -407,7 +416,7 @@ def test_refresh_vault_updates_visibility_when_config_reclassifies_dir(
     assert stored["metadatas"][0]["visibility"] == "public"
 
     monkeypatch.setattr(
-        "digest.kb.store.get_config",
+        "jarvis.kb.store.get_config",
         lambda: Config(private_vault_dirs=["private", "confidential"]),
     )
     added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
@@ -551,7 +560,7 @@ def test_embedding_guard_ignores_empty_collection(embeddings):
 @pytest.fixture
 def rerank_on(monkeypatch):
     """Force default retrieval config (re-ranking enabled) regardless of ~/.jarvis/config.toml."""
-    monkeypatch.setattr("digest.kb.store.get_config", lambda: Config())
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config())
 
 
 def test_reranked_search_still_excludes_private_docs(store, rerank_on):
@@ -581,7 +590,7 @@ def test_search_rerank_false_skips_reranker(store, monkeypatch):
     def fail_if_called():
         raise AssertionError("reranker must not be loaded when rerank=False")
 
-    monkeypatch.setattr("digest.kb.store._get_reranker", fail_if_called)
+    monkeypatch.setattr("jarvis.kb.store._get_reranker", fail_if_called)
     add_texts(content="Recurrent networks process sequences step by step.",
               doc_type="note", visibility="public", source="seq", store=store)
     results = search("recurrent sequence model", n_results=3, store=store, rerank=False)
@@ -778,3 +787,292 @@ def test_add_papers_batch_reports_added_and_skipped(store):
     added, skipped = add_papers_batch(entries, store=store)
     assert added == 1
     assert skipped == 1
+
+
+# ── 12. Corruption detection ────────────────────────────────────────────────────
+
+def test_search_raises_kb_corruption_error_on_id_lookup_failure(store, monkeypatch):
+    """
+    A ChromaDB "Error finding id" failure (a stale HNSW reference to a deleted
+    chunk) must surface as KBCorruptionError naming `kb reindex` as the fix —
+    not a generic RAGError the LLM would paraphrase into something useless.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
+
+    def broken_similarity_search(*args, **kwargs):
+        raise Exception("chromadb.errors.InternalError: Error finding id abcd1234")
+
+    monkeypatch.setattr(store, "similarity_search", broken_similarity_search)
+
+    with pytest.raises(KBCorruptionError, match="kb reindex"):
+        search("anything", store=store, rerank=False)
+
+
+def test_search_other_failures_still_raise_plain_rag_error(store, monkeypatch):
+    """
+    Any other similarity_search failure stays a plain RAGError — only the
+    stable "Error finding id" substring gets the corruption diagnosis.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
+
+    def broken_similarity_search(*args, **kwargs):
+        raise Exception("connection reset by peer")
+
+    monkeypatch.setattr(store, "similarity_search", broken_similarity_search)
+
+    with pytest.raises(RAGError) as exc_info:
+        search("anything", store=store, rerank=False)
+    assert not isinstance(exc_info.value, KBCorruptionError)
+
+
+def test_search_raises_kb_corruption_error_on_hybrid_path(store, monkeypatch):
+    """
+    The corruption diagnosis must also fire on the hybrid (default) path, not
+    just the plain similarity_search branch — hybrid=True is the default
+    config, so this is the path most users actually hit.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=True))
+    # The hybrid path only reaches the dense query() call if the candidate
+    # pool is non-empty, so seed one chunk first.
+    add_texts(content="Graph neural networks aggregate messages over edges.",
+              doc_type="note", visibility="public", source="hybrid-corruption-seed", store=store)
+
+    def broken_query(*args, **kwargs):
+        raise Exception("chromadb.errors.InternalError: Error finding id abcd1234")
+
+    monkeypatch.setattr(store._collection, "query", broken_query)
+
+    with pytest.raises(KBCorruptionError, match="kb reindex"):
+        search("anything", store=store, rerank=False)
+
+
+# ── 13. Embed header ─────────────────────────────────────────────────────────────
+
+def test_embed_header_is_prepended_to_every_chunk(store):
+    """
+    embed_header must be part of the EMBEDDED text of every chunk, not just
+    the first — an author-name query has to be able to match any chunk of a
+    long paper, since the author's name appears in no body chunk otherwise.
+    """
+    long_content = "Self-attention computes pairwise interactions between all tokens. " * 200
+    add_texts(
+        content=long_content, doc_type="paper", visibility="public",
+        source="header-test", store=store,
+        embed_header="A Long Paper — Jane Doe, John Smith",
+    )
+    stored = store._collection.get(where={"source": {"$eq": "header-test"}}, include=["documents"])
+    assert len(stored["documents"]) > 1, "content should have produced multiple chunks"
+    assert all(doc.startswith("A Long Paper — Jane Doe, John Smith") for doc in stored["documents"])
+
+
+# ── 14. Hybrid BM25 + RRF retrieval ───────────────────────────────────────────────
+
+def test_hybrid_disabled_reproduces_plain_similarity_search(store, monkeypatch):
+    """hybrid=False takes the untouched similarity_search branch, byte for byte."""
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("_hybrid_search must not be called when hybrid=False")
+
+    monkeypatch.setattr("jarvis.kb.store._hybrid_search", fail_if_called)
+    add_texts(content="Recurrent networks process sequences step by step.",
+              doc_type="note", visibility="public", source="seq-hybrid-off", store=store)
+    results = search("recurrent sequence model", n_results=3, store=store, rerank=False)
+    assert any(doc.metadata["source"] == "seq-hybrid-off" for doc in results)
+
+
+def test_hybrid_enabled_uses_hybrid_search_and_returns_expected_doc(store, monkeypatch):
+    """hybrid=True (the default) routes through _hybrid_search and still finds the doc."""
+    from jarvis.kb import store as store_module
+
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=True))
+    calls = {"n": 0}
+    original = store_module._hybrid_search
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("jarvis.kb.store._hybrid_search", spy)
+    add_texts(content="Diffusion models learn to reverse a gradual noising process.",
+              doc_type="note", visibility="public", source="diffusion-hybrid-on", store=store)
+    results = search("diffusion denoising model", n_results=3, store=store, rerank=False)
+    assert calls["n"] == 1
+    assert any(doc.metadata["source"] == "diffusion-hybrid-on" for doc in results)
+
+
+def test_reciprocal_rank_fusion_favours_ids_ranked_high_in_both_lists():
+    """A direct unit test of the fusion math, independent of any store."""
+    dense = ["a", "b", "c", "d"]
+    sparse = ["b", "a", "d", "c"]
+    fused = _reciprocal_rank_fusion(dense, sparse)
+    # "a" and "b" are ranked 1st/2nd in both lists, so they must both land
+    # ahead of "c" and "d", which rank lower in both.
+    assert set(fused[:2]) == {"a", "b"}
+    assert set(fused[2:]) == {"c", "d"}
+
+
+# ── 15. Verified-metadata loop ─────────────────────────────────────────────────
+
+def test_add_paper_content_includes_authors_line(store):
+    """
+    An author-name query needs the authors to appear somewhere in the
+    embedded text — add_paper's content now includes an authors line.
+    """
+    paper = {
+        "link": "https://arxiv.org/abs/9999.00001",
+        "title": "Attention Is All You Need",
+        "authors": "Ashish Vaswani, Noam Shazeer",
+    }
+    add_paper(paper, dense_summary="Introduces the Transformer architecture.", store=store)
+    stored = store._collection.get(where={"source": {"$eq": paper["link"]}}, include=["documents"])
+    assert any("Ashish Vaswani, Noam Shazeer" in doc for doc in stored["documents"])
+
+
+def test_update_paper_metadata_clears_meta_inferred(store):
+    """
+    Setting any field via update_paper_metadata marks the metadata verified —
+    meta_inferred flips to False even if the caller only touched one field.
+    """
+    paper = _paper(50)
+    ids = add_paper(paper, dense_summary="Summary text.", store=store)
+    inferred_metas = store._collection.get(ids=ids, include=["metadatas"])["metadatas"]
+    store._collection.update(ids=ids, metadatas=[{**m, "meta_inferred": True} for m in inferred_metas])
+
+    n = update_paper_metadata(paper["link"], title="Corrected Title", store=store)
+    assert n == len(ids)
+
+    stored = store._collection.get(where={"source": {"$eq": paper["link"]}}, include=["metadatas"])
+    assert all(m["title"] == "Corrected Title" for m in stored["metadatas"])
+    assert all(m["meta_inferred"] is False for m in stored["metadatas"])
+
+
+def test_count_unverified_papers_counts_unique_sources(store):
+    """count_unverified_papers de-duplicates by source and drops once verified."""
+    paper_a = _paper(60)
+    paper_b = _paper(61)
+    add_paper(paper_a, dense_summary="s", store=store)
+    add_paper(paper_b, dense_summary="s", store=store)
+    assert count_unverified_papers(store) == 0
+
+    ids_a = store._collection.get(where={"source": {"$eq": paper_a["link"]}}, include=[])["ids"]
+    metas_a = store._collection.get(ids=ids_a, include=["metadatas"])["metadatas"]
+    store._collection.update(ids=ids_a, metadatas=[{**m, "meta_inferred": True} for m in metas_a])
+    assert count_unverified_papers(store) == 1
+
+    update_paper_metadata(paper_a["link"], title="Verified now", store=store)
+    assert count_unverified_papers(store) == 0
+
+
+# ── 16. doc_type list filter (papers + digests) ────────────────────────────────
+
+def test_search_doc_type_list_returns_papers_and_digests(store):
+    """
+    search() with a doc_type LIST must return documents of every listed type
+    and still exclude the rest — this is what lets retrieve_papers surface
+    weekly digest documents alongside individually indexed papers.
+
+    All three documents share the same content, so the doc_type filter (not
+    relevance) must do the discrimination.
+    """
+    content = "Spatial transcriptomics maps gene expression onto tissue coordinates."
+    add_texts(content=content, doc_type="paper", visibility="public",
+              source="paper-src", store=store)
+    add_texts(content=content, doc_type="digest", visibility="public",
+              source="file:///digests/digest-2026-07-06.md", store=store)
+    add_texts(content=content, doc_type="note", visibility="public",
+              source="note-src", store=store)
+
+    results = search("spatial transcriptomics tissue", n_results=10,
+                     doc_type=["paper", "digest"], store=store, rerank=False)
+    types = {doc.metadata["doc_type"] for doc in results}
+    assert types == {"paper", "digest"}
+
+    # A plain string still narrows to that single type.
+    only_papers = search("spatial transcriptomics tissue", n_results=10,
+                         doc_type="paper", store=store, rerank=False)
+    assert {doc.metadata["doc_type"] for doc in only_papers} == {"paper"}
+
+
+# ── 17. add_figures enabled override ───────────────────────────────────────────
+
+def _one_figure_pdf(tmp_path: Path) -> Path:
+    """A single-page PDF containing one 300×300 embedded image."""
+    import pymupdf
+
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 300, 300), False)
+    pixmap.set_rect(pixmap.irect, (200, 30, 30))
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_image(pymupdf.Rect(0, 0, 300, 300), stream=pixmap.tobytes("png"))
+    pdf_path = tmp_path / "figure.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return pdf_path
+
+
+class _CountingVisionProvider:
+    """Canned describe_image that counts how often the vision model runs."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def describe_image(self, image_bytes: bytes, context: str) -> str:
+        self.calls += 1
+        return "A bar chart comparing methods."
+
+
+def test_add_figures_enabled_true_forces_captioning_despite_config_off(
+    store, tmp_path, monkeypatch
+):
+    """
+    enabled=True is the per-document opt-in (kb add --figures / with_figures):
+    figures are captioned and indexed even though figure_captions defaults to
+    False in config.
+    """
+    monkeypatch.setattr(
+        "jarvis.kb.store.get_config", lambda: Config(rag_dir=tmp_path / "rag")
+    )
+    pdf_path = _one_figure_pdf(tmp_path)
+    provider = _CountingVisionProvider()
+
+    ids = add_figures(
+        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
+        provider_obj=provider, provider_str="ollama", title="Figure Paper",
+        store=store, enabled=True,
+    )
+    assert len(ids) == 1
+    assert provider.calls == 1
+
+
+def test_add_figures_enabled_none_respects_config(store, tmp_path, monkeypatch):
+    """
+    enabled=None defers to cfg.figure_captions: nothing happens under the
+    default (off), and flipping the config on enables captioning without any
+    per-call opt-in.
+    """
+    pdf_path = _one_figure_pdf(tmp_path)
+    provider = _CountingVisionProvider()
+
+    monkeypatch.setattr(
+        "jarvis.kb.store.get_config", lambda: Config(rag_dir=tmp_path / "rag")
+    )
+    ids = add_figures(
+        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
+        provider_obj=provider, provider_str="ollama", title="Figure Paper",
+        store=store, enabled=None,
+    )
+    assert ids == []
+    assert provider.calls == 0
+
+    monkeypatch.setattr(
+        "jarvis.kb.store.get_config",
+        lambda: Config(rag_dir=tmp_path / "rag", figure_captions=True),
+    )
+    ids = add_figures(
+        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
+        provider_obj=provider, provider_str="ollama", title="Figure Paper",
+        store=store, enabled=None,
+    )
+    assert len(ids) == 1
+    assert provider.calls == 1

@@ -1,5 +1,5 @@
 """
-Tests for digest/llm.py — provider adapters.
+Tests for jarvis/core/llm.py — provider adapters.
 
 Integration tests (marked, skipped by default) verify that live services are
 reachable: the Anthropic API (key check, no tokens) and the local Ollama server.
@@ -22,8 +22,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from digest.errors import PrivacyError
-from digest.llm import AnthropicProvider, OllamaProvider, make_provider
+from jarvis.core.errors import PrivacyError
+from jarvis.core.llm import AnthropicProvider, OllamaProvider, make_provider
 
 TOOLS = [
     {
@@ -47,7 +47,7 @@ def test_anthropic_client_initialises():
     available. Raises AuthenticationError if no key is found in the env var or
     config file.
     """
-    from digest.config import get_config
+    from jarvis.core.config import get_config
 
     cfg = get_config()
     provider = AnthropicProvider(model=cfg.anthropic_model)
@@ -60,7 +60,7 @@ def test_anthropic_models_list_confirms_auth():
     client.models.list() makes a real API call (GET /v1/models) that validates
     the API key without generating output or consuming tokens.
     """
-    from digest.config import get_config
+    from jarvis.core.config import get_config
 
     cfg = get_config()
     provider = AnthropicProvider(model=cfg.anthropic_model)

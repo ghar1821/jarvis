@@ -1,12 +1,12 @@
 """
 Tests for the response-style setting: system-prompt wiring
-(vault_chat.chat.build_system_prompt) and the tomlkit-based config
-write-back (digest.config.set_config_value / reset_config).
+(jarvis.chat.chat.build_system_prompt) and the tomlkit-based config
+write-back (jarvis.core.config.set_config_value / reset_config).
 """
 
-import digest.config as config_mod
-from digest.config import load_config, reset_config, set_config_value
-from vault_chat.chat import build_system_prompt
+import jarvis.core.config as config_mod
+from jarvis.core.config import load_config, reset_config, set_config_value
+from jarvis.chat.chat import build_system_prompt
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────

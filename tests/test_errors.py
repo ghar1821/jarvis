@@ -1,5 +1,5 @@
 """
-Tests for digest/errors.py — the @with_retries decorator.
+Tests for jarvis/core/errors.py — the @with_retries decorator.
 
 @with_retries wraps a callable and retries it up to max_attempts times when one
 of the specified exception types is raised. An exponential backoff with jitter
@@ -12,8 +12,8 @@ the backoff-schedule test which stubs time.sleep to capture the waits.
 
 import pytest
 
-import digest.errors
-from digest.errors import with_retries
+import jarvis.core.errors
+from jarvis.core.errors import with_retries
 
 
 def test_succeeds_on_first_try():
@@ -120,7 +120,7 @@ def test_backoff_grows_exponentially_with_jitter(monkeypatch):
         three sleeps, each within [base, base * 1.25) for bases 2, 4, 8
     """
     waits: list[float] = []
-    monkeypatch.setattr(digest.errors.time, "sleep", waits.append)
+    monkeypatch.setattr(jarvis.core.errors.time, "sleep", waits.append)
 
     @with_retries(max_attempts=4, backoff=2.0, exceptions=(ValueError,))
     def always_fails():

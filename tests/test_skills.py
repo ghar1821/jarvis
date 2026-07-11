@@ -1,8 +1,8 @@
 """
-Tests for vault_chat/skills.py — user-defined skill files.
+Tests for jarvis/chat/skills.py — user-defined skill files.
 """
 
-from vault_chat.skills import list_skills, read_skill
+from jarvis.chat.skills import list_skills, read_skill
 
 
 def _write_skill(skills_dir, name, content):

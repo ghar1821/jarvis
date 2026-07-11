@@ -4,7 +4,202 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — webapp bug fixes: modal visibility, session rename/pin, tool-call logging
+## [current] — restructure into a single `jarvis` package
+
+**Run `uv sync` after pulling this change** — the installed package name is
+unchanged (`jarvis`), but every module's dotted path has moved; a stale
+editable install can leave `import digest` / `import vault_chat` resolvable
+from cached `.pyc` files until the venv is resynced.
+
+Mechanical restructure — no behaviour change. Everything that used to live
+under three top-level packages (`digest/`, `vault_chat/`, `webapp/`) now lives
+under one: `jarvis/`.
+
+- `digest/config.py`, `digest/errors.py`, `digest/llm.py` → `jarvis/core/`
+  (shared infrastructure with no product-specific logic of its own)
+- `digest/arxiv/`, `digest/biorxiv/`, `digest/pipeline/` → `jarvis/digest/`
+  (the automated weekly digest, unchanged internally)
+- `digest/kb/` → `jarvis/kb/` (knowledge base management, unchanged internally)
+- `digest/daemon.py` → `jarvis/sync/daemon.py` (the `jarvis-sync` background
+  daemon)
+- `vault_chat/` → `jarvis/chat/` (the conversational KB agent)
+- `webapp/` → `jarvis/webapp/` (the FastAPI browser UI)
+
+`jarvis/kb/cli.py` also had two concerns split out of it that never belonged
+next to the `kb` CLI surface itself:
+- `cmd_sync_status` (+ its `..daemon` import) moved to a new
+  `jarvis/sync/status.py`, since it reports on the sync daemon, not the
+  knowledge base
+- `cmd_add_digest` and its two Markdown-parsing helpers
+  (`_parse_digest_file`, `_parse_paper_block`) moved to a new
+  `jarvis/digest/import_digest.py`, since they are about importing digest
+  files, not managing the KB
+
+`kb`'s subcommands, help text, and behaviour are unchanged — `cli.py` now
+just imports `cmd_sync_status` and `cmd_add_digest` from their new homes and
+registers them exactly as before. All `uv run` entry points
+(`run-digest`, `jarvis-sync`, `convert-pdf`, `vault-chat`, `kb`, `webapp`)
+keep their names; only the `pyproject.toml` module targets they point at
+changed. Full test suite (211 passed, 3 deselected) is unchanged before and
+after.
+
+## [previous] — digest tiers with full-text must-reads, opt-in figure captioning, periodic PDF inbox scan, digest catch-up
+
+**Run `uv sync` after pulling this change** — the `watchdog` dependency was
+removed.
+
+### Changed behaviour
+- **Figure captioning is now OFF by default** (`[rag] figure_captions` default
+  `true` → `false`) — each figure costs a vision-model call. Opt in per
+  document with `kb add --figures` or the chat tool's `with_figures=true`
+  param on `add_document`; `add_figures()` gained a keyword-only
+  `enabled: bool | None` (None = follow config, True = force for this
+  document; the private-note privacy guard is never overridden). The daemon
+  inbox and vault refresh stay config-gated, so they now no-op by default.
+- **Duplicates replace instead of duplicate**: answering yes to a
+  same-source duplicate (`kb add` `[y/N]` prompt, or `add_document` with
+  `allow_duplicate=true`) deletes the old entry's chunks — annotations and
+  figures share `source`, so the whole entry is swept and re-added. This is
+  the "reingest paper X with figures" path end-to-end. A
+  same-title-but-different-source duplicate still adds a separate entry. The
+  delete only runs after the new content has been produced (PDF downloaded
+  and converted, or summary generated), immediately before the add call — a
+  failed download/conversion/summary leaves the old entry untouched instead
+  of destroying it before the replacement exists.
+- **Digest indexing is tiered** (previously: score ≥ 9 → summary, everything
+  else → nothing):
+  - **≥ 9 → full text**: the arXiv PDF is downloaded inside the digest job,
+    converted, and chunked with score/track metadata and the title/authors
+    embed header — no `summarize()` call. bioRxiv links (doi.org, no
+    derivable PDF URL) and failed downloads fall back to a summary entry
+    built from the digest's own text; one 404 never fails the digest job.
+  - **8–8.9 → summary entries** (new — these papers were previously not
+    indexed at all), reusing the scoring run's summary+why, zero extra LLM
+    calls.
+  - **< 8 → not indexed per-paper**, but now reachable via the digest
+    document (below).
+- **The weekly digest `.md` is itself indexed** as a new `doc_type="digest"`
+  with a `file://` source and dated title, so every mentioned paper is
+  searchable. `retrieve_papers` now queries `doc_type=["paper", "digest"]`
+  (`search()` accepts a doc_type list, `$in` filter); `kb stats` reports a
+  digest count. `"note"` was deliberately not reused — `refresh_vault` would
+  have deleted the digest entries as missing vault files.
+- **PDF inbox is scanned periodically instead of watched**: the watchdog
+  Observer, event handler, and ingest worker thread/queue are gone. A new
+  `pdf_scan` job sweeps `pdf_watch_dir` every `[sync] pdf_watch_minutes`
+  (default 30, validated ≥ 1) and at daemon start; byte-hash dedup makes
+  the sweep idempotent, so saving highlights costs at most one re-ingest
+  per interval instead of one per save. Inbox latency is now at most one
+  interval. Inbox-not-mirror semantics unchanged.
+- **Digest slot moved 02:00 → 05:00** (`digest_hour` default), and a missed
+  digest now catches up without a restart: `run_digest_catchup_job`
+  re-checks the persisted last-success stamp at daemon start **and every 6
+  hours** (job id `digest_catchup`). A module-level non-blocking lock in
+  `run_digest_job` guards against the cron and catch-up jobs double-firing
+  (separate APScheduler ids, so `max_instances=1` alone can't).
+- The digest header now shows the actual generation time instead of a
+  hardcoded "Generated 03:00".
+
+### Dependency
+- `watchdog` removed (no filesystem-event watcher any more) — run `uv sync`.
+
+---
+
+## [previous] — actionable KB-corruption errors, metadata inference + hybrid retrieval, one-shot removal confirm
+
+**⚠️ `uv run kb reindex` is REQUIRED after this change.** It clears any
+existing index corruption (see below) and prepends the title/authors header
+to old paper chunks so author-name queries work against papers indexed
+before this change too. Not run automatically — this is destructive-adjacent
+enough (a full re-embed) that it stays a deliberate, user-run step.
+
+### Fixed
+- **Segfault in `_add_document`** (`vault_chat/chat.py`): the papers-are-
+  always-public validation ran *after* `store = get_store()`, so a rejected
+  private-paper call still opened the live store first. Against a corrupted
+  index this could hard-crash the process (a Rust-side ChromaDB segfault,
+  uncatchable in Python). Reordered: the cheap argument check now runs before
+  any store or provider interaction.
+- **Opaque "internal error" on a corrupted index**: `similarity_search`
+  failing with ChromaDB's `"Error finding id"` (a stale HNSW reference to a
+  deleted chunk) was flattened into a generic `RAGError` that the LLM
+  paraphrased as an unhelpful internal error. New `KBCorruptionError`
+  (`digest/errors.py`) is raised instead, naming `uv run kb reindex` as the
+  fix; `retrieve_papers`, `search_notes`, and `search_chat_history` relay it
+  to the user verbatim instead of paraphrasing or retrying. New `uv run kb
+  doctor` command diagnoses this proactively (open store → count → search
+  probe) — note that on a badly corrupted store even `count()` can segfault
+  the process; that abrupt death is itself diagnostic.
+- **Author-name retrieval failures**: for full-text papers the author names
+  appeared in *no* chunk, so no retriever could ever match a query like
+  "papers by Vaswani" — this was a data-absence problem, not a ranking one.
+  `add_texts` gained `embed_header`, prepended to the embedded text of every
+  chunk (title, or `"{title} — {authors}"`); `add_paper`'s content now
+  includes an authors line too.
+- **Wrong / missing paper authors**: local PDFs previously fell back to the
+  filename as the title with no authors at all. New `digest/kb/metadata.py`
+  infers title/authors/DOI from a PDF's first pages (DOI via regex first,
+  then one small LLM call for whatever's left), wired into every local-PDF
+  add path (`kb add`, chat `add_document`, daemon `ingest_pdf`). A private
+  note's text still never reaches a cloud provider — inference is skipped
+  under Anthropic with a visible warning in that case.
+
+### Added
+- **Hybrid BM25 + reciprocal-rank fusion retrieval**, gated by `[rag] hybrid`
+  (default `true` — **this changes ranking for every existing search**, not
+  just new installs). `_hybrid_search` fuses dense (embedding) and sparse
+  (BM25, `rank-bm25`) rankings over the same privacy-filtered candidate pool,
+  so privacy holds by construction. `hybrid = false` reproduces the old
+  dense-only pipeline exactly.
+- **`doi` metadata field** for papers: inferred for local PDFs, passed
+  through from the arXiv API result when present, surfaced in every
+  formatter (`retrieve_papers`, `list_papers`, `kb list`).
+- **Verified-metadata loop**: inferred fields are flagged `meta_inferred:
+  true`. `kb set-meta <source> [--title] [--authors] [--doi]` and the chat
+  tool `update_document_metadata` apply a human correction (metadata only,
+  no re-embedding) and clear the flag. Reminders: `kb stats` and `kb list
+  --unverified`, a dismissible banner in the webapp header (`GET /info` →
+  `unverified_count`), and one `vault-chat` startup line.
+- **One-shot removal confirmation**: `remove_document` dropped the
+  `confirmed` round-trip — a single call immediately shows the human
+  confirmation prompt (terminal y/N or webapp dialog); only that out-of-band
+  answer executes the removal.
+- **File deletion removed from the codebase wholesale**: `delete_local_file`,
+  `kb remove --delete-file`, and the tool's `delete_file` param are gone —
+  not just disabled. `execute_remove()` only ever deletes ChromaDB chunks;
+  every preview and dialog states the same invariant line verbatim:
+  "Database entry only — files on disk are never touched by jarvis: `<path>`".
+- **Stale confirm-dialog token guard** (webapp): one-shot confirms make it
+  possible for an older, unclicked dialog to still be on screen when a newer
+  removal is requested. `request_confirmation` now tags each pending action
+  with a UUID token; `POST /confirm-action` 409s unless the posted token
+  matches the currently pending one.
+
+### Dependency
+- `rank-bm25` added for hybrid retrieval — run `uv sync`.
+
+---
+
+## [previous] — copy-as-markdown for chat responses
+
+### Added
+- **Copy button on every assistant response** (`webapp/static/app.js`,
+  `webapp/static/style.css`): a hover-revealed button in the top-right corner of each response
+  bubble copies the whole reply to the clipboard as raw markdown, with a ~1.5s "✓" confirmation.
+  Extracted into a shared `buildAssistantBubble()` helper used by both the history-restore path
+  and the live SSE reply path, so newly-streamed and page-refreshed responses behave identically.
+- **Native selection-copy now yields markdown**: selecting text inside an assistant response and
+  copying it with the OS-native Cmd+C/Ctrl+C now places markdown notation on the clipboard (bold,
+  code, headings, lists, links) instead of plain rendered text, via a new `htmlFragmentToMarkdown()`
+  walker that mirrors `renderMarkdown`'s element vocabulary in reverse. This replaces the originally
+  proposed "create Obsidian notes from conversations" feature (TODO item 4) — copy/paste into the
+  user's own vault was judged simpler than a write path into Obsidian, and this change makes that
+  manual copy markdown-faithful. Selections outside an assistant bubble, or spanning more than one,
+  are untouched (default browser copy behaviour).
+
+---
+
+## [previous] — webapp bug fixes: modal visibility, session rename/pin, tool-call logging
 
 Three bugs found while testing the webapp after the launchd-removal change,
 plus the observability gap that made the second one hard to diagnose.

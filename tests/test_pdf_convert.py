@@ -1,5 +1,5 @@
 """
-Tests for digest/kb/convert.py — PDF-to-Markdown conversion via pymupdf4llm.
+Tests for jarvis/kb/convert.py — PDF-to-Markdown conversion via pymupdf4llm.
 
 pymupdf4llm is a pure-Python extraction library (no ML models, no network),
 so these tests run the real converter against tiny PDFs generated in-test
@@ -11,8 +11,8 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from digest.errors import ConversionError
-from digest.kb.convert import pdf_to_markdown
+from jarvis.core.errors import ConversionError
+from jarvis.kb.convert import pdf_to_markdown
 
 
 def _make_text_pdf(path: Path, text: str) -> Path:
