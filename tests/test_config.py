@@ -215,6 +215,86 @@ def test_pdf_watch_dir_env_override(tmp_path, monkeypatch):
     assert cfg.pdf_watch_dir == tmp_path / "from-env"
 
 
+def test_anthropic_model_read_from_chat_section(tmp_path):
+    """
+    [chat] anthropic_model is the canonical home for the model key.
+
+    Input:  config.toml with [chat] anthropic_model set, no [digest] key
+    Expected output: cfg.anthropic_model == the [chat] value; no warning printed
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[chat]\nanthropic_model = "claude-opus-4-1"\n')
+    cfg = load_config(config_file)
+    assert cfg.anthropic_model == "claude-opus-4-1"
+
+
+def test_anthropic_model_digest_fallback_warns(tmp_path, capsys):
+    """
+    A legacy [digest] anthropic_model still works as a fallback, but prints a
+    one-line warning telling the user to move it — fail visibly, no silent
+    auto-rewrite of the user's file.
+
+    Input:  config.toml with only [digest] anthropic_model set
+    Expected output:
+        cfg.anthropic_model == the [digest] value
+        stdout mentions moving the key to [chat]
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[digest]\nanthropic_model = "claude-legacy-1"\n')
+    cfg = load_config(config_file)
+    assert cfg.anthropic_model == "claude-legacy-1"
+    captured = capsys.readouterr()
+    assert "[chat]" in captured.out
+    assert "anthropic_model" in captured.out
+
+
+def test_anthropic_model_chat_wins_over_digest(tmp_path, capsys):
+    """
+    When both [chat] and [digest] set anthropic_model, [chat] wins and no
+    deprecation warning is printed (the legacy key is simply ignored).
+
+    Input:  config.toml with differing [chat] and [digest] anthropic_model values
+    Expected output: cfg.anthropic_model == the [chat] value; no warning
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[digest]\nanthropic_model = "claude-legacy-1"\n\n'
+        '[chat]\nanthropic_model = "claude-current-1"\n'
+    )
+    cfg = load_config(config_file)
+    assert cfg.anthropic_model == "claude-current-1"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_anthropic_model_env_wins_over_chat_and_digest(tmp_path, monkeypatch):
+    """
+    ANTHROPIC_MODEL env var wins over both [chat] and [digest] TOML values.
+
+    Input:  TOML sets both [chat] and [digest] anthropic_model; env var differs
+    Expected output: cfg.anthropic_model == the env var value
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[digest]\nanthropic_model = "claude-legacy-1"\n\n'
+        '[chat]\nanthropic_model = "claude-current-1"\n'
+    )
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-env-1")
+    cfg = load_config(config_file)
+    assert cfg.anthropic_model == "claude-env-1"
+
+
+def test_anthropic_model_default_when_unset(tmp_path):
+    """
+    Default anthropic_model is used when the config file has no matching key.
+
+    Input:  no config file
+    Expected output: cfg.anthropic_model == "claude-sonnet-4-6"
+    """
+    cfg = load_config(tmp_path / "nonexistent.toml")
+    assert cfg.anthropic_model == "claude-sonnet-4-6"
+
+
 def test_api_key_loaded_from_auth_section(tmp_path):
     """
     The [auth] api_key field is read into cfg.anthropic_api_key, allowing the

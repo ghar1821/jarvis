@@ -7,11 +7,11 @@ that vault-chat draws on during conversations.
 Subcommands:
   add <url|path>    Add a paper by arXiv URL or local PDF path
   add-digest <path> Import papers from digest Markdown file(s)
-  list              List indexed papers (--unverified to show only auto-inferred metadata)
+  list              List indexed papers
   stats             Show document and chunk counts
   remove <source>   Remove a document by source URL (database entry only — never touches files)
   clear             Delete all documents (prompts for confirmation)
-  set-meta <source> Set verified title/authors/doi, clearing the unverified flag
+  set-meta <source> Set verified title/authors/doi
 
   index-vault       Incrementally update vault index; --force clears first
   reindex           Re-embed all chunks with the configured embed_model
@@ -24,7 +24,6 @@ Usage examples:
   uv run kb add paper.pdf --provider anthropic
   uv run kb add-digest ~/Documents/papers/digest/
   uv run kb list
-  uv run kb list --unverified
   uv run kb stats
   uv run kb remove https://arxiv.org/abs/2301.07041
   uv run kb set-meta https://arxiv.org/abs/2301.07041 --authors "Ada Lovelace"
@@ -177,23 +176,15 @@ def cmd_add(args: argparse.Namespace) -> None:
             print(f"Added (summary): {paper['link']}")
 
     elif Path(input_str).exists() and Path(input_str).suffix.lower() == ".pdf":
+        # Local PDFs are always public papers — notes come exclusively from
+        # the Obsidian vault (.md files), so there is no visibility/doc_type
+        # choice to make here.
         pdf_path = Path(input_str).resolve()
-        visibility = args.visibility
-        doc_type = args.doc_type
-
-        # Invariant: papers are always public. Only notes may be private.
-        if doc_type == "paper" and visibility == "private":
-            print(
-                "Error: papers are always public — use --doc-type note for private documents.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
         from .metadata import resolve_pdf_metadata
 
         meta = resolve_pdf_metadata(
-            pdf_path, get_provider(), (args.provider or cfg.provider),
-            doc_type=doc_type, visibility=visibility,
+            pdf_path, get_provider(),
             title_override=args.title, authors_override=args.authors, doi_override=args.doi,
         )
         title = meta["title"] or pdf_path.stem
@@ -209,14 +200,14 @@ def cmd_add(args: argparse.Namespace) -> None:
             # own chunks, regardless of whether the body was stored as summary
             # or full text.
             annotation_ids = add_annotations(
-                pdf_path, doc_type=doc_type, visibility=visibility,
+                pdf_path, doc_type="paper", visibility="public",
                 source=pdf_path.as_uri(), title=title,
                 file_path=str(pdf_path), store=store,
             )
             if annotation_ids:
                 print(f"  {len(annotation_ids)} annotation(s) indexed")
             figure_ids = add_figures(
-                pdf_path, doc_type=doc_type, visibility=visibility,
+                pdf_path, doc_type="paper", visibility="public",
                 source=pdf_path.as_uri(), provider_obj=get_provider(),
                 provider_str=(args.provider or cfg.provider),
                 title=title, file_path=str(pdf_path), store=store,
@@ -225,41 +216,10 @@ def cmd_add(args: argparse.Namespace) -> None:
             if figure_ids:
                 print(f"  {len(figure_ids)} figure(s) captioned")
 
-        if doc_type == "note":
-            # Notes are always indexed as full text; content_hash tracked for refresh
-            import hashlib as _hashlib
+        if args.full_text:
             from jarvis.core.errors import ConversionError
             from .convert import pdf_to_markdown
-            print(f"Converting PDF note to Markdown ({visibility}): {pdf_path.name}...")
-            try:
-                full_text = pdf_to_markdown(pdf_path)
-            except ConversionError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                sys.exit(1)
-            if replace_source:
-                deleted = delete_by_metadata("source", replace_source, store)
-                print(f"  Replacing existing entry — {deleted} old chunk(s) removed")
-            content_hash = _hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-            ids = add_texts(
-                content=full_text,
-                doc_type="note",
-                visibility=visibility,
-                source=pdf_path.as_uri(),
-                extra_metadata={
-                    "title": title,
-                    "file_path": str(pdf_path),
-                    "content_hash": content_hash,
-                    "storage_mode": "full_text",
-                },
-                store=store,
-            )
-            print(f"Added note (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
-            index_annotations()
-
-        elif args.full_text:
-            from jarvis.core.errors import ConversionError
-            from .convert import pdf_to_markdown
-            print(f"Converting PDF to Markdown ({visibility}): {pdf_path.name}...")
+            print(f"Converting PDF to Markdown: {pdf_path.name}...")
             try:
                 full_text = pdf_to_markdown(pdf_path)
             except ConversionError as exc:
@@ -270,39 +230,35 @@ def cmd_add(args: argparse.Namespace) -> None:
                 print(f"  Replacing existing entry — {deleted} old chunk(s) removed")
             extra_metadata = {"title": title, "file_path": str(pdf_path),
                                "storage_mode": "full_text", "authors": authors, "doi": doi}
-            if meta["meta_inferred"]:
-                extra_metadata["meta_inferred"] = True
             ids = add_texts(
                 content=full_text,
                 doc_type="paper",
-                visibility=visibility,
+                visibility="public",
                 source=pdf_path.as_uri(),
                 extra_metadata=extra_metadata,
                 store=store,
                 embed_header=(f"{title} — {authors}" if authors else title),
             )
-            print(f"Added paper (full text, {len(ids)} chunks): {pdf_path.name} ({visibility})")
+            print(f"Added paper (full text, {len(ids)} chunks): {pdf_path.name}")
             index_annotations()
         else:
-            print(f"Generating summary from PDF ({visibility}): {pdf_path.name}...")
+            print(f"Generating summary from PDF: {pdf_path.name}...")
             summary = get_provider().summarize(title, pdf_path)
             if replace_source:
                 deleted = delete_by_metadata("source", replace_source, store)
                 print(f"  Replacing existing entry — {deleted} old chunk(s) removed")
             extra_metadata = {"title": title, "file_path": str(pdf_path),
                                "storage_mode": "summary", "authors": authors, "doi": doi}
-            if meta["meta_inferred"]:
-                extra_metadata["meta_inferred"] = True
             add_texts(
                 content=f"{title}\n\n{summary}",
                 doc_type="paper",
-                visibility=visibility,
+                visibility="public",
                 source=pdf_path.as_uri(),
                 extra_metadata=extra_metadata,
                 store=store,
                 embed_header=(f"{title} — {authors}" if authors else title),
             )
-            print(f"Added paper (summary): {pdf_path.name} ({visibility})")
+            print(f"Added paper (summary): {pdf_path.name}")
             index_annotations()
 
     else:
@@ -317,16 +273,13 @@ def cmd_list(args: argparse.Namespace) -> None:
     from .store import get_store, list_papers
 
     papers = list_papers(limit=args.limit, store=get_store())
-    if args.unverified:
-        papers = [p for p in papers if p.get("meta_inferred")]
     if not papers:
         print("No papers in knowledge base.")
         return
     for p in papers:
         chunks = p.get("chunk_count", "?")
         mode = p.get("storage_mode", "summary" if chunks in ("?", 1, 2) else "full_text")
-        unverified_tag = " [unverified]" if p.get("meta_inferred") else ""
-        print(f"[{p.get('score', '?')}/10] {p.get('title', 'untitled')}{unverified_tag}  [{mode}, {chunks} chunks]")
+        print(f"[{p.get('score', '?')}/10] {p.get('title', 'untitled')}  [{mode}, {chunks} chunks]")
         print(f"  {p.get('source', 'no source')}  ·  {p.get('date_added', 'N/A')[:10]}")
         if p.get("authors"):
             print(f"  Authors: {p['authors']}")
@@ -336,7 +289,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_stats() -> None:
-    from .store import count, count_unique_documents, count_unverified_papers, get_store
+    from .store import count, count_unique_documents, get_store
 
     store = get_store()
     total_chunks = count(store)
@@ -358,22 +311,13 @@ def cmd_stats() -> None:
         if private_sources:
             print(
                 f"\n⚠️  {len(private_sources)} paper(s) are marked private, but papers "
-                "must always be public.\n   Re-add each as a note (kb remove + kb add "
-                "--doc-type note) or make it public:"
+                "must always be public.\n   Move its content into the vault as a note, "
+                "or make it public (kb remove, then kb add to re-add as a public paper):"
             )
             for src in private_sources:
                 print(f"   - {src}")
     except Exception:
         pass
-
-    # Reminder for the verified-metadata loop: inferred title/authors/doi
-    # should eventually be checked by a human via `kb set-meta`.
-    n_unverified = count_unverified_papers(store)
-    if n_unverified:
-        print(
-            f"\n{n_unverified} paper(s) have unverified (auto-inferred) metadata "
-            "— run `kb list --unverified` to review them."
-        )
 
 
 def _resolve_local_file(source: str, meta: dict) -> "Path | None":
@@ -463,14 +407,9 @@ def cmd_index_vault(args: argparse.Namespace) -> None:
         print("Clearing existing vault index...", flush=True)
         try:
             result = store._collection.get(
-                where={"doc_type": {"$eq": "note"}}, include=["metadatas"]
+                where={"doc_type": {"$eq": "note"}}, include=[]
             )
-            # Only delete vault .md notes (relative paths).
-            # PDF notes (absolute paths ending in .pdf) are left untouched.
-            ids_to_delete = [
-                id_ for id_, meta in zip(result["ids"], result["metadatas"])
-                if not meta.get("file_path", "").endswith(".pdf")
-            ]
+            ids_to_delete = result["ids"]
             if ids_to_delete:
                 store.delete(ids_to_delete)
                 print(f"  Cleared {len(ids_to_delete)} chunks", flush=True)
@@ -576,6 +515,11 @@ def cmd_reindex(args: argparse.Namespace) -> None:
     client.delete_collection(COLLECTION_NAME)
     new_collection.modify(name=COLLECTION_NAME)
     print(f"Done — reindexed {len(ids)} chunks with '{cfg.embed_model}'.")
+    print(
+        "NOTE: the swap gives the collection a new identity, so any jarvis "
+        "process that was already running (webapp, jarvis-sync, vault-chat) "
+        "now holds a stale handle — restart those processes before using them."
+    )
 
 
 def cmd_doctor() -> None:
@@ -590,6 +534,10 @@ def cmd_doctor() -> None:
     process (a Rust-side ChromaDB crash, uncatchable in Python). If this
     command dies abruptly with no output beyond "Checking knowledge base...",
     that abrupt death is itself the diagnosis — run `kb reindex` blind.
+
+    Once the store is confirmed healthy, also checks for legacy PDF notes
+    (see _check_legacy_pdf_notes) — a one-time migration for entries added
+    before local PDFs became always-public papers.
     """
     from jarvis.core.errors import KBCorruptionError, RAGError
     from .store import count, get_store, search
@@ -622,6 +570,57 @@ def cmd_doctor() -> None:
         print(f"✗ Search failed: {exc}", file=sys.stderr)
         sys.exit(1)
     print("✓ Search probe succeeded\n\nKnowledge base is healthy.")
+
+    _check_legacy_pdf_notes(store)
+
+
+def _check_legacy_pdf_notes(store) -> None:
+    """
+    One-time migration check: local PDFs are now always public papers — notes
+    come exclusively from the Obsidian vault. Entries added before that
+    decision may still carry doc_type="note" with an absolute PDF file_path.
+
+    Public ones are reclassified in place with a single y/N prompt (doc_type
+    flips to "paper"; content_hash/storage_mode/file_path are untouched, so
+    the result has the same shape a daemon-ingested paper carries). Private
+    ones are NEVER silently made public — they are only listed, with
+    resolution options, and `kb doctor` keeps reporting them until resolved.
+    """
+    from .store import find_pdf_notes, reclassify_notes_as_papers
+
+    pdf_notes = find_pdf_notes(store)
+    if not pdf_notes:
+        return
+
+    public = [n for n in pdf_notes if n["visibility"] != "private"]
+    private = [n for n in pdf_notes if n["visibility"] == "private"]
+
+    if public:
+        print(
+            f"\n⚠️  {len(public)} legacy PDF note(s) found — local PDFs are always "
+            "papers now; notes come only from the vault."
+        )
+        for n in public:
+            print(f"   - {n['title']}  ({n['source']}, {n['chunk_count']} chunk(s))")
+        answer = input(f"Reclassify {len(public)} document(s) as papers? [y/N] ").strip().lower()
+        if answer == "y":
+            n_chunks = reclassify_notes_as_papers([n["source"] for n in public], store)
+            print(f"  Reclassified {len(public)} document(s) ({n_chunks} chunk(s)) as papers.")
+        else:
+            print("  Skipped — run `kb doctor` again to reclassify later.")
+
+    if private:
+        print(
+            f"\n⚠️  {len(private)} private legacy PDF note(s) found. Papers are "
+            "always public, so these are never silently reclassified — resolve "
+            "each one, then re-run `kb doctor`:"
+        )
+        for n in private:
+            print(f"   - {n['title']}  ({n['source']}, {n['chunk_count']} chunk(s))")
+        print(
+            "     Resolve by either: `kb remove <source>` then re-add the PDF as "
+            "a public paper, or move its content into the vault as a private .md note."
+        )
 
 
 def cmd_set_meta(args: argparse.Namespace) -> None:
@@ -675,14 +674,6 @@ def main() -> None:
     p_add.add_argument("--authors", default="", help="Override authors (for local PDFs)")
     p_add.add_argument("--doi", default="", help="Override DOI (for local PDFs)")
     p_add.add_argument(
-        "--visibility", default="public", choices=["public", "private"],
-        help="Visibility for local PDFs (arXiv papers are always public)",
-    )
-    p_add.add_argument(
-        "--doc-type", default="paper", choices=["paper", "note"], dest="doc_type",
-        help="Type for local PDFs: 'paper' (research paper) or 'note' (always indexed as full text with hash tracking)",
-    )
-    p_add.add_argument(
         "--provider", default="",
         help=f"'anthropic' or 'ollama' (default: {cfg.provider})",
     )
@@ -705,17 +696,13 @@ def main() -> None:
     # list / stats / remove / clear
     p_list = sub.add_parser("list", help="List indexed papers")
     p_list.add_argument("--limit", type=int, default=20)
-    p_list.add_argument(
-        "--unverified", action="store_true",
-        help="Only show papers with auto-inferred (not yet human-verified) metadata",
-    )
     sub.add_parser("stats", help="Show document and chunk counts")
     p_remove = sub.add_parser("remove", help="Remove a document by source URL")
     p_remove.add_argument("source", help="Source URL of the document to remove")
     sub.add_parser("clear", help="Delete all documents (prompts for confirmation)")
 
     # set-meta
-    p_setmeta = sub.add_parser("set-meta", help="Set verified title/authors/doi, clearing meta_inferred")
+    p_setmeta = sub.add_parser("set-meta", help="Set verified title/authors/doi")
     p_setmeta.add_argument("source")
     p_setmeta.add_argument("--title", default=None)
     p_setmeta.add_argument("--authors", default=None)
@@ -729,7 +716,7 @@ def main() -> None:
     # index-vault
     p_idx = sub.add_parser("index-vault", help="(Re)index the Obsidian vault")
     p_idx.add_argument("--vault-path", default="")
-    p_idx.add_argument("--force", action="store_true", help="Clear existing vault .md index first (preserves PDF notes)")
+    p_idx.add_argument("--force", action="store_true", help="Clear existing vault note index first")
 
     # reindex
     sub.add_parser("reindex", help="Re-embed all chunks with the configured embed_model (no LLM calls)")

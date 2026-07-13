@@ -23,7 +23,7 @@ from pathlib import Path
 
 from jarvis.core.config import get_config
 from jarvis.core.errors import KBCorruptionError, LLMError, PrivacyError
-from jarvis.core.llm import make_provider
+from jarvis.core.llm import active_model, make_provider
 
 # Tool failures are caught and turned into a short string for the LLM to
 # relay — but LLMs paraphrase rather than quote, so the real exception and
@@ -52,7 +52,9 @@ TOOLS = [
                 "Use for questions about papers and scientific topics. "
                 "Also searches the indexed weekly digest documents, so papers "
                 "that were only mentioned in a digest (not indexed "
-                "individually) can still be found. Always search before answering."
+                "individually) can still be found. Always search before answering. "
+                "Each hit includes the full text of the matching passage — "
+                "usually enough to answer from directly."
             ),
             "parameters": {
                 "type": "object",
@@ -69,8 +71,8 @@ TOOLS = [
         "function": {
             "name": "search_notes",
             "description": (
-                "Semantically search vault notes and local documents. "
-                "Use to discover relevant files before reading them with read_file."
+                "Semantically search Obsidian vault notes (Markdown files). "
+                "Use to discover relevant notes before reading them with read_file."
             ),
             "parameters": {
                 "type": "object",
@@ -87,10 +89,10 @@ TOOLS = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read the complete, ordered content of one vault file. "
-                "Use this when search_notes has identified a specific file and you need the "
-                "whole document — not just the matching chunks — to give a coherent answer. "
-                "Do not use for discovery; use search_notes for that."
+                "Read one vault text file (Markdown) in full, in order. "
+                "Cannot open PDFs — use get_document for papers and other "
+                "indexed documents. Only use after search_notes has identified "
+                "a specific vault file; not for discovery."
             ),
             "parameters": {
                 "type": "object",
@@ -101,25 +103,45 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_document",
+            "description": (
+                "Read the stored content of one knowledge-base document in order, "
+                "paginated (15 chunks per page). Works for everything indexed, "
+                "including PDFs, which read_file cannot open. Use when search "
+                "results aren't enough — to get surrounding context or the full text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Exact source URL, from retrieve_papers/search_notes/list_papers",
+                    },
+                    "page": {"type": "integer", "description": "1-based page number", "default": 1},
+                },
+                "required": ["source"],
+            },
+        },
+    },
     # ── Management tools ──────────────────────────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "add_document",
             "description": (
-                "Add a paper or document to the knowledge base. "
-                "Source can be an arXiv URL or an absolute path to a local PDF file.\n"
-                "For arXiv URLs: always stored as 'paper'. Ask the user whether they want "
-                "summary (default, fast) or full_text (paragraph-level retrieval) mode.\n"
-                "For local PDFs: ALWAYS ask the user whether it is a 'paper' or a 'note' before calling.\n"
-                "  doc_type='paper': research paper — supports summary or full_text mode. "
-                "Papers are ALWAYS public; a private paper is rejected. Title, authors, and "
-                "DOI are auto-inferred from the PDF's first pages if not given explicitly "
-                "(skipped for a private note under Anthropic — use title/authors/doi to set "
-                "them manually in that case).\n"
-                "  doc_type='note': personal note — always indexed as full text; "
-                "content hash tracked so refresh_vault detects changes automatically.\n"
-                "Ask for visibility (public/private) for note-type local PDFs only. "
+                "Add a paper to the knowledge base. "
+                "Source can be an arXiv URL or an absolute path to a local PDF file — "
+                "both are ALWAYS stored as public papers. Notes come only from the "
+                "Obsidian vault (indexed separately via index_vault); this tool never "
+                "creates a note.\n"
+                "Ask the user whether they want summary (default, fast) or full_text "
+                "(paragraph-level retrieval) mode.\n"
+                "For local PDFs, title, authors, and DOI are auto-inferred from the "
+                "PDF's first pages if not given explicitly — use title/authors/doi to "
+                "override.\n"
                 "Figure captioning is off by default; set with_figures=true to caption "
                 "and index this document's figures.\n"
                 "To re-add an existing paper with figures (reingest): call add_document "
@@ -136,25 +158,13 @@ TOOLS = [
                         "type": "string",
                         "description": "arXiv URL (https://arxiv.org/abs/...) or absolute path to a local PDF file",
                     },
-                    "doc_type": {
-                        "type": "string",
-                        "enum": ["paper", "note"],
-                        "description": "For local PDFs only: 'paper' (research paper) or 'note' (personal note, always full text with hash tracking). arXiv URLs are always 'paper'.",
-                        "default": "paper",
-                    },
                     "score": {"type": "integer", "description": "Relevance score 0-10", "default": 0},
                     "track": {"type": "string", "description": "Research track label", "default": ""},
                     "mode": {
                         "type": "string",
                         "enum": ["summary", "full_text"],
-                        "description": "For papers only: summary (LLM-generated) or full_text (full PDF chunked). Notes are always full_text.",
+                        "description": "summary (LLM-generated) or full_text (full PDF chunked)",
                         "default": "summary",
-                    },
-                    "visibility": {
-                        "type": "string",
-                        "enum": ["public", "private"],
-                        "description": "Visibility for note-type local PDFs only. Papers (arXiv or local) are always public.",
-                        "default": "public",
                     },
                     "title": {
                         "type": "string",
@@ -263,7 +273,7 @@ TOOLS = [
             "description": (
                 "Set verified title, authors, and/or DOI for a paper — metadata "
                 "only, no re-embedding. Use when the user corrects an "
-                "auto-inferred title/author/DOI. Clears the 'unverified' flag."
+                "auto-inferred title/author/DOI."
             ),
             "parameters": {
                 "type": "object",
@@ -330,6 +340,13 @@ READ_SKILL_TOOL = {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Skill name exactly as listed"},
+                "file": {
+                    "type": "string",
+                    "description": (
+                        "Read one of the skill's supporting files instead of SKILL.md — "
+                        "path exactly as shown in the SKILL.md \"Supporting files:\" listing"
+                    ),
+                },
             },
             "required": ["name"],
         },
@@ -360,9 +377,14 @@ You are a knowledgeable assistant that can both query and manage a local \
 knowledge base of research papers and Obsidian vault notes.
 
 Querying workflow:
-1. Search first — use search_notes and/or retrieve_papers before reading anything.
-2. Read for detail — use read_file only after search has identified a relevant file.
-3. Never call read_file speculatively.
+1. Search first — use search_notes and/or retrieve_papers before reading anything. \
+Each hit includes the full text of the matching passage; answer directly from it when \
+it's enough.
+2. If the hits aren't enough, either refine the query and search again, or call \
+get_document(source) to read the whole stored document page by page (works for \
+papers, notes, and PDFs — anything indexed).
+3. read_file is only for vault text files found by search_notes; it cannot read PDFs. \
+Never call read_file or get_document speculatively.
 4. To recall previous conversations with the user, use search_chat_history.
 
 Management:
@@ -516,13 +538,76 @@ def _retrieve_papers(args: dict, provider_str: str) -> tuple[str, bool]:
         # themselves — they're the weekly roundup), so they get a clean
         # "[digest]" prefix instead of the misleading "[?/10 · ]".
         prefix = "digest" if m.get("doc_type") == "digest" else f"{m.get('score', '?')}/10 · {m.get('track', '')}"
+        section_line = f"   Section: {m['section']}\n" if m.get("section") else ""
         lines.append(
             f"{i}. [{prefix}] {m.get('title', 'untitled')}\n"
             f"   {m.get('source', '')}\n"
-            f"{authors_line}{doi_line}"
-            f"   {doc.page_content[:300].replace(chr(10), ' ')}...\n"
+            f"{authors_line}{doi_line}{section_line}"
+            f"   {doc.page_content}\n"
         )
     return "\n".join(lines), saw_private
+
+
+def _get_document(args: dict, provider_str: str) -> tuple[str, bool]:
+    """
+    Return (result_text, saw_private). Paginated read of every stored chunk
+    for one source, in order — the escalation path from a search hit to
+    full context, without falling back to read_file (which cannot open PDFs).
+    """
+    source = args.get("source", "")
+    try:
+        # page comes straight from the model, so parse it inside the try —
+        # a malformed value becomes a tool error rather than aborting the turn.
+        # Corruption (KBCorruptionError) can't surface here: get_document_chunks
+        # is a metadata scan that never touches the HNSW index.
+        requested_page = max(int(args.get("page", 1)), 1)
+        from jarvis.kb.store import get_document_chunks, get_store
+
+        chunks = get_document_chunks(source, store=get_store())
+    except Exception as exc:
+        log.exception("get_document tool failed")
+        return f"[get_document error: {exc}]", False
+
+    if not chunks:
+        return f"[No document found with source: {source}]", False
+
+    # Privacy mirrors read_file: a hard stop for the cloud provider before any
+    # content — even a hint of title or length — is returned. Private
+    # documents may contain adversarial text meant to manipulate the model.
+    is_private = any(doc.metadata.get("visibility") == "private" for doc in chunks)
+    if provider_str == "anthropic" and is_private:
+        raise PrivacyError(
+            f"'{source}' is private and cannot be read by a cloud provider. "
+            "Switch to the local model to access private documents."
+        )
+
+    per_page = 15
+    total = len(chunks)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(requested_page, total_pages)
+    start = (page - 1) * per_page
+    page_chunks = chunks[start:start + per_page]
+
+    title = chunks[0].metadata.get("title") or "untitled"
+    header = (
+        f'"{title}" — chunks {start + 1}–{start + len(page_chunks)} of {total} '
+        f"(page {page} of {total_pages})."
+    )
+    if page < total_pages:
+        header += f" Call get_document(source, page={page + 1}) for more."
+    lines = [header, ""]
+    for doc in page_chunks:
+        m = doc.metadata
+        section_prefix = f"[{m['section']}] " if m.get("section") else ""
+        lines.append(f"{section_prefix}{doc.page_content}\n")
+
+    if chunks[0].metadata.get("storage_mode") == "summary":
+        lines.append(
+            "(This document is stored as a summary only — the full text is not "
+            "in the knowledge base. Re-add with mode='full_text' for full-text access.)"
+        )
+
+    return "\n".join(lines), is_private
 
 
 def _search_notes(args: dict, provider_str: str) -> tuple[str, bool]:
@@ -559,9 +644,11 @@ def _search_notes(args: dict, provider_str: str) -> tuple[str, bool]:
     lines = [f"Found {len(results)} note chunk(s):\n"]
     for i, doc in enumerate(results, 1):
         m = doc.metadata
+        section_line = f"   Section: {m['section']}\n" if m.get("section") else ""
         lines.append(
             f"{i}. {m.get('title', 'untitled')}  ({m.get('file_path', 'unknown')})\n"
-            f"   {doc.page_content[:300].replace(chr(10), ' ')}...\n"
+            f"{section_line}"
+            f"   {doc.page_content}\n"
         )
     if has_private:
         # Static app text, safe to show the model — contains no private content.
@@ -574,7 +661,9 @@ def _search_notes(args: dict, provider_str: str) -> tuple[str, bool]:
 
 def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str:
     """
-    Add a paper or local PDF document to the knowledge base.
+    Add a paper to the knowledge base — always public, whether the source is
+    an arXiv URL or a local PDF path. Notes come only from the Obsidian
+    vault (indexed separately via index_vault); this tool never creates one.
 
     source: arXiv URL  → fetch metadata from API, then summary or full-text
     source: local path → read PDF directly, then summary (LLM reads PDF) or full-text (pymupdf4llm)
@@ -598,8 +687,6 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
         score = int(args.get("score", 0))
         track = str(args.get("track", ""))
         mode = args.get("mode", "summary")
-        visibility = args.get("visibility", "public")
-        doc_type = args.get("doc_type", "paper")
         title_override = args.get("title", "")
         authors_override = args.get("authors", "")
         doi_override = args.get("doi", "")
@@ -607,17 +694,6 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
         # with_figures=true forces captioning for this one document; None
         # leaves it to cfg.figure_captions (off by default).
         figures_enabled = True if bool(args.get("with_figures", False)) else None
-
-        # Invariant: papers are always public. Only notes may be private —
-        # this is what guarantees the summary path below (which uploads the
-        # PDF to a cloud provider) can never see private content. Checked
-        # before store/get_store() — a cheap argument check must never wait
-        # behind a live store connection (which can be unhealthy) to fail.
-        if doc_type == "paper" and visibility == "private":
-            return (
-                "[Error: papers are always public — use doc_type='note' for "
-                "private documents]"
-            )
 
         store = get_store()
 
@@ -734,8 +810,7 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
         from jarvis.kb.metadata import resolve_pdf_metadata
 
         meta = resolve_pdf_metadata(
-            pdf_path, provider_obj, provider_str,
-            doc_type=doc_type, visibility=visibility,
+            pdf_path, provider_obj,
             title_override=title_override, authors_override=authors_override,
             doi_override=doi_override,
         )
@@ -752,7 +827,7 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             # of whether the body was stored as summary or full text. Figure
             # captions are indexed alongside them via the active provider.
             figure_ids = add_figures(
-                pdf_path, doc_type=doc_type, visibility=visibility,
+                pdf_path, doc_type="paper", visibility="public",
                 source=file_source, provider_obj=provider_obj,
                 provider_str=provider_str, title=title,
                 file_path=str(pdf_path), store=store, enabled=figures_enabled,
@@ -760,42 +835,10 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             if figure_ids:
                 print(f"  {len(figure_ids)} figure(s) captioned", flush=True)
             return len(add_annotations(
-                pdf_path, doc_type=doc_type, visibility=visibility,
+                pdf_path, doc_type="paper", visibility="public",
                 source=file_source, title=title,
                 file_path=str(pdf_path), store=store,
             ))
-
-        if doc_type == "note":
-            # Notes are always full text with content_hash for change tracking
-            import hashlib as _hashlib
-            from jarvis.core.errors import ConversionError
-            from jarvis.kb.convert import pdf_to_markdown
-            print(f"  Converting PDF note {pdf_path.name} to Markdown...", flush=True)
-            try:
-                content = pdf_to_markdown(pdf_path)
-            except ConversionError as exc:
-                return f"[Error: {exc}]"
-            if replace_source:
-                deleted = delete_by_metadata("source", replace_source, store)
-                print(f"  Replacing existing entry — {deleted} old chunk(s) removed", flush=True)
-            content_hash = _hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-            print("  Chunking and indexing...", flush=True)
-            ids = add_texts(
-                content=content, doc_type="note", visibility=visibility,
-                source=file_source,
-                extra_metadata={
-                    "title": title, "file_path": str(pdf_path),
-                    "content_hash": content_hash, "storage_mode": "full_text",
-                },
-                store=store,
-            )
-            annotation_count = index_annotations()
-            return (
-                f"Added note \"{title}\" (full text, {visibility}, {len(ids)} chunk(s), "
-                f"{annotation_count} annotation(s)).\n"
-                f"  Source: {file_source}\n"
-                f"  Hash tracked — refresh_vault will detect changes automatically."
-            )
 
         if mode == "full_text":
             from jarvis.core.errors import ConversionError
@@ -812,18 +855,14 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             extra_metadata = {"title": title, "file_path": str(pdf_path),
                                "score": score, "track": track, "storage_mode": "full_text",
                                "authors": authors, "doi": doi}
-            if meta["meta_inferred"]:
-                extra_metadata["meta_inferred"] = True
             ids = add_texts(
-                content=content, doc_type="paper", visibility=visibility,
+                content=content, doc_type="paper", visibility="public",
                 source=file_source,
                 extra_metadata=extra_metadata,
                 store=store,
                 embed_header=(f"{title} — {authors}" if authors else title),
             )
         else:
-            # Safe to hand the PDF to the provider: the invariant above
-            # guarantees only public papers ever reach this branch.
             print(f"  Generating summary from {pdf_path.name}...", flush=True)
             summary = provider_obj.summarize(title, pdf_path)
             if replace_source:
@@ -832,10 +871,8 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             extra_metadata = {"title": title, "file_path": str(pdf_path),
                                "score": score, "track": track, "storage_mode": "summary",
                                "authors": authors, "doi": doi}
-            if meta["meta_inferred"]:
-                extra_metadata["meta_inferred"] = True
             ids = add_texts(
-                content=f"{title}\n\n{summary}", doc_type="paper", visibility=visibility,
+                content=f"{title}\n\n{summary}", doc_type="paper", visibility="public",
                 source=file_source,
                 extra_metadata=extra_metadata,
                 store=store,
@@ -844,7 +881,7 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
 
         annotation_count = index_annotations()
         return (
-            f"Added paper \"{title}\" ({mode}, {visibility}, {len(ids)} chunk(s), "
+            f"Added paper \"{title}\" ({mode}, {len(ids)} chunk(s), "
             f"{annotation_count} annotation(s)).\n"
             f"  Source: {file_source}"
         )
@@ -1073,7 +1110,7 @@ def _read_skill(args: dict) -> str:
 
     from .skills import read_skill as read_skill_file
 
-    return read_skill_file(args.get("name", ""), _get_config().skills_dir)
+    return read_skill_file(args.get("name", ""), _get_config().skills_dir, args.get("file"))
 
 
 def _use_own_knowledge() -> str:
@@ -1142,13 +1179,15 @@ def _dispatch_tool(
     # The three retrieval tools report whether they returned private content;
     # the first private sighting flags the whole session as private (its
     # history and chat-index entries then stay local-only forever).
-    if name in ("read_file", "retrieve_papers", "search_notes"):
+    if name in ("read_file", "retrieve_papers", "search_notes", "get_document"):
         if name == "read_file":
             text, saw_private = read_file(vault, arguments.get("path", ""), provider_str)
         elif name == "retrieve_papers":
             text, saw_private = _retrieve_papers(arguments, provider_str)
-        else:
+        elif name == "search_notes":
             text, saw_private = _search_notes(arguments, provider_str)
+        else:
+            text, saw_private = _get_document(arguments, provider_str)
         if saw_private and session is not None and not session.private:
             from jarvis.kb.store import get_store
 
@@ -1236,9 +1275,9 @@ def run_session(vault: Path, kb_only: bool = True, session=None) -> None:
             print(f"{speaker}: {turn['content']}\n")
 
     provider_label = (
-        f"Anthropic ({cfg.anthropic_model})"
+        f"Anthropic ({active_model(cfg)})"
         if cfg.provider == "anthropic"
-        else f"Ollama ({cfg.ollama_model})"
+        else f"Ollama ({active_model(cfg)})"
     )
     print(f"Vault chat ready. Provider: {provider_label}  Vault: {vault}")
     print(f"Session: {session.id}{'  [private]' if session.private else ''}")
@@ -1278,6 +1317,7 @@ def run_session(vault: Path, kb_only: bool = True, session=None) -> None:
                 system=system_prompt,
             )
         except LLMError as exc:
+            log.exception("chat turn failed with an LLM error")
             print(f"[LLM error: {exc}]")
             session.messages.pop()
             session.display.pop()
@@ -1358,15 +1398,6 @@ def main() -> None:
 
     warn_if_config_readable()
     _auto_refresh_vault(vault)
-
-    from jarvis.kb.store import count_unverified_papers, get_store
-
-    n_unverified = count_unverified_papers(get_store())
-    if n_unverified:
-        print(
-            f"{n_unverified} paper(s) have unverified metadata — ask me to review them.",
-            flush=True,
-        )
 
     run_session(vault, kb_only=args.kb_only, session=session)
 

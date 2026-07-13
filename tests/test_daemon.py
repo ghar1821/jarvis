@@ -184,8 +184,8 @@ def test_ingest_pdf_adds_then_skips_then_updates(store, tmp_path, monkeypatch):
 def test_ingest_pdf_populates_inferred_title_and_authors(store, tmp_path, monkeypatch):
     """
     A provider that actually returns metadata gets its title/authors stored
-    on the body chunk, with meta_inferred set — inbox PDFs are always public
-    papers, so inference is never blocked by the privacy guard.
+    on the body chunk — inbox PDFs are always public papers, so inference is
+    never blocked by the privacy guard.
     """
     class _RealisticStubProvider:
         def complete(self, messages, max_tokens=300, context_length=None):
@@ -202,7 +202,56 @@ def test_ingest_pdf_populates_inferred_title_and_authors(store, tmp_path, monkey
     assert body_meta
     assert body_meta[0]["title"] == "Reproducible Pipelines at Scale"
     assert body_meta[0]["authors"] == "Ada Lovelace"
-    assert body_meta[0]["meta_inferred"] is True
+
+
+def test_ingest_pdf_logs_metadata_inference_model(store, tmp_path, monkeypatch, caplog):
+    """
+    ingest_pdf logs which provider+model performed metadata inference — once
+    per add/update, not on a skipped (unchanged) file, since no LLM call
+    happens on the skip path.
+    """
+    monkeypatch.setattr("jarvis.core.llm.make_provider", lambda provider_str: _StubMetadataProvider())
+    monkeypatch.setattr(
+        daemon_module, "get_config", lambda: Config(provider="anthropic", anthropic_model="claude-test-9")
+    )
+    pdf = _make_pdf(tmp_path / "logged_paper.pdf", "A study of reproducible pipelines.")
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        assert ingest_pdf(pdf, store) == "added"
+
+    matching = [r for r in caplog.records if "inferring metadata" in r.message]
+    assert len(matching) == 1
+    assert "anthropic" in matching[0].message
+    assert "claude-test-9" in matching[0].message
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        assert ingest_pdf(pdf, store) == "skipped"
+
+    assert [r for r in caplog.records if "inferring metadata" in r.message] == []
+
+
+def test_ingest_pdf_logs_stored_metadata_on_add(store, tmp_path, monkeypatch, caplog):
+    """
+    After a successful add, ingest_pdf logs one line with the stored
+    title/authors/doi and the source filename, so the sync log shows exactly
+    what metadata ended up in the KB without a separate lookup.
+    """
+    class _RealisticStubProvider:
+        def complete(self, messages, max_tokens=300, context_length=None):
+            return '{"title": "Reproducible Pipelines at Scale", "authors": "Ada Lovelace", "doi": "10.1/repro"}'
+
+    monkeypatch.setattr("jarvis.core.llm.make_provider", lambda provider_str: _RealisticStubProvider())
+    pdf = _make_pdf(tmp_path / "metadata_logged.pdf", "A study of reproducible pipelines.")
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        assert ingest_pdf(pdf, store) == "added"
+
+    matching = [r for r in caplog.records if "Reproducible Pipelines at Scale" in r.message]
+    assert len(matching) == 1
+    assert "Ada Lovelace" in matching[0].message
+    assert "10.1/repro" in matching[0].message
+    assert pdf.name in matching[0].message
 
 
 def test_scan_watch_dir_lists_pdfs_and_skips_artifacts(tmp_path):
@@ -433,6 +482,27 @@ def test_run_digest_job_releases_lock_so_a_second_call_runs(tmp_path, monkeypatc
     assert calls == [1, 1], "pipeline main must run once per call — lock was released between them"
 
 
+def test_run_digest_job_logs_provider_and_model(tmp_path, monkeypatch, caplog):
+    """
+    run_digest_job logs which provider+model the digest will use, once per
+    invocation, before handing off to the pipeline — so `jarvis-sync.log`
+    always shows which model produced a given digest without re-reading config.
+    """
+    monkeypatch.setattr(
+        daemon_module, "get_config", lambda: Config(provider="anthropic", anthropic_model="claude-test-9")
+    )
+    monkeypatch.setattr("jarvis.digest.pipeline.run.main", lambda: None)
+    status_file = tmp_path / "state" / "sync_status.json"
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        assert run_digest_job(status_file=status_file) is True
+
+    matching = [r for r in caplog.records if "digest: using" in r.message]
+    assert len(matching) == 1
+    assert "anthropic" in matching[0].message
+    assert "claude-test-9" in matching[0].message
+
+
 # ── config validation ──────────────────────────────────────────────────────────
 
 def test_validate_sync_config_accepts_defaults(tmp_path):
@@ -490,6 +560,51 @@ def test_build_scheduler_adds_pdf_scan_when_watch_dir_set(tmp_path):
     """A configured watch dir adds the periodic pdf_scan job."""
     scheduler = _build_scheduler(Config(pdf_watch_dir=tmp_path))
     assert scheduler.get_job("pdf_scan") is not None
+
+
+# ── job logging ────────────────────────────────────────────────────────────────
+
+def test_log_next_run_times_logs_one_line_per_job(caplog):
+    """
+    Startup should state, per job, when it will next fire — computed via the
+    trigger directly since job.next_run_time is still None before
+    BlockingScheduler.start() actually runs.
+    """
+    scheduler = _build_scheduler(Config())
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        daemon_module._log_next_run_times(scheduler)
+
+    logged_ids = {
+        job.id for job in scheduler.get_jobs()
+        if any(f"job {job.id}: next run at" in r.message for r in caplog.records)
+    }
+    assert logged_ids == {job.id for job in scheduler.get_jobs()}
+
+
+def test_log_job_outcome_reports_next_run_after_success_and_error(caplog):
+    """A finished job (success or error) logs its next scheduled run time."""
+    from types import SimpleNamespace
+
+    scheduler = _build_scheduler(Config())
+    ok_event = SimpleNamespace(job_id="vault_refresh", exception=None)
+    error_event = SimpleNamespace(job_id="digest", exception=RuntimeError("boom"))
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        daemon_module._log_job_outcome(scheduler, ok_event)
+    assert any(
+        r.levelname == "INFO" and "job vault_refresh finished — next run at" in r.message
+        for r in caplog.records
+    )
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        daemon_module._log_job_outcome(scheduler, error_event)
+    assert any(
+        r.levelname == "ERROR"
+        and "job digest failed: boom — next run at" in r.message
+        for r in caplog.records
+    )
 
 
 # ── status file ────────────────────────────────────────────────────────────────

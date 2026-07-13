@@ -6,9 +6,11 @@ the first couple of pages and asks the active provider to extract a title
 and author list. A DOI is looked for with a regex first — cheap and exact
 when present — and the LLM is only asked to guess one when the regex misses.
 resolve_pdf_metadata() is the entry point every add-path calls: it layers
-explicit user overrides, the private-note privacy guard, and inference, so
-the three call sites (kb add, chat add_document, daemon ingest_pdf) share
-one policy instead of three copies of it.
+explicit user overrides and inference, so the three call sites (kb add, chat
+add_document, daemon ingest_pdf) share one policy instead of three copies of
+it. Local PDFs are always public papers, so inference never needs to worry
+about reaching a cloud provider with private content — that guard lives
+entirely in the vault-note privacy machinery instead.
 """
 
 import json
@@ -82,9 +84,6 @@ def infer_pdf_metadata(pdf_path: Path, provider) -> dict:
 def resolve_pdf_metadata(
     pdf_path: Path,
     provider,
-    provider_str: str,
-    doc_type: str,
-    visibility: str,
     title_override: str = "",
     authors_override: str = "",
     doi_override: str = "",
@@ -92,38 +91,22 @@ def resolve_pdf_metadata(
     """
     Resolve title/authors/doi for one local-PDF add, applying in order:
       1. explicit overrides — always win, skip inference entirely if all three given
-      2. the privacy guard — a private note's text must never reach a cloud
-         provider, so inference is skipped under Anthropic with a visible
-         warning, leaving the caller to fall back to the filename stem
-      3. automatic inference for whichever fields are still unset
+      2. automatic inference for whichever fields are still unset
 
-    Returns {"title", "authors", "doi", "meta_inferred"}; title/authors/doi
-    default to "" (caller falls back to the filename stem for title).
-    meta_inferred is True whenever inference ran (not skipped by overrides or
-    the privacy guard) — even if it came back empty, since an unfilled field
-    falling back to the filename stem is exactly the case that most needs
-    human review.
+    Local PDFs are always public papers, so inference is always allowed —
+    there is no private-note guard to apply here (private documents only
+    ever come from the Obsidian vault, handled separately).
+
+    Returns {"title", "authors", "doi"}; each defaults to "" (caller falls
+    back to the filename stem for title).
     """
     if title_override and authors_override and doi_override:
-        return {
-            "title": title_override, "authors": authors_override,
-            "doi": doi_override, "meta_inferred": False,
-        }
+        return {"title": title_override, "authors": authors_override, "doi": doi_override}
 
-    if doc_type == "note" and visibility == "private" and provider_str == "anthropic":
-        print(
-            "  ⚠️  skipping metadata inference — a private note's text must "
-            "not reach a cloud provider (switch to the local model to infer "
-            "it, or use --title/--authors/--doi to set it manually)",
-            flush=True,
-        )
-        inferred: dict = {}
-    else:
-        inferred = infer_pdf_metadata(pdf_path, provider)
+    inferred = infer_pdf_metadata(pdf_path, provider)
 
     return {
         "title": title_override or inferred.get("title", ""),
         "authors": authors_override or inferred.get("authors", ""),
         "doi": doi_override or inferred.get("doi", ""),
-        "meta_inferred": bool(inferred) and not (title_override and authors_override and doi_override),
     }

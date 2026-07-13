@@ -92,7 +92,7 @@ ollama pull qwen3-vl:30b
 
 `qwen3-vl:30b` is the default (a vision + thinking MoE that fits a 36GB M3 Max); confirm the exact tag with `ollama list`, since Ollama's registry names can shift. Ollama runs as a macOS login-item app or via `ollama serve`. Run `uv run jarvis-sync` directly in a terminal to keep the sync daemon going (see "Background sync daemon" below). Summary mode converts the PDF to markdown locally (via `pymupdf4llm`) before summarising, so it does not need the PDF-document API.
 
-**Upgrading an existing config:** old configs with `provider = "llamacpp"` and `llamacpp_url` / `llamacpp_model` should switch back to `provider = "ollama"` and `ollama_model` (see [Configuration](#configuration)). Old configs may also carry a stale `rag_dir = "~/.seshat/rag"` — fix it to `~/.jarvis/rag`.
+**Upgrading an existing config:** old configs with `provider = "llamacpp"` and `llamacpp_url` / `llamacpp_model` should switch back to `provider = "ollama"` and `ollama_model` (see [Configuration](#configuration)). Old configs may also carry a stale `rag_dir = "~/.seshat/rag"` — fix it to `~/.jarvis/rag`. `anthropic_model` also moved: it now lives under `[chat]` rather than `[digest]`. A `[digest] anthropic_model` still works as a fallback, but jarvis prints a one-line warning at startup telling you to move it — jarvis never rewrites your config file for you.
 
 **Upgrading an existing knowledge base:** the default embedding model is now `BAAI/bge-small-en-v1.5`. Run `uv run kb reindex` once to re-embed your existing chunks — the app refuses to search a knowledge base built with a different embedding model until you do. This re-embeds stored chunk text only (no LLM calls, nothing re-downloaded). To also benefit from the newer section-aware chunking, run `uv run kb index-vault --force` for vault notes. **`uv run kb reindex` is also required after upgrading to hybrid retrieval** (see "Retrieval quality" below) — the same run both clears any pre-existing index corruption and prepends the title/authors header to old paper chunks so author-name queries work against them too. If you suspect the knowledge base index is corrupted (searches failing with an internal ChromaDB error), run `uv run kb doctor` to diagnose it before reaching for `kb reindex` blind.
 
@@ -104,7 +104,6 @@ All settings live in `~/.jarvis/config.toml`. Optional — defaults apply if abs
 
 ```toml
 [digest]
-anthropic_model = "claude-sonnet-4-6"
 output_dir = "~/Documents/papers/digest"
 max_results = 10
 # arxiv_categories is a list of [category, limit] pairs:
@@ -130,10 +129,11 @@ figure_min_pixels = 40000                                                  # ski
 
 [chat]
 provider = "ollama"              # "ollama" | "anthropic"
+anthropic_model = "claude-sonnet-4-6"  # used when provider = "anthropic" (also the digest pipeline's model)
 ollama_model = "qwen3-vl:30b"    # Ollama tag; needs tool calling + vision for full functionality
 vault_path = "~/Documents/obsidian"
 private_vault_dirs = ["private"] # top-level vault dirs only accessible to local model
-skills_dir = "~/.jarvis/skills"  # user-written skill files (*.md); missing folder = feature off
+skills_dir = "~/.jarvis/skills"  # user-written skills (skills_dir/<name>/SKILL.md); missing folder = feature off
 response_style = ""              # free-text instruction for how the assistant should write replies
 compact_after_tokens = 12000     # compact long sessions past this estimated context size
 compact_keep_exchanges = 6       # recent turns kept verbatim when compacting
@@ -168,7 +168,7 @@ vault/
 └── research/   ← cloud + local
 ```
 
-**Papers are always public.** Only notes — vault files and note-type PDFs — can be private; adding a private paper is rejected. Chat sessions that touch private content are flagged private and stay local-only (see [Chat sessions](#chat-sessions)).
+**Papers are always public.** Only notes — vault `.md` files — can be private; local PDFs are always indexed as public papers, so there is no way to add one privately. Chat sessions that touch private content are flagged private and stay local-only (see [Chat sessions](#chat-sessions)).
 
 ---
 
@@ -200,7 +200,9 @@ Every conversation is saved automatically to `~/.jarvis/sessions/` after each tu
 
 ### Skills
 
-Drop `.md` files into `~/.jarvis/skills/` (configurable via `[chat] skills_dir`) to teach the agent reusable procedures. The filename is the skill name and the first non-empty line is its one-line description. Only name + description go into the system prompt; the model loads the full instructions on demand with its `read_skill` tool when a task matches. Delete the folder (or leave it empty) to switch the feature off.
+Create a folder per skill under `~/.jarvis/skills/` (configurable via `[chat] skills_dir`) to teach the agent reusable procedures: `skills_dir/<name>/SKILL.md`, plus any supporting files the instructions reference (templates, checklists, scripts — at any depth). The folder name is the skill name; the description comes from a `description:` key in SKILL.md's `---` frontmatter, or the first non-empty body line if there's no frontmatter. Only name + description go into the system prompt; the model loads the full instructions on demand with its `read_skill` tool when a task matches, and can fetch a specific supporting file by name. Delete the folder (or leave it empty) to switch the feature off.
+
+Upgrading from the old flat-file format: move each `x.md` into its own folder as `x/SKILL.md` (`mkdir x && mv x.md x/SKILL.md`) — flat files no longer load and `list_skills` warns about any left behind.
 
 ### Response style
 
@@ -216,6 +218,8 @@ uv run webapp --provider ollama
 
 Same agent as `vault-chat`, in a dark theme. Tool calls appear live in a collapsible box while the agent is working. Localhost only — not accessible from other machines.
 
+After upgrading jarvis, hard-reload any webapp tab that was already open (Cmd+Shift+R) — a tab still running the previous JavaScript can send request shapes the new server rejects.
+
 The sidebar lists stored chat sessions: click to resume, rename (✎), pin to protect from pruning, or delete. Private sessions show a lock badge and cannot be resumed under the Anthropic provider. The response style is set from the header ⋮ menu (see above).
 
 A **DB only** toggle (on by default) restricts the agent to the knowledge base. Switch it off to allow the model to fall back to its training knowledge — an amber status badge appears whenever this happens.
@@ -224,17 +228,18 @@ Each assistant response has a hover-revealed copy button (top-right of the bubbl
 
 When the agent requests a deletion, the webapp shows a Confirm/Cancel dialog — nothing is removed until you click Confirm. The model can only ask; the decision is always yours. The dialog always states that only the database entry is removed — jarvis has no code path that deletes a file on disk.
 
-If any papers have auto-inferred (not yet human-verified) title/authors/DOI, a dismissible banner appears under the header naming the count — ask the agent to review them, or fix individual entries with `kb set-meta`.
+The header ⋮ menu also has a **Papers…** entry that opens a searchable list of every indexed paper — title, authors, DOI, date added, storage mode. Search narrows the list as you type. Each row can be edited in place (title/authors/DOI) or removed; removal shows the same two-step "database entry only, files on disk are never touched" confirmation as the chat agent's own deletion flow, and it too only ever deletes the ChromaDB entry.
 
 Available tools the agent can call:
 
 | Tool | What it does |
 |---|---|
-| `retrieve_papers` | Semantic search over indexed papers and weekly digest documents |
-| `search_notes` | Semantic search over vault notes |
+| `retrieve_papers` | Semantic search over indexed papers and weekly digest documents; each hit includes the full matching passage |
+| `search_notes` | Semantic search over vault notes; each hit includes the full matching passage |
 | `search_chat_history` | Semantic search over past conversations |
-| `read_file` | Read a specific vault file in full |
-| `read_skill` | Load a user-defined skill's full instructions (only available when skills exist) |
+| `get_document` | Read one document's full stored content, paginated — works for anything indexed, including PDFs |
+| `read_file` | Read a specific vault Markdown file in full (cannot open PDFs — use `get_document` for those) |
+| `read_skill` | Load a user-defined skill's full instructions, or one of its supporting files (only available when skills exist) |
 | `add_document` | Add a paper by arXiv URL or local PDF — title/authors/DOI auto-inferred for local PDFs unless given explicitly; `with_figures` opts into figure captioning, and re-adding the same source replaces the old entry |
 | `remove_document` | One call: immediately requests removal — a human must confirm (terminal prompt or webapp dialog) before anything is deleted; database entry only, jarvis can never delete a file on disk |
 | `list_papers` | List all indexed papers |
@@ -267,7 +272,7 @@ When adding a paper the agent uses `summary` mode by default. Specify `full text
 
 ### PDF annotations
 
-Highlights and typed notes made in macOS Preview or Foxit Reader are extracted automatically whenever a PDF is ingested — via `kb add`, the chat `add_document` tool, the sync daemon's inbox, or the vault refresh of PDF notes. Each annotation becomes its own searchable chunk, prefixed `[HIGHLIGHT p.N]` or `[USER NOTE p.N]`, so the agent can answer "what did I highlight in that paper?".
+Highlights and typed notes made in macOS Preview or Foxit Reader are extracted automatically whenever a PDF is ingested — via `kb add`, the chat `add_document` tool, or the sync daemon's inbox. Each annotation becomes its own searchable chunk, prefixed `[HIGHLIGHT p.N]` or `[USER NOTE p.N]`, so the agent can answer "what did I highlight in that paper?".
 
 What is extracted:
 
@@ -278,7 +283,7 @@ What is not:
 
 - **Freehand/handwritten drawing (Ink)** — Preview's Sketch/Draw tools and stylus scribbles store stroke geometry, not text, and are not extracted. Anything you want searchable must be typed or highlighted.
 
-Re-saving a PDF after adding annotations re-indexes it automatically: the inbox watcher and vault refresh detect the changed byte hash and replace the old chunks.
+Re-saving a PDF after adding annotations re-indexes it automatically: the sync daemon's inbox watcher detects the changed byte hash and replaces the old chunks.
 
 ### PDF figure captioning
 
@@ -302,7 +307,8 @@ uv run kb index-vault --vault-path ~/path/to/vault --force
 # adopting hybrid retrieval, or to clear a corrupted index (see `kb doctor`).
 uv run kb reindex
 
-# Diagnose knowledge base health (embed model mismatch, index corruption)
+# Diagnose knowledge base health (embed model mismatch, index corruption);
+# also finds and offers to migrate any legacy PDF notes to papers (see CHANGELOG)
 uv run kb doctor
 
 # Add a paper by arXiv URL
@@ -315,12 +321,11 @@ uv run kb add https://arxiv.org/abs/2406.04093 --full-text   # store full PDF te
 # duplicate prompt: the old entry is REPLACED (same source), never duplicated.
 uv run kb add https://arxiv.org/abs/2406.04093 --full-text --figures
 
-# Add a local PDF (--doc-type paper or note; papers are always public,
-# so --visibility private requires --doc-type note). Title/authors/DOI are
-# auto-inferred from the PDF's first pages unless given explicitly.
-uv run kb add paper.pdf --doc-type paper --full-text
+# Add a local PDF — always indexed as a public paper (notes come only from
+# the Obsidian vault). Title/authors/DOI are auto-inferred from the PDF's
+# first pages unless given explicitly.
+uv run kb add paper.pdf --full-text
 uv run kb add paper.pdf --authors "Ada Lovelace" --doi "10.1234/example"
-uv run kb add notes.pdf --doc-type note --visibility private
 
 # Override the provider used for summary generation
 uv run kb add https://arxiv.org/abs/2406.04093 --provider anthropic
@@ -332,8 +337,7 @@ uv run kb add-digest ~/Documents/papers/digest/ --min-score 7
 # Inspect
 uv run kb list
 uv run kb list --limit 100
-uv run kb list --unverified   # only papers with auto-inferred metadata
-uv run kb stats                # also warns about unverified metadata and legacy private papers
+uv run kb stats                # also warns about legacy private papers
 uv run kb sync-status          # jarvis-sync daemon health and last job outcomes
 
 # Correct an auto-inferred title/authors/DOI (metadata only, no re-embedding)

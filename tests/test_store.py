@@ -18,7 +18,7 @@ Sections
 4. delete_by_metadata        — chunk removal
 5. list_papers               — deduplication and chunk count
 6. update_file_path          — in-place metadata update
-7. refresh_vault             — incremental vault sync (add / update / delete / PDF notes)
+7. refresh_vault             — incremental vault sync (add / update / delete)
 8. embedding-model guard
 9. re-ranking
 10. chunk metadata
@@ -44,9 +44,11 @@ from jarvis.kb.store import (
     add_papers_batch,
     add_texts,
     count,
-    count_unverified_papers,
     delete_by_metadata,
+    find_pdf_notes,
+    get_document_chunks,
     list_papers,
+    reclassify_notes_as_papers,
     refresh_vault,
     search,
     search_with_privacy_check,
@@ -332,6 +334,54 @@ def test_update_file_path_returns_zero_for_unknown_source(store):
     assert n == 0
 
 
+def test_get_document_chunks_orders_body_before_annotations(store):
+    """
+    get_document_chunks returns body chunks first (sorted by chunk_index),
+    then annotation/figure chunks — identified by the annotation_kind
+    metadata key, which body chunks never carry.
+
+    Input:  one document with 3 markdown sections plus a highlight and a
+        figure caption, all sharing the same source
+    Expected output: the 3 body chunks (in section order) followed by the
+        2 annotation chunks
+    """
+    source = "file:///doc.pdf"
+    content = (
+        "## Intro\nFirst section content about wombats and their burrows.\n\n"
+        "## Method\nSecond section content about survey methodology used.\n\n"
+        "## Results\nThird section content about population estimates found.\n"
+    )
+    add_texts(content=content, doc_type="paper", visibility="public",
+              source=source, store=store)
+    add_texts(content="[HIGHLIGHT p.1] a key finding", doc_type="paper",
+              visibility="public", source=source,
+              extra_metadata={"annotation_kind": "highlight", "page": 1, "note_text": ""},
+              store=store)
+    add_texts(content="[FIGURE p.2] a captioned figure", doc_type="paper",
+              visibility="public", source=source,
+              extra_metadata={"annotation_kind": "figure", "page": 2, "note_text": ""},
+              store=store)
+
+    chunks = get_document_chunks(source, store=store)
+
+    assert len(chunks) == 5
+    body, annotations = chunks[:3], chunks[3:]
+    assert all("annotation_kind" not in doc.metadata for doc in body)
+    assert [doc.metadata["chunk_index"] for doc in body] == [0, 1, 2]
+    assert {doc.metadata["annotation_kind"] for doc in annotations} == {"highlight", "figure"}
+
+
+def test_get_document_chunks_unknown_source_returns_empty_list(store):
+    """
+    get_document_chunks returns [] for a source with no matching chunks,
+    mirroring update_file_path's "0 for unknown" behaviour rather than raising.
+
+    Input:  a source string that was never indexed
+    Expected output: []
+    """
+    assert get_document_chunks("file:///does/not/exist.pdf", store=store) == []
+
+
 # ── 7. Vault sync ──────────────────────────────────────────────────────────────
 
 def test_refresh_vault_adds_new_files(tmp_path, store):
@@ -451,59 +501,6 @@ def test_update_visibility_updates_metadata_only(store):
     assert stored["documents"][0] == "A note about lab meetings."
 
     assert update_visibility("no-such-file.md", "private", store) == 0
-
-
-def test_refresh_vault_preserves_pdf_notes(tmp_path, store):
-    """
-    PDF notes (doc_type="note", file_path is an absolute .pdf path) must NOT
-    be deleted by the vault .md scan in Phase 1 of refresh_vault.
-
-    Before the bug fix, Phase 1 built the `indexed` dict from ALL doc_type="note"
-    entries, including PDF notes whose file_path is an absolute path like
-    "/tmp/.../paper.pdf". The deletion sweep then checked whether each indexed
-    path appeared in `current` (relative .md paths from vault_root.rglob). An
-    absolute path never matched, so every PDF note was silently deleted on every
-    refresh_vault call.
-
-    Input:  a PDF note in the store; a vault directory with no .md files
-    Expected output: refresh_vault returns deleted=0; the PDF note remains present
-    """
-    # Simulate a PDF note as stored by 'kb add --doc-type note'.
-    # The content_hash must match the actual file so Phase 2 skips re-indexing —
-    # we only want to test Phase 1's deletion behaviour here.
-    import hashlib
-    fake_pdf = tmp_path / "paper.pdf"
-    pdf_bytes = b"%PDF fake content"
-    fake_pdf.write_bytes(pdf_bytes)
-    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
-    add_texts(
-        content="This is the converted text of a PDF research note.",
-        doc_type="note",
-        visibility="public",
-        source=fake_pdf.as_uri(),
-        extra_metadata={
-            "title": "My PDF Note",
-            "file_path": str(fake_pdf),  # absolute path — this is the trigger for the bug
-            "content_hash": content_hash,
-            "storage_mode": "full_text",
-        },
-        store=store,
-    )
-
-    # Run refresh_vault against an empty vault — nothing on disk, so Phase 1's
-    # `current` dict is empty. The PDF note must survive the deletion sweep.
-    vault_dir = tmp_path / "vault"
-    vault_dir.mkdir()
-
-    added, updated, deleted = refresh_vault(vault_root=vault_dir, store=store)
-    assert deleted == 0, "Phase 1 must not delete PDF notes — their absolute paths are never in current"
-
-    # Confirm the PDF note is still retrievable from the store
-    result = store._collection.get(
-        where={"doc_type": {"$eq": "note"}}, include=["metadatas"]
-    )
-    stored_paths = [m.get("file_path", "") for m in result["metadatas"]]
-    assert str(fake_pdf) in stored_paths
 
 
 # ── 8. Embedding-model guard ────────────────────────────────────────────────────
@@ -846,6 +843,45 @@ def test_search_raises_kb_corruption_error_on_hybrid_path(store, monkeypatch):
         search("anything", store=store, rerank=False)
 
 
+def test_search_diagnoses_stale_collection_handle_after_reindex(store, monkeypatch):
+    """
+    `kb reindex` swaps in a rebuilt collection with a new UUID; a process that
+    was already running still holds the old handle, and every operation then
+    fails with "Collection [...] does not exist". That must surface as a
+    diagnosis naming the fix (restart the process) — not as a generic
+    RAGError, and definitely not as advice to run reindex again.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
+
+    def stale_similarity_search(*args, **kwargs):
+        raise Exception(
+            "Error getting collection: Collection "
+            "[6e8c78c5-ace7-4ab3-a40e-e3e0ac3bd8fb] does not exist."
+        )
+
+    monkeypatch.setattr(store, "similarity_search", stale_similarity_search)
+
+    with pytest.raises(KBCorruptionError, match="restart this process"):
+        search("anything", store=store, rerank=False)
+
+
+def test_add_texts_diagnoses_stale_collection_handle_after_reindex(store, monkeypatch):
+    """The same stale-handle diagnosis must fire on the write path — that is
+    where the webapp actually hit it (indexing exchanges after a turn)."""
+
+    def stale_add_documents(*args, **kwargs):
+        raise Exception(
+            "Failed to add documents: Error getting collection: Collection "
+            "[6e8c78c5-ace7-4ab3-a40e-e3e0ac3bd8fb] does not exist."
+        )
+
+    monkeypatch.setattr(store, "add_documents", stale_add_documents)
+
+    with pytest.raises(KBCorruptionError, match="restart this process"):
+        add_texts(content="anything", doc_type="note", visibility="public",
+                  source="stale-handle-test", store=store)
+
+
 # ── 13. Embed header ─────────────────────────────────────────────────────────────
 
 def test_embed_header_is_prepended_to_every_chunk(store):
@@ -929,39 +965,19 @@ def test_add_paper_content_includes_authors_line(store):
     assert any("Ashish Vaswani, Noam Shazeer" in doc for doc in stored["documents"])
 
 
-def test_update_paper_metadata_clears_meta_inferred(store):
+def test_update_paper_metadata_sets_only_the_given_fields(store):
     """
-    Setting any field via update_paper_metadata marks the metadata verified —
-    meta_inferred flips to False even if the caller only touched one field.
+    update_paper_metadata applies a human correction metadata-only — only
+    the fields the caller passes are changed on every chunk.
     """
     paper = _paper(50)
     ids = add_paper(paper, dense_summary="Summary text.", store=store)
-    inferred_metas = store._collection.get(ids=ids, include=["metadatas"])["metadatas"]
-    store._collection.update(ids=ids, metadatas=[{**m, "meta_inferred": True} for m in inferred_metas])
 
     n = update_paper_metadata(paper["link"], title="Corrected Title", store=store)
     assert n == len(ids)
 
     stored = store._collection.get(where={"source": {"$eq": paper["link"]}}, include=["metadatas"])
     assert all(m["title"] == "Corrected Title" for m in stored["metadatas"])
-    assert all(m["meta_inferred"] is False for m in stored["metadatas"])
-
-
-def test_count_unverified_papers_counts_unique_sources(store):
-    """count_unverified_papers de-duplicates by source and drops once verified."""
-    paper_a = _paper(60)
-    paper_b = _paper(61)
-    add_paper(paper_a, dense_summary="s", store=store)
-    add_paper(paper_b, dense_summary="s", store=store)
-    assert count_unverified_papers(store) == 0
-
-    ids_a = store._collection.get(where={"source": {"$eq": paper_a["link"]}}, include=[])["ids"]
-    metas_a = store._collection.get(ids=ids_a, include=["metadatas"])["metadatas"]
-    store._collection.update(ids=ids_a, metadatas=[{**m, "meta_inferred": True} for m in metas_a])
-    assert count_unverified_papers(store) == 1
-
-    update_paper_metadata(paper_a["link"], title="Verified now", store=store)
-    assert count_unverified_papers(store) == 0
 
 
 # ── 16. doc_type list filter (papers + digests) ────────────────────────────────
@@ -1076,3 +1092,89 @@ def test_add_figures_enabled_none_respects_config(store, tmp_path, monkeypatch):
     )
     assert len(ids) == 1
     assert provider.calls == 1
+
+
+# ── 18. Legacy PDF-note migration (kb doctor) ──────────────────────────────────
+
+
+def test_find_pdf_notes_ignores_vault_md_notes(store):
+    """
+    A vault .md note (relative file_path) must never be reported as a legacy
+    PDF note — only an absolute .pdf file_path counts.
+    """
+    add_texts(
+        content="A note about lab meetings.", doc_type="note", visibility="public",
+        source="local", extra_metadata={"file_path": "meetings.md", "title": "Meetings"},
+        store=store,
+    )
+    assert find_pdf_notes(store) == []
+
+
+def test_find_pdf_notes_groups_by_source_and_reports_visibility(store, tmp_path):
+    """
+    A legacy PDF note is reported once per source (not once per chunk), with
+    its title, visibility, and chunk count.
+    """
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF fake content")
+    source = fake_pdf.as_uri()
+    add_texts(
+        content="Body text of a legacy PDF note.",
+        doc_type="note", visibility="public", source=source,
+        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
+                         "content_hash": "abc123", "storage_mode": "full_text"},
+        store=store,
+    )
+    # A second chunk of the same document (e.g. an annotation) must not be
+    # double-counted as a separate document.
+    add_texts(
+        content="[HIGHLIGHT p.1] An important passage.",
+        doc_type="note", visibility="public", source=source,
+        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
+                         "annotation_kind": "highlight"},
+        store=store,
+    )
+
+    found = find_pdf_notes(store)
+    assert len(found) == 1
+    assert found[0]["source"] == source
+    assert found[0]["title"] == "Legacy Note"
+    assert found[0]["visibility"] == "public"
+    assert found[0]["chunk_count"] == 2
+
+
+def test_reclassify_notes_as_papers_flips_doc_type_only(store, tmp_path):
+    """
+    Reclassifying a legacy PDF note to a paper flips only doc_type — every
+    other field (content_hash, storage_mode, file_path, visibility) is left
+    exactly as it was, matching the shape a daemon-ingested paper carries.
+    """
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF fake content")
+    source = fake_pdf.as_uri()
+    add_texts(
+        content="Body text of a legacy PDF note.",
+        doc_type="note", visibility="public", source=source,
+        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
+                         "content_hash": "abc123", "storage_mode": "full_text"},
+        store=store,
+    )
+
+    n = reclassify_notes_as_papers([source], store)
+    assert n == 1
+
+    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
+    meta = stored["metadatas"][0]
+    assert meta["doc_type"] == "paper"
+    assert meta["content_hash"] == "abc123"
+    assert meta["storage_mode"] == "full_text"
+    assert meta["file_path"] == str(fake_pdf)
+    assert meta["visibility"] == "public"
+
+    # A reclassified document is no longer reported by find_pdf_notes.
+    assert find_pdf_notes(store) == []
+
+
+def test_reclassify_notes_as_papers_empty_sources_is_a_noop(store):
+    """An empty source list is a no-op, not an error."""
+    assert reclassify_notes_as_papers([], store) == 0

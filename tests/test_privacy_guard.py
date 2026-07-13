@@ -4,7 +4,7 @@ Tests for the chat-layer privacy enforcement in jarvis/chat/chat.py.
 These cover the guards that sit between the LLM's tool calls and the data:
 - read_file: vault containment, private-dir hard stop, symlink resolution
 - _search_notes: the "private matches excluded" caveat and hard stop
-- _add_document: the papers-are-always-public invariant
+- _get_document: privacy mirrors read_file's behaviour
 
 The store fixture comes from conftest.py (real embeddings, isolated
 collection). get_store()/get_config() are monkeypatched where the chat
@@ -19,7 +19,7 @@ import pytest
 from jarvis.core.config import Config
 from jarvis.core.errors import PrivacyError
 from jarvis.kb.store import add_texts
-from jarvis.chat.chat import _add_document, _search_notes, read_file
+from jarvis.chat.chat import _get_document, _search_notes, read_file
 
 
 @pytest.fixture
@@ -164,59 +164,62 @@ def test_search_notes_local_provider_gets_no_caveat(store, monkeypatch):
     assert saw_private is True
 
 
-# ── _add_document invariant ────────────────────────────────────────────────────
+# ── _get_document privacy ───────────────────────────────────────────────────────
 
-class _ExplodingProvider:
-    """Fails the test if the model provider is ever asked to summarize."""
-
-    def summarize(self, title, source, max_tokens=2048):
-        raise AssertionError("summarize() must not be called for a rejected document")
-
-
-def test_add_document_rejects_private_paper(tmp_path):
+def test_get_document_public_doc_fine_under_anthropic(store, monkeypatch):
     """
-    doc_type='paper' with visibility='private' violates the papers-are-public
-    invariant and is rejected before any provider or store interaction.
+    A public document reads fine under the cloud provider — get_document
+    mirrors read_file's privacy behaviour, not a blanket cloud restriction.
 
-    Input:  local PDF path, doc_type=paper, visibility=private, summary mode
-    Expected output: error string naming the invariant; summarize never called
+    Input:  a public note's source, anthropic provider
+    Expected output: content returned, saw_private=False
     """
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF-1.4 stub")
-
-    result = _add_document(
-        {"source": str(pdf), "doc_type": "paper", "visibility": "private"},
-        _ExplodingProvider(),
-    )
-    assert "papers are always public" in result
-
-
-def test_add_document_private_note_pdf_is_allowed(store, tmp_path, monkeypatch):
-    """
-    Private note-type PDFs are the supported way to index private documents:
-    converted locally, never sent to a provider.
-
-    Input:  generated PDF, doc_type=note, visibility=private
-    Expected output: success message; chunks stored with visibility=private
-    """
-    import pymupdf
-
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
-    doc = pymupdf.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), "Confidential lab notebook entry.", fontsize=12)
-    pdf = tmp_path / "notebook.pdf"
-    doc.save(pdf)
-    doc.close()
+    add_texts(content="Public overview of the quantum sensing project.",
+              doc_type="note", visibility="public", source="local-public-doc",
+              extra_metadata={"file_path": "projects/quantum.md", "title": "Quantum"},
+              store=store)
 
-    result = _add_document(
-        {"source": str(pdf), "doc_type": "note", "visibility": "private"},
-        _ExplodingProvider(),
-    )
-    assert result.startswith("Added note")
+    result, saw_private = _get_document({"source": "local-public-doc"}, "anthropic")
+    assert "Public overview" in result
+    assert saw_private is False
 
-    stored = store._collection.get(
-        where={"source": {"$eq": pdf.resolve().as_uri()}}, include=["metadatas"]
-    )
-    assert stored["ids"]
-    assert all(m["visibility"] == "private" for m in stored["metadatas"])
+
+def test_get_document_private_source_hard_stops_under_anthropic_with_no_leak(store, monkeypatch):
+    """
+    A private document's source raises PrivacyError before any content —
+    even a hint of title or length — reaches the cloud provider.
+
+    Input:  a private note's source, anthropic provider
+    Expected output: PrivacyError whose message contains no document content
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    add_texts(content="Private budget worries about the quantum sensing project.",
+              doc_type="note", visibility="private", source="local-private-doc",
+              extra_metadata={"file_path": "private/quantum.md", "title": "Quantum private"},
+              store=store)
+
+    with pytest.raises(PrivacyError) as exc_info:
+        _get_document({"source": "local-private-doc"}, "anthropic")
+    assert "budget worries" not in str(exc_info.value)
+    assert "Quantum private" not in str(exc_info.value)
+
+
+def test_get_document_private_source_readable_locally(store, monkeypatch):
+    """
+    The local provider can read a private document in full — and the call
+    reports saw_private=True so the session gets flagged.
+
+    Input:  a private note's source, ollama provider
+    Expected output: content returned, saw_private=True
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    add_texts(content="Private budget worries about the quantum sensing project.",
+              doc_type="note", visibility="private", source="local-private-doc-2",
+              extra_metadata={"file_path": "private/quantum.md", "title": "Quantum private"},
+              store=store)
+
+    result, saw_private = _get_document({"source": "local-private-doc-2"}, "ollama")
+    assert "budget worries" in result
+    assert saw_private is True
+

@@ -138,7 +138,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | `~/.jarvis/rag/` | ChromaDB persistent store (+ `.write.lock` for cross-process writes) |
 | `~/.jarvis/state/sync_status.json` | `jarvis-sync` daemon/job status (read by `kb sync-status`) |
 | `~/.jarvis/sessions/` | Persistent chat sessions, one JSON file each (dir 0700, files 0600) |
-| `~/.jarvis/skills/` | User-defined skill `.md` files (configurable via `skills_dir`) |
+| `~/.jarvis/skills/` | User-defined skill folders, `<name>/SKILL.md` + supporting files (configurable via `skills_dir`) |
 | `~/.jarvis/logs/sync.log` | `jarvis-sync` daemon log (written directly by the daemon; also echoed to stderr) |
 | `~/.jarvis/logs/chat.log` | Chat-tool failures — full exception + traceback for every caught tool error, shared by `vault-chat` and the webapp (file only, not echoed to the terminal) |
 | `~/Documents/papers/digest/` | Weekly digest `.md` output files (configurable) |
@@ -151,7 +151,6 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 
 | Field | Default | Env var | Description |
 |---|---|---|---|
-| `anthropic_model` | `claude-sonnet-4-6` | `ANTHROPIC_MODEL` | Anthropic model |
 | `output_dir` | `~/Documents/papers/digest` | — | Digest output directory |
 | `max_results` | `10` | — | Max papers per digest |
 | `arxiv_cats` | 6 categories | — | `[(category, limit), ...]` (TOML key `arxiv_categories`) |
@@ -170,10 +169,11 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `biorxiv_keywords` | `[("cytometry", 50), ...]` | — | bioRxiv client-side keyword filters (TOML key `biorxiv_keywords`) |
 | `biorxiv_days` | `7` | — | Recent-preprint window for bioRxiv fetches |
 | `provider` | `ollama` | `CHAT_PROVIDER` | Active LLM provider (`"ollama"` \| `"anthropic"`) |
+| `anthropic_model` | `claude-sonnet-4-6` | `ANTHROPIC_MODEL` | Anthropic model, used both for chat and the digest pipeline. Canonical home is `[chat]`; a legacy `[digest] anthropic_model` still works as a fallback but prints a one-line warning to move it (no auto-rewrite). Precedence: env > `[chat]` > `[digest]` |
 | `ollama_model` | `qwen3-vl:30b` | `OLLAMA_MODEL` | Ollama model tag (needs tool calling + vision for full functionality) |
 | `vault_path` | `~/vault` | `VAULT_PATH` | Obsidian vault root |
 | `private_vault_dirs` | `["private"]` | — | Top-level vault folders treated as private |
-| `skills_dir` | `~/.jarvis/skills` | — | User-defined skill files; missing folder = feature off |
+| `skills_dir` | `~/.jarvis/skills` | — | User-defined skill folders (`<name>/SKILL.md`); missing folder = feature off |
 | `response_style` | `""` | — | Free-text style instruction appended to the system prompt |
 | `compact_after_tokens` | `12000` | — | Session compaction threshold (estimated context tokens) |
 | `compact_keep_exchanges` | `6` | — | Recent turns kept verbatim when compacting |
@@ -211,8 +211,6 @@ metadata:
   authors     : str  — papers only (optional)
   doi         : str  — papers only (optional); regex/LLM-inferred for local PDFs,
                        passed through from the arXiv API result when present
-  meta_inferred: bool — title/authors/doi came from auto-inference and has not
-                       been human-verified yet (papers only, optional)
   score       : int  — relevance 0–10, papers only (optional)
   track       : str  — research track, papers only (optional)
   storage_mode: str  — "summary" | "full_text" (optional)
@@ -232,7 +230,7 @@ Annotation and figure chunks share `source`/`file_path`/`doc_type`/`visibility` 
 
 **`doc_type` rules:**
 - arXiv URL → always `"paper"`
-- Local PDF → user must specify `"paper"` or `"note"` via `--doc-type`
+- Local PDF → always `"paper"` (public). Notes come exclusively from the Obsidian vault — there is no way to add a local PDF as a note.
 - Vault `.md` files → always `"note"`
 - Chat exchanges (indexed per turn by `jarvis/chat/sessions.py`) → `"chat"`
 - Weekly digest `.md` files (indexed by the digest pipeline) → `"digest"`. Deliberately not `"note"`: `refresh_vault` deletes note entries whose vault-relative path no longer exists, and a digest's absolute path would look exactly like that and get wiped on the next sync. Searched by `retrieve_papers` alongside papers (`doc_type=["paper", "digest"]`).
@@ -250,7 +248,7 @@ Annotation and figure chunks share `source`/`file_path`/`doc_type`/`visibility` 
 
 When a cloud provider query matches only private content, or tries to read a file in a private vault directory, `PrivacyError` is raised from the tool implementation. `agentic_turn()` catches it, removes the orphaned assistant message from `messages` to keep conversation history valid, and returns the error string directly to the user — no further LLM calls are made. This is a prompt-injection defence: private notes may contain adversarial content that must never reach a cloud model.
 
-**Papers are always public (invariant).** Only notes — vault `.md` files and note-type PDFs — can be private. Enforced at add time in `kb add` and the `add_document` tool; this is what makes the cloud summary path (which uploads the PDF to Anthropic) safe by construction rather than by a per-path gate. `kb stats` warns about legacy private papers added before the invariant existed.
+**Papers are always public (invariant).** Only notes — vault `.md` files — can be private; local PDFs are always public papers, so there is no `--visibility`/`--doc-type` choice to make when adding one. This is what makes the cloud summary path (which uploads the PDF to Anthropic) safe by construction rather than by a per-path gate. `kb stats` and `kb doctor` warn about legacy private papers/notes added before the invariant existed (see the `kb doctor` migration below).
 
 **One classification policy.** `get_visibility(file_path, vault_root)` is the single rule that maps a path to a visibility, and it is used by *both* indexing and `read_file`. `read_file` classifies the **resolved** path — checking the caller-supplied relative path instead would let a symlink placed in a public folder reach into `private/`.
 
@@ -277,14 +275,14 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 | `search(query, n_results, visibility, doc_type, annotation_kind, rerank=True)` | Hybrid (dense+BM25, gated by `[rag] hybrid`) or dense-only search with filters, then optional cross-encoder re-ranking; `doc_type` accepts one type or a list (`$in` filter, e.g. `["paper", "digest"]`); raises `KBCorruptionError` on a stale-id failure |
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
-| `update_paper_metadata(source, title, authors, doi)` | Metadata-only correction of a paper's title/authors/doi; clears `meta_inferred` |
-| `count_unverified_papers()` | Count papers whose metadata is still auto-inferred and unverified |
+| `update_paper_metadata(source, title, authors, doi)` | Metadata-only correction of a paper's title/authors/doi |
 | `count()` · `count_unique_documents()` · `list_papers()` | Inspection |
 | `update_file_path(source, new_path)` | Update `file_path` (and `source` URI) for all chunks matching a source; no re-embedding |
 | `update_visibility(file_path, new_visibility)` | Metadata-only reclassification of a note's chunks; no re-embedding |
 | `get_visibility(file_path, vault_root)` | The one visibility policy: derive public/private from the top-level folder |
 | `index_vault_file(file_path, vault_root)` | Chunk and index one vault file |
-| `refresh_vault(vault_root)` | Incremental sync (Phase 1: vault `.md` files incl. visibility re-check; Phase 2: local PDF notes incl. annotations); returns `(added, updated, deleted)` |
+| `refresh_vault(vault_root)` | Incremental sync of vault `.md` files (add / update / delete, plus a visibility re-check on unchanged notes); returns `(added, updated, deleted)` |
+| `find_pdf_notes()` / `reclassify_notes_as_papers(sources)` | `kb doctor` migration helpers: find legacy `doc_type="note"` chunks with a `.pdf` `file_path`, and flip public ones to `doc_type="paper"` in place |
 
 **Cross-process write lock (`_kb_write_lock`).** The daemon, webapp, and CLI all open the same ChromaDB `PersistentClient` directory, and Chroma's SQLite backend is not safe for concurrent multi-process writers. Every write path takes an advisory `flock` on `<rag_dir>/.write.lock` (re-entrant per thread, so composite operations like `refresh_vault` → `add_texts` don't self-deadlock). Reads stay unlocked — SQLite WAL handles concurrent readers.
 
@@ -307,7 +305,7 @@ macOS Preview and Foxit Reader both write standard ISO 32000 annotation objects 
 | Comment typed on a highlight | ✓ (as the highlight's `note_text`) |
 | Freehand/handwritten drawing (Ink) | ✗ — stores stroke geometry, not text; would need handwriting OCR |
 
-**Where it is wired in:** `kb add` (local PDFs and arXiv full-text), the chat `add_document` tool, `refresh_vault` Phase 2 (PDF notes), and the daemon's inbox ingest. Annotations are indexed *before* body conversion, so a scanned PDF whose body fails to convert still keeps its highlights. Re-saving a PDF with new annotations changes its byte hash, which triggers a full re-index through the existing change-detection paths.
+**Where it is wired in:** `kb add` (local PDFs and arXiv full-text), the chat `add_document` tool, and the daemon's inbox ingest. Annotations are indexed *before* body conversion, so a scanned PDF whose body fails to convert still keeps its highlights. Re-saving a PDF with new annotations changes its byte hash, which triggers a full re-index through the existing change-detection paths.
 
 ### Figure captioning — `jarvis/kb/images.py` + `add_figures`
 
@@ -330,15 +328,17 @@ A query flows through four stages, all local — no data leaves the machine:
 3. **Re-ranking.** A cross-encoder (`rerank_model`) scores each `(query, chunk)` pair jointly and reorders the (dense or fused) candidates, returning the top `n_results`. Re-ranking is far more accurate than the bi-encoder's independent embeddings at deciding which chunk is actually most relevant. It runs **after** the visibility filter, so it never widens what a cloud provider can see; set `rerank_model = ""` to disable it.
 4. **Corruption detection.** If ChromaDB raises with `"Error finding id"` in the message — a stale HNSW reference to a chunk id that no longer exists — `search()` raises `KBCorruptionError` instead of a generic `RAGError`, naming `uv run kb reindex` as the fix (chunk texts are already stored, so nothing is lost). This is not retried automatically: retrying persistent corruption just hides it. `uv run kb doctor` diagnoses this proactively (open store → count → search-probe) without waiting for a real query to hit it; on a badly corrupted store even `count()` can hard-segfault the process (a Rust-side ChromaDB crash, uncatchable in Python) — `kb doctor` dying abruptly is itself the diagnosis, not a bug in the doctor command.
 
+**Legacy PDF-note migration.** Once the store is confirmed healthy, `kb doctor` also checks for `doc_type="note"` chunks whose `file_path` is a local PDF path — leftovers from before local PDFs became always-public papers (`find_pdf_notes()`). Public ones are listed with a single y/N prompt to reclassify them to `doc_type="paper"` in place (`reclassify_notes_as_papers()` — only `doc_type` changes; `content_hash`/`storage_mode`/`file_path` are left exactly as they were, so the result has the same shape a daemon-ingested paper carries). Private ones are **never** silently made public — they are only listed, with two resolutions (`kb remove` then re-add as a public paper, or move the content into the vault as a `.md` note), and `kb doctor` keeps reporting them until resolved.
+
 **Embedding-model guard.** ChromaDB records `embed_model` in the collection metadata when the collection is first created. `get_store()` compares that tag against the configured model and raises `RAGError` on any mismatch — including legacy collections created before the tag existed. This prevents silently comparing vectors from two incompatible embedding spaces. The fix is always `uv run kb reindex`, which re-embeds every stored chunk (no LLM calls, chunk texts are already stored) into a fresh collection and swaps it in atomically. `kb reindex` also migrates old paper chunks that predate the `embed_header` convention: it prepends `"{title} — {authors}"` to any `doc_type="paper"` body chunk that doesn't already start with its title, so author-name queries work against papers indexed before this migration too (idempotent — a chunk already carrying the header is left alone).
 
 ### Metadata inference — `jarvis/kb/metadata.py`
 
 Local PDFs arrive with nothing but a filename, so `infer_pdf_metadata(pdf_path, provider)` reads the first ~2 pages and asks the active provider (one small `complete()` call) to extract a title and author list. A DOI is looked for with a regex (`10.\d{4,9}/\S+`) first — cheap and exact when printed on the page — and the LLM is only asked to guess one when the regex misses. Degrades to `{}` on any LLM failure: inference is best-effort, never fatal to the add.
 
-`resolve_pdf_metadata(...)` is the policy every add path (`kb add`, chat `add_document`, daemon `ingest_pdf`) shares, applied in order: (1) explicit `--title`/`--authors`/`--doi` overrides always win, skipping inference entirely once all three are given; (2) the privacy guard — a private note's text must never reach a cloud provider, so inference is skipped under Anthropic with a visible warning, leaving the filename stem as the title; (3) automatic inference for whatever is still unset. Papers are always public, so inference always runs for papers regardless of provider. Fields inferred this way are flagged `meta_inferred: true`.
+`resolve_pdf_metadata(...)` is the policy every add path (`kb add`, chat `add_document`, daemon `ingest_pdf`) shares, applied in order: (1) explicit `--title`/`--authors`/`--doi` overrides always win, skipping inference entirely once all three are given; (2) automatic inference for whatever is still unset. Local PDFs are always public papers, so inference always runs regardless of provider — there is no private-note guard to apply here (that machinery lives entirely with vault notes instead).
 
-**Verified-metadata loop.** `kb set-meta <source> [--title] [--authors] [--doi]` and the matching `update_document_metadata` chat tool apply a human correction metadata-only (no re-embedding) and clear `meta_inferred`. Reminders surface the unverified count in three places: `kb stats`, the webapp header (`GET /info` → `unverified_count` → a dismissible banner), and one `vault-chat` startup line.
+**Correcting metadata.** `kb set-meta <source> [--title] [--authors] [--doi]` and the matching `update_document_metadata` chat tool apply a human correction metadata-only (no re-embedding). There used to be an "unverified" flag (`meta_inferred`) tracking whether inference had been human-checked, plus reminders surfacing the count in `kb stats`, the webapp header, and a `vault-chat` startup line — it was removed for being unreliable and unactionable in practice (nearly every paper ended up flagged, and asking the LLM to act on the reminder rarely went anywhere); `kb list` is how you review titles/authors/dois now.
 
 ### Deferred retrieval improvements
 
@@ -411,9 +411,13 @@ One supervised long-running process, run directly with `uv run jarvis-sync` — 
 
 **Status file** — `~/.jarvis/state/sync_status.json` records the daemon pid/start time and each job's `last_run` / `last_success` / `last_error` (written atomically). `kb sync-status` reads it, checks pid liveness, and tails the log. Every job body catches its own exceptions and records the outcome — one failing job never takes the daemon down. Fatal setup problems (invalid `[sync]` config, embedding-model mismatch) exit non-zero at startup with the reason logged to `~/.jarvis/logs/sync.log` and stderr.
 
+**LLM logging** — `main()` logs one line at startup naming the active provider+model (via `active_model()`) and the embedding model, so `sync.log` alone answers "what model is this daemon using" without cross-referencing config. `run_digest_job` logs the provider+model it will use right before handing off to the pipeline. `ingest_pdf` logs the provider+model performing metadata inference (it runs on every non-skipped inbox PDF), and `_caption_figures` logs it again only when captioning actually fires (figures found and `figure_captions` on) — one line per job invocation, never on a no-op.
+
+**Job logging** — APScheduler's own module logger is unconfigured and propagates to root at INFO, spamming "Added job ... to job store default" on every startup; `main()` sets `logging.getLogger("apscheduler")` to `WARNING` and replaces that noise with the daemon's own lines. Right after `_build_scheduler()`, `_log_next_run_times(scheduler)` logs one `job <id>: next run at <time>` line per job — computed via `job.trigger.get_next_fire_time(None, now)` rather than `job.next_run_time`, which stays `None` until `BlockingScheduler.start()` is actually running the loop. A `scheduler.add_listener(..., EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)` listener (`_log_job_outcome`) then logs `job <id> finished — next run at <time>` after every run (or error), so the running log always answers "when will each job run next" without cross-referencing the schedule.
+
 **Digest catch-up** — `run_digest_catchup_job(trigger)` re-reads `jobs.digest.last_success` from the status file and calls `digest_is_overdue(trigger, last_success, now)`: if a scheduled fire time has passed since the stamp (machine was powered off across the slot), the digest runs immediately. It runs once at daemon start and then every 6 hours (job id `digest_catchup`) — a missed Monday fires within hours of the machine coming back, not at the next restart or the next Monday. On the very first start there is no baseline, so it waits for the next slot rather than surprise-running. The misfire grace handles sleep; the stamp + interval re-check handle power-off. **Double-fire guard:** the cron job and the catch-up job are separate APScheduler ids, so `max_instances=1` cannot stop them overlapping — `run_digest_job` acquires a module-level `threading.Lock` non-blocking at the top and returns early (with a log line) if another digest run holds it.
 
-**Inbox semantics** — the watch dir is an *inbox, not a mirror*: removing a file never deletes its KB entry. Every `pdf_watch_minutes`, `run_pdf_scan_job` lists the inbox (`scan_watch_dir`, skipping dotfiles, `~$` lock files, and `.icloud` placeholders), checks each file is done being written (`wait_for_stable`, short parameters — a file still changing is left for the next cycle rather than waited on), and calls `ingest_pdf()` inline with a per-file try/except. `ingest_pdf()` indexes each PDF as a public full-text paper (annotations first, so a scanned PDF whose body can't convert still keeps its highlights), deduplicated by byte hash: unchanged file → skipped at zero LLM cost, which is what makes the periodic sweep idempotent; changed bytes (e.g. new annotations saved into the file) → old chunks replaced. Saving highlights repeatedly therefore costs at most one re-ingest per interval instead of one per save — that is the point of the periodic design. Title/authors/DOI are auto-inferred (`resolve_pdf_metadata`, see Knowledge base) — inbox PDFs are always public papers, so a provider is built unconditionally for this and reused for figure captioning rather than constructed twice (captioning itself is config-gated and off by default). New PDFs appear in the KB within one scan interval. The daemon refuses to start if `pdf_watch_dir` is set but missing — silently `mkdir`-ing a typo'd path would watch the wrong place.
+**Inbox semantics** — the watch dir is an *inbox, not a mirror*: removing a file never deletes its KB entry. Every `pdf_watch_minutes`, `run_pdf_scan_job` lists the inbox (`scan_watch_dir`, skipping dotfiles, `~$` lock files, and `.icloud` placeholders), checks each file is done being written (`wait_for_stable`, short parameters — a file still changing is left for the next cycle rather than waited on), and calls `ingest_pdf()` inline with a per-file try/except. `ingest_pdf()` indexes each PDF as a public full-text paper (annotations first, so a scanned PDF whose body can't convert still keeps its highlights), deduplicated by byte hash: unchanged file → skipped at zero LLM cost, which is what makes the periodic sweep idempotent; changed bytes (e.g. new annotations saved into the file) → old chunks replaced. Saving highlights repeatedly therefore costs at most one re-ingest per interval instead of one per save — that is the point of the periodic design. Title/authors/DOI are auto-inferred (`resolve_pdf_metadata`, see Knowledge base) — inbox PDFs are always public papers, so a provider is built unconditionally for this and reused for figure captioning rather than constructed twice (captioning itself is config-gated and off by default). After a successful add or update, `ingest_pdf` logs one line with the stored title/authors/doi and the source filename, so the sync log shows exactly what metadata ended up in the KB for each ingested paper without a separate `kb list` lookup. New PDFs appear in the KB within one scan interval. The daemon refuses to start if `pdf_watch_dir` is set but missing — silently `mkdir`-ing a typo'd path would watch the wrong place.
 
 **Why the cross-process write lock exists** — the daemon runs alongside the webapp and CLI, all writing to the same Chroma store; Chroma's SQLite backend is not multi-process-writer safe, hence the `flock`-based `_kb_write_lock` in `store.py`.
 
@@ -492,6 +496,8 @@ A single `_FIGURE_CAPTION_PROMPT` is shared by both providers' `describe_image()
 - `"ollama"` → `OllamaProvider` with config `ollama_model` (or the override)
 - anything else → `ValueError`
 
+`active_model(cfg)` returns whichever model name is actually in effect for `cfg.provider` (`cfg.anthropic_model` or `cfg.ollama_model`) — the single place the "which model are we using" conditional lives, used for display in the CLI banner, the webapp `/info` label, the digest output footer, and the sync daemon's startup/job log lines.
+
 ---
 
 ## KB agent — `jarvis/chat/chat.py`
@@ -503,7 +509,9 @@ Single `run_session(vault, kb_only=True, session=None)` loop using `provider.age
 2. the list of available skills as `name: description` lines (when `skills` is non-empty),
 3. the user's `response_style` preference (when set).
 
-**Retrieved-data wrapping:** results from the retrieval tools (`retrieve_papers`, `search_notes`, `read_file`, `search_chat_history`) are wrapped in `BEGIN/END RETRIEVED DATA` markers, and the system prompt instructs the model to treat that text strictly as data, never as instructions. This is defence in depth against prompt injection from malicious documents — a mitigation, not a guarantee; the hard protections are the human-confirmation gate on deletions and the `PrivacyError` stops (see Security).
+**Retrieved-data wrapping:** results from the retrieval tools (`retrieve_papers`, `search_notes`, `get_document`, `read_file`, `search_chat_history`) are wrapped in `BEGIN/END RETRIEVED DATA` markers, and the system prompt instructs the model to treat that text strictly as data, never as instructions. This is defence in depth against prompt injection from malicious documents — a mitigation, not a guarantee; the hard protections are the human-confirmation gate on deletions and the `PrivacyError` stops (see Security).
+
+**Chunk-first retrieval.** `retrieve_papers` and `search_notes` return each hit's full chunk text (chunks are ≤1024 chars by construction) plus its `section` breadcrumb, instead of a 300-char truncation — the model can usually answer directly from a search hit. When a hit isn't enough, `get_document(source, page=1)` reads the whole stored document — every chunk sharing that `source`, in reading order (body chunks by `chunk_index`, then annotation/figure chunks) — 15 chunks per page. This is the escalation path for full context, including PDFs, which `read_file` cannot open; `read_file` stays limited to vault Markdown files already identified by `search_notes`. `search_chat_history` keeps its 300-char truncation deliberately — those results are recall cues, not answer material.
 
 ### Knowledge source modes
 
@@ -516,21 +524,22 @@ Single `run_session(vault, kb_only=True, session=None)` loop using `provider.age
 
 | Tool | Concern | Cloud provider behaviour |
 |---|---|---|
-| `retrieve_papers` | Search indexed papers and digest documents (`doc_type=["paper", "digest"]`) | Public only; `PrivacyError` if query only matches private content |
-| `search_notes` | Search vault notes | Public only; `PrivacyError` if query only matches private content; static caveat line appended when private matches were excluded from mixed results |
+| `retrieve_papers` | Search indexed papers and digest documents (`doc_type=["paper", "digest"]`); each hit includes the full matching passage | Public only; `PrivacyError` if query only matches private content |
+| `search_notes` | Search vault notes; each hit includes the full matching passage | Public only; `PrivacyError` if query only matches private content; static caveat line appended when private matches were excluded from mixed results |
 | `search_chat_history` | Search past conversations (`doc_type="chat"`), excluding the running session | Public sessions only; `PrivacyError` if query only matches private sessions |
-| `read_file` | Read one vault file in full (after search identifies it) | `PrivacyError` for files whose resolved path is in `private_vault_dirs` |
-| `read_skill` | Load a user-defined skill's full instructions; only in the tools list when skills exist | Any (skills are the user's own trusted files) |
-| `add_document` | Add a paper or PDF; requires `doc_type` for local PDFs; two storage modes (see below); rejects private papers; title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry (old chunks deleted first), which is the reingest-with-figures path | Any |
+| `get_document` | Read one document's stored chunks in full, paginated (15/page) — works for anything indexed, including PDFs | `PrivacyError` if any chunk of the document is private |
+| `read_file` | Read one vault Markdown file in full (after search identifies it); cannot open PDFs — use `get_document` for those | `PrivacyError` for files whose resolved path is in `private_vault_dirs` |
+| `read_skill` | Load a user-defined skill's full instructions (or one named supporting file); only in the tools list when skills exist | Any (skills are the user's own trusted files) |
+| `add_document` | Add a paper — arXiv URL or local PDF, always public; two storage modes (see below); title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry (old chunks deleted first), which is the reingest-with-figures path | Any |
 | `update_file_path` | Update stored path for a local document without re-embedding | Any |
-| `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only; clears `meta_inferred` | Any |
+| `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only | Any |
 | `remove_document` | One call: immediately shows a **human** confirmation prompt; only that human answer executes the removal — database entry only, files on disk are never touched (see Security) | Any |
 | `list_papers` | List indexed papers | Any |
 | `kb_stats` | Document and chunk counts | Any |
 | `index_vault` | Incremental vault sync (new/changed/deleted files). No `force` option — the destructive clean rebuild is CLI-only (`kb index-vault --force`) | Any |
 | `use_own_knowledge` | Pseudo-tool called by the LLM before answering from training knowledge; dispatch returns an acknowledgement string; only included in the tools list when `kb_only=False` | Any |
 
-The three retrieval tools additionally report whether they returned private content; under the local provider, the first private sighting flags the whole session as private (see Sessions).
+The four retrieval tools (`read_file`, `retrieve_papers`, `search_notes`, `get_document`) additionally report whether they returned private content; under the local provider, the first private sighting flags the whole session as private (see Sessions).
 
 ### `add_document` storage modes
 
@@ -541,9 +550,9 @@ The tool exposes two modes; the LLM asks the user which to use if not specified:
 | `summary` (default for papers) | abstract/PDF → LLM generates ~1000-word summary → chunk | 1–2 | Most papers — fast, compact |
 | `full_text` | download PDF → `pdf_to_markdown()` → chunk raw Markdown | Many | Papers the user wants to query at paragraph level |
 
-Notes (`doc_type="note"`) are **always** stored as `full_text` regardless of what the caller requests. Both modes also run `add_annotations()` and `add_figures()` on local PDFs, so highlights/typed notes and captioned figures are indexed even when the body is stored as a summary.
+Both modes also run `add_annotations()` and `add_figures()` on local PDFs, so highlights/typed notes and captioned figures are indexed even when the body is stored as a summary.
 
-For local PDFs, `doc_type` (`"paper"` or `"note"`), `visibility` (`"public"` / `"private"`, note-type only — private papers are rejected), and an optional `title` override are also accepted.
+For local PDFs, an optional `title`/`authors`/`doi` override is also accepted. Local PDFs are always indexed as public papers — there is no `doc_type`/`visibility` choice, since notes come exclusively from the Obsidian vault.
 
 **Duplicate handling** — a paper can now arrive via arXiv and bioRxiv under different URLs, so `add_paper` and the manual-add paths skip on a normalised-title match as well as a source-URL match (`_title_exists` in `store.py`). The digest batch skips silently and reports `(added, skipped)`; `kb add` prompts `[y/N]`; the chat `add_document` tool returns an ask-the-user message and only proceeds when re-invoked with `allow_duplicate=true`. **Re-adding replaces:** once the user opts in, a SAME-SOURCE duplicate has its old chunks deleted by source before the re-add (annotations and figures share `source`, so the whole old entry is swept) — the store never holds two copies of one source. A same-title-but-different-source duplicate deletes nothing and becomes a separate entry. This replace path is how an already-indexed paper gets reingested with figure captions on.
 
@@ -577,9 +586,11 @@ One JSON file per session in `~/.jarvis/sessions/<id>.json` (dir 0700, files 060
 
 ## Skills — `jarvis/chat/skills.py`
 
-A skill is a plain `.md` file in `skills_dir` (default `~/.jarvis/skills`); the filename stem is the skill name and the first non-empty line (leading `#` stripped) is its one-line description. A missing or empty folder means the feature is off — the `read_skill` tool is not even advertised.
+A skill is a folder `skills_dir/<name>/` (default `~/.jarvis/skills/<name>/`) containing `SKILL.md` plus any supporting files the instructions reference, at any depth. The folder name is the skill name. The description is parsed from a `description:` key in SKILL.md's `---` frontmatter (a small hand-rolled single-line-value parser, no YAML dependency); when there's no frontmatter or no description key, it falls back to the first non-empty body line (leading `#` stripped). A missing or empty `skills_dir` means the feature is off — the `read_skill` tool is not even advertised.
 
-The design is **progressive disclosure**: the system prompt carries only `name: description` lines; the model calls `read_skill(name)` to pull in the full instructions when a task matches, so full skill text never occupies context until actually needed. Skill names coming from the LLM are treated as untrusted: separators/traversal sequences are rejected and the resolved path must stay inside `skills_dir`. Skills are the user's own local files — trusted content, never indexed into the vector store, outside the visibility model.
+No dual format: a stray flat `*.md` file, or a folder missing `SKILL.md`, no longer loads — `list_skills` prints a one-line warning naming the fix and skips it, rather than failing silently.
+
+The design is **progressive disclosure**: the system prompt carries only `name: description` lines; the model calls `read_skill(name)` to pull in SKILL.md plus a "Supporting files:" listing (sorted relative paths, omitted when there are none) when a task matches, then `read_skill(name, file=<path>)` to load one specific supporting file, so full skill text never occupies context until actually needed. Both `name` and `file` come from the LLM and are treated as untrusted: separators/traversal sequences are rejected outright, and `resolve()` + `relative_to()` confirm the path stays inside the skill folder — this also defeats a supporting file that is a symlink pointing outside it. Supporting-file reads are capped at 64 KB. Skills are the user's own local files — trusted content, never indexed into the vector store, outside the visibility model.
 
 **Response style** — the related `[chat] response_style` free-text instruction is appended to the system prompt by `build_system_prompt()`. The webapp edits it live via the header ⋮ menu → modal (prefilled from `GET /settings`) and persists it via `set_config_value()` (tomlkit write-back, comments preserved, atomic, mode 0600).
 
@@ -593,16 +604,16 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 
 **Hardening:** `TrustedHostMiddleware` allows only `127.0.0.1` / `localhost` Host headers — a DNS-rebinding page pointing an attacker domain at 127.0.0.1 gets refused. Session ids arriving over the network are validated against the generated alphabet before any file path is built (see Security).
 
-**Session state:** a single in-memory dict shared across browser tabs, holding the active persistent `Session` object. Appropriate for a local single-user tool.
+**Session state:** a single in-memory dict shared across browser tabs. `session` is the *currently viewed* session, not a lock — several sessions can be mid-turn at once in their own background threads (true parallelism; see `running` below), and switching which one the browser is looking at never interrupts a turn running against another.
 
 | State field | Default | Description |
 |---|---|---|
-| `session` | new `Session` at startup | The active persistent session (messages + display + privacy flag) |
+| `session` | new `Session` at startup | The currently viewed persistent session (messages + display + privacy flag). `/history`, `/config`, and a `/chat` whose `session_id` matches all read/write this one |
 | `provider` | set at startup | Active `ChatProvider` instance |
-| `system` | set at startup | Active system prompt string |
-| `kb_only` | `True` | Knowledge source mode; updated by `POST /config` |
+| `kb_only` | `True` | Default `kb_only` for brand-new sessions; `POST /config` also updates the *active* session's own `kb_only` (see below) |
 | `response_style` | from config | Current style instruction; updated by `POST /settings` |
-| `pending_action` | `None` | Deletion awaiting the user's Confirm/Cancel click |
+| `pending_actions` | `{}` | Deletions awaiting the user's Confirm/Cancel click, keyed by token: `{token: {session_id, action}}`. Each dialog owns its own token, so several stacked confirmations (e.g. a bulk removal) are each independently confirmable — confirming or cancelling one only pops its own entry. `session_id` lets a new turn on session S clear only S's own dialogs (`_clear_pending_for`) without touching any other session's — including one that's mid-turn concurrently. `POST /confirm-action` itself does not check `session_id`: token possession is the capability, regardless of which session happens to be active in the browser right now |
+| `running` | `{}` | `{session_id: live Session object}` — every session currently mid-turn in its own `run_agent` background thread. A second `/chat` addressed at an id already in here 409s; resuming that id installs this *same live object* (not a stale disk copy); `sessions_delete` refuses to delete an id that's in here |
 
 **Routes:**
 
@@ -611,44 +622,85 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 | `GET /` | Serves `index.html` |
 | `GET /info` | `{provider, provider_kind, vault}` for the header |
 | `GET /history` | The active session's display list for page-refresh restore |
-| `GET /sessions` | `{active, sessions}` — stored session metadata for the sidebar (pinned first, newest first) |
-| `POST /sessions/new` | Swap in a fresh session (the outgoing one is already persisted per turn) |
-| `POST /sessions/{id}/resume` | Load and activate a stored session; 409 if `check_resume` refuses (private-under-cloud or provider-family mismatch) |
+| `GET /sessions` | `{active, busy, sessions}` — stored session metadata for the sidebar (pinned first, newest first); `busy` is the **list** of session ids currently mid-turn |
+| `POST /sessions/new` | Swap in a fresh session (the outgoing one is already persisted per turn); does **not** touch `pending_actions` — a fresh id owns no tokens, and any other session's dialogs (including the outgoing one's) must keep working |
+| `POST /sessions/{id}/resume` | If `id` is in `running`, installs that live object directly (skips the disk load — it would be stale mid-turn — and `check_resume`, since a running turn started under the current provider by construction) and reports `busy: true`; otherwise loads from disk and 409s if `check_resume` refuses (private-under-cloud or provider-family mismatch). Either path clears only `id`'s pending actions |
 | `POST /sessions/{id}/pin` | `{pinned: bool}` — flip the pinned flag |
 | `POST /sessions/{id}/rename` | `{title: str}` — rename; also updates the active session and indexed chat-chunk titles; 404 on unknown id or empty title |
-| `DELETE /sessions/{id}` | Delete the session file and its indexed chat chunks; swaps in a fresh session if it was active |
-| `POST /config` | `{kb_only: bool}`; updates the flag and rebuilds the system prompt |
+| `DELETE /sessions/{id}` | Delete the session file and its indexed chat chunks; clears `id`'s pending actions; swaps in a fresh session if it was active; 409 if `id` is in `running` |
+| `POST /config` | `{kb_only: bool}`; updates the default AND the active session's own `kb_only` |
 | `GET /settings` | `{response_style}` |
-| `POST /settings` | `{response_style}` — applies immediately and persists to `config.toml` via tomlkit |
-| `POST /confirm-action` | `{confirmed: bool}` — the human decision point for a pending deletion; executes `execute_remove()` or cancels |
-| `POST /chat` | Accepts `{message}`, streams SSE events |
+| `POST /settings` | `{response_style}` — applies immediately (next turn's system prompt is built fresh, see below) and persists to `config.toml` via tomlkit |
+| `POST /confirm-action` | `{confirmed: bool, token: str}` — the human decision point for one pending deletion; pops that token from `pending_actions` and executes `execute_remove()` or cancels; 409 if the token isn't in the dict |
+| `POST /chat` | Accepts `{message, session_id}`, streams SSE events; 409 if `session_id` is already in `running`; 404 if `session_id` isn't the active session and has no file on disk; 409 if it's a stored session `check_resume` refuses |
+| `GET /papers` | `?q=<search>` — every indexed paper (`list_papers`, de-duplicated by source, most-recent-first), optionally narrowed by a case-insensitive substring match over title/authors/doi/source. Each row: title, authors, doi, source, storage_mode, visibility, score, track, date_added, chunk_count, file_path |
+| `POST /papers/meta` | `{source, title?, authors?, doi?}` — wraps `update_paper_metadata`; sets only the given fields, no re-embedding; 404 if `source` matches no chunks |
+| `POST /papers/remove` | `{source}` — wraps `execute_remove` directly (not the token-confirmed `/confirm-action` flow); 404 if `source` matches no chunks. Human-only by construction: no chat tool references this route, so the model can never reach it; see Security below |
 
 **Request flow:**
 
 ```
-Browser POST /chat
-  → FastAPI builds the tools list (TOOLS [+ READ_SKILL_TOOL] [+ USE_OWN_KNOWLEDGE_TOOL])
-  → runs maybe_compact(), records the turn in the session
-  → spawns a background thread running provider.agentic_turn()
-  → thread pushes {type: "tool"} events to a queue as each tool fires
-  → a deletion request pushes {type: "confirm", description} and stores pending_action
+Browser POST /chat {message, session_id}
+  → 409 if session_id is already in _session["running"] (that session has a turn in flight)
+  → resolves the addressed session: the active in-memory object if its id
+    matches session_id (this is what lets a brand-new, not-yet-saved session
+    accept its very first message — it has no file on disk yet); otherwise
+    load_session(session_id) + check_resume(), 404/409 on failure. A message
+    always lands on the session named in the request, never on whatever
+    happens to be "active" in the shared dict at that instant
+  → builds tools + system prompt fresh, from the RESOLVED session's own
+    kb_only (not a cached global) — so a /config change or a resumed
+    session's own setting is never silently ignored for this turn
+  → clears only this session's pending_actions, registers
+    _session["running"][session.id] = session on the event loop (before the
+    thread spawns, so a second /chat for the same id racing in immediately
+    after still sees the busy guard)
+  → spawns a background thread running run_agent()
+      → runs maybe_compact(), records the turn in the session
+      → save_session(session) immediately — no store=, so no indexing/prune
+        side effects, but the user's message is now on disk even if the
+        browser switches sessions or the process dies before the reply lands
+      → calls provider.agentic_turn(); each tool call pushes {type: "tool"}
+        to the queue as it fires; a deletion request pushes
+        {type: "confirm", description, token} and adds
+        {token: {session_id, action}} to pending_actions
+      → on success: appends the reply to display, save_session(session, store=...)
+        (this save also indexes new exchanges and prunes old sessions)
+      → on LLMError or any other exception: logs it (log.exception, so
+        ~/.jarvis/logs/chat.log gets the traceback), builds a ⚠️ reply instead,
+        and saves the session so the error turn survives a refresh
+      → finally: pushes {type: "reply", ...} + the None sentinel, and pops
+        session.id from _session["running"] — this always runs, so the SSE
+        stream never hangs even if the turn crashed outright. No reinstall
+        step: resume installs the live registry object directly (see above),
+        so there is never a stale copy to reconcile
   → async SSE generator drains the queue (50 ms poll) and yields data: lines
-  → thread pushes {type: "reply", content, tool_calls, private} + sentinel when done;
-    the session is saved (and its new exchanges indexed)
 Browser reads the stream via fetch() + ReadableStream
   → tool events (regular): appended live to an open <details> box
   → tool event (use_own_knowledge): amber status badge inserted
-  → confirm event: Confirm/Cancel dialog; Confirm POSTs /confirm-action
+  → confirm event: Confirm/Cancel dialog (closes over its own token); Confirm
+    POSTs /confirm-action {confirmed, token}
   → reply event: <details> collapses; reply bubble appears; private=true shows the
     session's private badge and greys it out for cloud resume
-  → fetch errors render an error bubble instead of a stuck "Working..." placeholder
+  → fetch errors (incl. a 409 busy response) roll back the optimistic user
+    bubble and placeholder entirely and restore the typed text (to the
+    textarea if still viewing that session, to its draft otherwise) instead
+    of rendering an error over an orphaned message
 ```
 
-**SSE event types:** `tool` (name + arg summary), `confirm` (deletion description), `reply` (final text, tool-call log, session `private` flag). The tool-call arg summary elides overly long values with a shared middle-ellipsis helper (`truncate_middle` in `chat.py`, used by both the CLI and the webapp) so a `file:///` URI's filename stays visible.
+**Resuming into a running turn:** if `resumeSession` finds `busy: true` in the resume response (the resumed session's own turn is still in flight — e.g. the user switched away mid-turn and back again), the frontend shows a "Working..." placeholder and polls `GET /sessions` every ~2 s until that session's id is no longer in the `busy` list, then re-renders from `GET /history`. A generation counter bumped on every successful resume guards this: a poll left over from an earlier resume checks its snapshot against the current value and stops rather than clobbering a conversation the user has since navigated away from again (a failed resume doesn't bump it, so the previous session's still-legitimate poll survives). The `/history` fetch is correct by construction because resume installs the exact live object `run_agent` is mutating (see the request flow above) — there is nothing stale left to reconcile.
+
+**True parallel sessions:** any number of sessions can be mid-turn at once, each in its own background thread and its own SSE stream. The composer's disabled state is keyed per session (`inFlight` set of session ids the current tab has sent to, unioned with the server's `busy` list from `/sessions`) via `updateComposerState()`, so a slow turn in one session never locks the composer for another. A sidebar row for a busy session gets a `.busy` class (pulsing dot).
+
+**SSE event types:** `tool` (name + arg summary), `confirm` (deletion description + token), `reply` (final text, tool-call log, session `private` flag). The tool-call arg summary elides overly long values with a shared middle-ellipsis helper (`truncate_middle` in `chat.py`, used by both the CLI and the webapp) so a `file:///` URI's filename stays visible.
+
+**Per-session input drafts:** the frontend keeps a `drafts` map keyed by session id. `switchDraft(newId)` — called from `resumeSession`, "New chat", and session delete — saves the outgoing session's textarea contents and loads the incoming session's (or blank), so a half-typed message never leaks into the wrong conversation. A failed send restores its text the same way if the user has since switched away from the session it was addressed to.
 
 **Theme + layout:** dark theme only (a single palette via CSS custom properties, no toggle). Chat bubbles cap line length at `min(80ch, 100%)`. The header carries a ⋮ menu → "Set response style…" modal (prefilled from `GET /settings`, Save posts, Cancel/Esc/backdrop closes). Each sidebar session row has a ✎ rename button (a `prompt()` → `POST /sessions/{id}/rename`) alongside pin and delete.
 
 **DB only toggle:** A pill toggle in the input bar (on by default). Fires `POST /config` on change. When on, `kb_only=True` and the LLM is restricted to KB tools. When off, `kb_only=False` and `USE_OWN_KNOWLEDGE_TOOL` is added to the tools list.
+
+**Papers manager:** a ⋮ menu → "Papers…" modal (same open/prefill/close pattern as the response-style modal) lists every indexed paper via `GET /papers`, with a debounced search box re-fetching `?q=` as the user types. Each row supports inline editing (title/authors/doi become text inputs with Save/Cancel; Save `POST`s `/papers/meta` and re-renders just that row) and removal (a two-step in-modal confirmation states the "Database entry only — files on disk are never touched by jarvis: `<path>`" invariant verbatim, using the paper's `file_path` if it has one or its `source` otherwise; only the explicit Confirm `POST`s `/papers/remove`, then the whole list re-fetches). This is a second, independent removal path from `remove_document` — it is human-only by construction (no chat tool calls `/papers/remove`) rather than routed through `pending_actions`/`/confirm-action`, but it ends at the exact same `execute_remove()` and the exact same "chunks only, never files" guarantee.
 
 **Why fetch + ReadableStream instead of EventSource:** `EventSource` only supports `GET`; sending the message body requires `POST`.
 
@@ -662,13 +714,15 @@ Browser reads the stream via fetch() + ReadableStream
 
 **File deletion has been removed from the codebase wholesale (hard).** There is no code path anywhere in `jarvis/kb/store.py`, `jarvis/kb/cli.py`, or `jarvis/chat/chat.py` that unlinks a file — `delete_local_file()` and the `--delete-file` / `delete_file` params were deleted, not just disabled. `execute_remove()` only ever deletes ChromaDB chunks; the preview, the webapp dialog, and the system prompt all state the same invariant line verbatim: `"Database entry only — files on disk are never touched by jarvis: <path>"`, rendered visually distinct in the webapp dialog. This resolves what was previously an unclear-wording complaint by making the scary case impossible rather than better-worded.
 
-**Stale confirm-dialog token guard.** The one-shot flow makes it possible for an older, unclicked confirmation dialog to still be on screen when a newer removal is requested. `request_confirmation` tags each pending action with a fresh UUID token; `POST /confirm-action` 409s unless the posted token matches the currently pending one, so an old dialog's Confirm button can never fire against a different (newer) action.
+**Stale confirm-dialog token guard.** The one-shot flow makes it possible for an older, unclicked confirmation dialog to still be on screen when a newer removal is requested — or for the model to propose removing several documents in the same turn, stacking more than one dialog at once. `request_confirmation` tags each pending action with a fresh UUID token and stores it in `pending_actions: {token: {session_id, action}}`; `POST /confirm-action` pops only the token it was sent (no session check — token possession is the capability), so each dialog resolves independently of the others. A new `/chat` turn or a resume clears only *that session's own* tokens (`_clear_pending_for`), never another session's — including one that's mid-turn concurrently. A token that isn't in the dict anymore (already resolved, or abandoned by its own session's reset) 409s instead of executing.
 
 **Reduced LLM-facing surface.** The `index_vault` tool lost its destructive `force` option; the clean rebuild lives only in the human-driven CLI (`kb index-vault --force`).
 
+**`POST /papers/remove` is a second, unconditional removal path — and it is safe for the same reason the first one is.** It skips `pending_actions`/`/confirm-action` entirely and calls `execute_remove()` straight away, which is fine specifically because no chat tool references `/papers/remove` — the model has no way to reach it, so there is nothing for a prompt injection to trigger. It carries the same guarantee as `remove_document`: only ChromaDB chunks are deleted, never a file on disk (regression-tested with a spy on `pathlib.Path.unlink`/`os.remove`, see `test_webapp_papers.py`). No `chmod`-based hardening was added on top — the webapp runs as the user's own account, so a read-only vault/PDF directory would block the user's own edits (Obsidian, Finder) without stopping anything the process itself could do, since jarvis has no file-deletion code to begin with.
+
 **Retrieved-data delimiters (mitigation, not a guarantee).** Retrieval results are wrapped in `BEGIN/END RETRIEVED DATA` markers with a system-prompt rule to treat the content as data. This raises the bar against prompt injection from malicious documents, but a sufficiently persuasive payload can still influence the model — which is exactly why the deletion gate and `PrivacyError` stops do not rely on the model behaving.
 
-**Network hardening.** `TrustedHostMiddleware` rejects non-localhost Host headers (DNS-rebinding defence); the server binds to 127.0.0.1 only. Session ids from the network are validated (`[0-9a-z-]{1,64}`) before any file path construction, blocking traversal. Skill names from the LLM get the same treatment (separator/traversal rejection + resolved-path containment).
+**Network hardening.** `TrustedHostMiddleware` rejects non-localhost Host headers (DNS-rebinding defence); the server binds to 127.0.0.1 only. Session ids from the network are validated (`[0-9a-z-]{1,64}`) before any file path construction, blocking traversal. Skill names and supporting-file paths from the LLM get the same treatment (separator/traversal rejection + resolved-path containment, which also defeats a supporting file that is a symlink escaping the skill folder).
 
 **File permissions.** Config write-back and session files are 0600; the sessions directory is 0700. `jarvis-sync` and `vault-chat` warn at startup when `config.toml` (which can hold the API key) is group/world-readable — fail visibly rather than silently chmod.
 
@@ -727,18 +781,17 @@ arXiv (arxiv package) + bioRxiv (details API: categories + keywords)
 User message → maybe_compact() → provider.agentic_turn() → tool loop → reply
   → save_session(): write JSON, index new exchanges as doc_type="chat", prune old sessions
 
-  retrieve_papers / search_notes  → search_with_privacy_check() → wrap in RETRIEVED DATA markers
+  retrieve_papers / search_notes  → search_with_privacy_check() → full chunk text + section → wrap in RETRIEVED DATA markers
+  get_document                    → get_document_chunks() → privacy check (any private chunk → PrivacyError) → paginate 15/page → wrap
   search_chat_history             → search_with_privacy_check(doc_type="chat") → wrap
   read_file                       → resolved-path privacy check → filesystem read → wrap
-  read_skill                      → validated name → skill file content
-  add_document (summary mode)     → resolve_pdf_metadata() (local PDFs) → provider.summarize() → add_texts() (+ annotations)
+  read_skill                      → validated name (+ optional validated file) → SKILL.md + supporting-files listing, or one supporting file
+  add_document (summary mode)     → resolve_pdf_metadata() (local PDFs, always paper/public) → provider.summarize() → add_texts() (+ annotations)
   add_document (full_text mode)   → download PDF → pdf_to_markdown() → chunk → add_texts() + add_annotations()
-  add_document (note, local PDF)  → resolve_pdf_metadata() → pdf_to_markdown() → chunk → add_texts() + add_annotations()
   update_file_path                → update file_path + source URI in all matching chunks; no re-embedding
-  update_document_metadata        → update_paper_metadata(); clears meta_inferred; no re-embedding
+  update_document_metadata        → update_paper_metadata(); no re-embedding
   remove_document                 → lookup metadata → build preview → request_confirmation → human decides → execute_remove()
   index_vault                     → refresh_vault() (incremental only)
-  refresh_vault Phase 1           → compare hashes → index new/changed vault .md, delete removed,
-                                    re-check visibility of unchanged notes (skips PDF notes)
-  refresh_vault Phase 2           → check local PDF notes: warn if missing, re-index (with annotations) if hash changed
+  refresh_vault                   → compare hashes → index new/changed vault .md, delete removed,
+                                    re-check visibility of unchanged notes
 ```

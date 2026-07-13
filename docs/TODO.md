@@ -1,12 +1,22 @@
-Things that need to be done:
-~~- by default, pdf ingest should not ingest figures. so if a user decided it needs the figures, then it can ask to reingest the paper with figures.~~ (done — `figure_captions` now defaults to false; opt in per document with `kb add --figures` or asking the agent for `with_figures`; re-adding the same source replaces the old entry, so "reingest with figures" is one confirmed re-add)
-~~- Check whether digest that score >= 9 are added to db as summary or full text? I think >= 9 should be added as full text. easiest thing to do is just drop a full copy into the pdf watch dir, and let daemon automatically ingest it as full text but with the rating set at whatever it was. Anything less should just be summary.~~ (done — the digest job now ingests ≥ 9 papers full text directly (arXiv PDF downloaded in-job; bioRxiv/download failures fall back to summary), 8–8.9 as summaries, and indexes the digest .md itself so < 8 papers stay searchable)
-~~- add ability to create new obsidian notes based on conversation. for each session, create one note. build in ability in the ui to select a passage from the response, and automatically add it to either the response box or to the note (just as append).~~ (dropped — resolved instead by a manual copy/paste workflow: copies, both the whole-response button and native selection-copy, now carry markdown notation, so pasting into Obsidian keeps formatting intact)
-~~- add a button to copy llm response into clipboard. it should copy the response out in md format.~~ (done)
-~~- if digest silently missed this week and won't run again until next Monday unless you either restart jarvis-sync (triggers the overdue check) or run uv run run-digest manually now. There should be a reschedule option. Though rethink if this is necessary or just run it manually?~~ (done — the overdue check now also runs every 6 hours inside the daemon, so a missed week catches up on its own; default slot moved to 05:00; a lock prevents the cron and catch-up jobs double-firing)
-~~- need to refactor the codebase. everything put under digest, including the sync feature is not how you would organise a good codebase.~~ (done — mechanical restructure into a single `jarvis` package: `jarvis/core` (config/errors/llm), `jarvis/digest` (arxiv/biorxiv/pipeline + `import_digest.py`), `jarvis/kb`, `jarvis/sync` (daemon + `status.py`), `jarvis/chat`, `jarvis/webapp`; `kb/cli.py`'s `cmd_sync_status` moved to `jarvis/sync/status.py` and `cmd_add_digest` to `jarvis/digest/import_digest.py`, with the `kb` CLI surface unchanged; zero behaviour change, same 211 passed / 3 deselected test result)
-~~- nice to have: a ui on the right panel showing a mindmap of the conversation. branching when it has gone slightly off topic, like defining a term or explaining a passage. the main branch is based on the main question. this is hard to do i think, but some pointers/ideas on how to try a prototype will be nice.~~ (dropped — the model already sees the session's conversation history by default, so just ask it to draw an ASCII mindmap; note: very long sessions are compacted, older turns represented by a summary)
-~~- to save tokens, the pdf watch should just periodically refresh db rather than all the time. otherwise, every highlight, every notes, trigger a refresh which is expensive. the check should also just compute hash and calculate diffs, so no llm tokens are needed for just determining what has changed, but check.~~ (done — the watchdog observer is gone; the inbox is now scanned every `pdf_watch_minutes` (default 30), and the existing byte-hash dedup means an unchanged file costs zero LLM tokens per scan; repeated highlight saves cost at most one re-ingest per interval)
-~~- serious bug. see chat.log. if the tool calling does not return an id, the function just return internal error. This is a bad error handling. the retrieval is also not great as it fails to return appropriate relevant pdf files even after i included the authors' name in the query.~~ (done — `KBCorruptionError` names `kb reindex` as the fix instead of an opaque internal error; `kb doctor` diagnoses it proactively; hybrid BM25+RRF retrieval plus an embedded title/authors header fixes author-name recall)
-~~- the prompt to remove, need another response before i can get the ui to show yes or no. this should just appear in the same response that first asking for confirmation.~~ (done — `remove_document` is now a single call that immediately shows the confirmation dialog)
-~~- the db should store the paper's title and author. currently it kept getting the authors of papers wrong which is irritating.~~ (done — title/authors/DOI are auto-inferred for local PDFs and stored on every paper; `kb set-meta` / `update_document_metadata` let a human correct them, with an unverified-count reminder in `kb stats`, the webapp header, and vault-chat's startup line)
+Resolved 2026-07-13 (branch todo-batch-2) — see docs/CHANGELOG.md for details:
+
+1) Fixed: a brand-new session's first message is always accepted now (no global busy
+   409), and the early save persists it — the session can always be revisited.
+2) Fixed: a new chat appears in the sidebar as soon as the first message is sent
+   (the session file is written before the LLM call).
+3) Implemented parallel sessions: turns in different sessions run concurrently
+   (per-session serialization — only a second message to the SAME session waits).
+   No queueing needed.
+4) Fixed: /chat is session-addressed now (the request carries the session id), so a
+   message can never land in a different session than the one it was typed in.
+5) Fixed: jarvis sync logs each job's next run time at startup and after every run,
+   and APScheduler's own registration noise is silenced.
+6) Removed: the unverified-metadata (meta_inferred) flag and all its surfacing
+   (kb stats reminder, kb list --unverified, webapp banner). kb set-meta and the
+   chat metadata tool remain as plain editors.
+7) Done: jarvis sync logs the stored title/authors/doi per ingested paper, and the
+   webapp has a Papers… manager (top-right menu): searchable list, inline
+   title/authors/doi editing, and DB-only removal behind a two-step confirmation
+   ("Database entry only — files on disk are never touched by jarvis"). No chmod
+   hardening needed: jarvis has no file-deletion code at all (regression-tested),
+   and chmod would also block your own edits since the webapp runs as your user.

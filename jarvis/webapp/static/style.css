@@ -62,6 +62,21 @@ body {
 .session-item:hover { background: var(--surface-2); }
 .session-item.active { background: var(--accent-dim); border-color: var(--accent); }
 .session-item.unresumable { opacity: 0.5; cursor: default; }
+/* A turn is generating for this session right now (parallel-session
+   indicator) — a small pulsing dot, first in the row like the lock badge. */
+.session-item.busy::before {
+  content: '';
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: busy-pulse 1.2s ease-in-out infinite;
+}
+@keyframes busy-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
 .session-item .title {
   flex: 1;
   overflow: hidden;
@@ -347,27 +362,6 @@ button:disabled { opacity: 0.45; cursor: default; }
   margin-bottom: 6px;
 }
 
-/* Dismissible header reminder: papers with unverified (auto-inferred) metadata. */
-#unverified-banner {
-  font-size: 0.78rem;
-  color: var(--badge-text);
-  background: var(--badge-bg);
-  border-bottom: 1px solid var(--badge-border);
-  padding: 4px 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-#unverified-banner button {
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  font-size: 1rem;
-  line-height: 1;
-}
-
 /* The "files on disk are never touched" invariant line in the remove-document
    confirmation dialog — always rendered distinct from the rest of the preview. */
 .file-fate-line {
@@ -423,3 +417,80 @@ button:disabled { opacity: 0.45; cursor: default; }
 .modal-box textarea:focus { border-color: var(--accent); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .modal-actions #style-cancel { background: var(--surface-3); color: var(--text); }
+
+/* ── Papers manager modal ── */
+.papers-modal-box {
+  width: min(90vw, 820px);
+  max-height: 80vh;
+}
+.papers-modal-box input#papers-search {
+  width: 100%;
+  padding: 9px 11px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.papers-modal-box input#papers-search:focus { border-color: var(--accent); }
+.papers-list {
+  overflow-y: auto;
+  max-height: 55vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.papers-empty {
+  padding: 16px;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  text-align: center;
+}
+.papers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.papers-table th, .papers-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.papers-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.papers-table tbody tr:last-child td { border-bottom: none; }
+.papers-table input[type="text"] {
+  width: 100%;
+  padding: 5px 7px;
+  font-size: 0.85rem;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.papers-table input[type="text"]:focus { border-color: var(--accent); }
+.papers-actions {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+.papers-btn {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  border-radius: 6px;
+}
+.papers-confirm {
+  background: var(--badge-bg);
+  border-radius: 6px;
+}
+.papers-confirm-actions { display: flex; gap: 8px; margin-top: 8px; }

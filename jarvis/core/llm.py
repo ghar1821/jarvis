@@ -23,9 +23,12 @@ figure captioning and vision-based summaries depend on the vision capability.
 import base64
 import json
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from .errors import AuthenticationError, LLMError, PrivacyError
+
+if TYPE_CHECKING:
+    from .config import Config
 
 # ── Protocol ───────────────────────────────────────────────────────────────────
 
@@ -404,3 +407,8 @@ def make_provider(
     if spec == "ollama":
         return OllamaProvider(model=model or cfg.ollama_model)
     raise ValueError(f"Unknown provider spec: {spec!r} (expected 'ollama' or 'anthropic')")
+
+
+def active_model(cfg: "Config") -> str:
+    """Return the model name jarvis will actually use for cfg.provider."""
+    return cfg.anthropic_model if cfg.provider == "anthropic" else cfg.ollama_model

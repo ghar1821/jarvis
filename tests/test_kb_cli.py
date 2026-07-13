@@ -12,7 +12,7 @@ import pytest
 
 from jarvis.core.config import Config
 from jarvis.core.errors import KBCorruptionError, RAGError
-from jarvis.kb.cli import _migrated_chunk_text, cmd_doctor, cmd_reindex
+from jarvis.kb.cli import _check_legacy_pdf_notes, _migrated_chunk_text, cmd_doctor, cmd_reindex
 
 
 def test_cmd_doctor_reports_healthy_store(store, monkeypatch, capsys):
@@ -186,3 +186,99 @@ def test_cmd_reindex_backfills_embed_header_end_to_end(tmp_path, monkeypatch, em
     reindexed_again = client.get_collection(COLLECTION_NAME)
     stored_again = reindexed_again.get(ids=["paper-chunk"], include=["documents"])
     assert stored_again["documents"][0] == by_id["paper-chunk"]
+
+
+# ── `kb doctor` legacy PDF-note migration ───────────────────────────────────
+#
+# Local PDFs are now always public papers — notes come exclusively from the
+# vault. `_check_legacy_pdf_notes` finds leftover doc_type="note" chunks with
+# a .pdf file_path and offers to reclassify the public ones; private ones are
+# never silently flipped.
+
+
+def test_check_legacy_pdf_notes_reclassifies_public_on_yes(store, tmp_path, monkeypatch, capsys):
+    """A public legacy PDF note is reclassified to doc_type='paper' after a y answer."""
+    from jarvis.kb.store import add_texts
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF fake content")
+    source = fake_pdf.as_uri()
+    add_texts(
+        content="Body text of a legacy PDF note.",
+        doc_type="note", visibility="public", source=source,
+        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
+                         "content_hash": "abc123", "storage_mode": "full_text"},
+        store=store,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    _check_legacy_pdf_notes(store)
+
+    out = capsys.readouterr().out
+    assert "1 legacy PDF note(s) found" in out
+    assert "Reclassified 1 document(s)" in out
+    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
+    assert stored["metadatas"][0]["doc_type"] == "paper"
+
+
+def test_check_legacy_pdf_notes_skips_public_on_no(store, tmp_path, monkeypatch, capsys):
+    """Declining the prompt leaves the entry as doc_type='note' for next time."""
+    from jarvis.kb.store import add_texts
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF fake content")
+    source = fake_pdf.as_uri()
+    add_texts(
+        content="Body text of a legacy PDF note.",
+        doc_type="note", visibility="public", source=source,
+        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
+                         "content_hash": "abc123", "storage_mode": "full_text"},
+        store=store,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    _check_legacy_pdf_notes(store)
+
+    out = capsys.readouterr().out
+    assert "Skipped" in out
+    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
+    assert stored["metadatas"][0]["doc_type"] == "note"
+
+
+def test_check_legacy_pdf_notes_never_reclassifies_private(store, tmp_path, monkeypatch, capsys):
+    """
+    A private legacy PDF note is only listed with resolution options — never
+    silently made public — and no prompt is even shown for it.
+    """
+    from jarvis.kb.store import add_texts
+
+    fake_pdf = tmp_path / "notebook.pdf"
+    fake_pdf.write_bytes(b"%PDF fake content")
+    source = fake_pdf.as_uri()
+    add_texts(
+        content="Confidential lab notebook entry.",
+        doc_type="note", visibility="private", source=source,
+        extra_metadata={"title": "Private Note", "file_path": str(fake_pdf),
+                         "content_hash": "def456", "storage_mode": "full_text"},
+        store=store,
+    )
+
+    def _fail_if_prompted(prompt=""):
+        raise AssertionError("private PDF notes must never trigger a reclassify prompt")
+
+    monkeypatch.setattr("builtins.input", _fail_if_prompted)
+
+    _check_legacy_pdf_notes(store)
+
+    out = capsys.readouterr().out
+    assert "1 private legacy PDF note(s) found" in out
+    assert "kb remove" in out
+    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
+    assert stored["metadatas"][0]["doc_type"] == "note"
+    assert stored["metadatas"][0]["visibility"] == "private"
+
+
+def test_check_legacy_pdf_notes_no_op_when_none_found(store, capsys):
+    """No legacy PDF notes in the store — nothing is printed, no prompt shown."""
+    _check_legacy_pdf_notes(store)
+    assert capsys.readouterr().out == ""

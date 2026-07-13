@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.core.config import Config, get_config, warn_if_config_readable
+from jarvis.core.llm import active_model
 
 STATE_DIR = Path.home() / ".jarvis" / "state"
 STATUS_FILE = STATE_DIR / "sync_status.json"
@@ -169,6 +170,7 @@ def run_digest_job(status_file: Path = STATUS_FILE) -> bool:
             cfg = get_config()
             if cfg.provider != "anthropic":
                 _require_local_llm(cfg)
+            log.info("digest: using %s (model %s)", cfg.provider, active_model(cfg))
             from jarvis.digest.pipeline.run import main as run_digest
 
             run_digest()
@@ -297,7 +299,11 @@ def ingest_pdf(pdf_path: Path, store=None) -> str:
 
     cfg = get_config()
     provider = make_provider(cfg.provider)
-    meta = resolve_pdf_metadata(resolved, provider, cfg.provider, doc_type="paper", visibility="public")
+    log.info(
+        "inbox: inferring metadata for %s using %s (model %s)",
+        pdf_path.name, cfg.provider, active_model(cfg),
+    )
+    meta = resolve_pdf_metadata(resolved, provider)
     title = meta["title"] or resolved.stem
     authors, doi = meta["authors"], meta["doi"]
 
@@ -323,8 +329,6 @@ def ingest_pdf(pdf_path: Path, store=None) -> str:
         "authors": authors,
         "doi": doi,
     }
-    if meta["meta_inferred"]:
-        extra_metadata["meta_inferred"] = True
     add_texts(
         content=full_text,
         doc_type="paper",
@@ -333,6 +337,10 @@ def ingest_pdf(pdf_path: Path, store=None) -> str:
         extra_metadata=extra_metadata,
         embed_header=(f"{title} — {authors}" if authors else title),
         store=s,
+    )
+    log.info(
+        'inbox: %s "%s" — authors: %s; doi: %s; file: %s',
+        outcome, title, authors or "unknown", doi or "unknown", pdf_path.name,
     )
     return outcome
 
@@ -363,6 +371,10 @@ def _caption_figures(
             from jarvis.core.llm import make_provider
 
             provider = make_provider(cfg.provider)
+        log.info(
+            "inbox: captioning figures for %s using %s (model %s)",
+            pdf_path.name, cfg.provider, active_model(cfg),
+        )
         figure_ids = add_figures(
             pdf_path, doc_type="paper", visibility="public", source=source,
             provider_obj=provider, provider_str=cfg.provider,
@@ -484,6 +496,35 @@ def _build_scheduler(cfg: Config):
     return scheduler
 
 
+def _log_next_run_times(scheduler) -> None:
+    """
+    Log one line per job stating when it will next fire. job.next_run_time
+    is None until BlockingScheduler.start() actually begins running the
+    loop, so ask each job's trigger directly for its first fire time —
+    this is what answers "when will it run next" right from startup.
+    """
+    now = datetime.now(timezone.utc).astimezone()
+    for job in scheduler.get_jobs():
+        next_fire = job.trigger.get_next_fire_time(None, now)
+        log.info("job %s: next run at %s", job.id, next_fire)
+
+
+def _log_job_outcome(scheduler, event) -> None:
+    """Log a job's completion (or failure) and its next scheduled run."""
+    job = scheduler.get_job(event.job_id)
+    next_fire = (
+        job.trigger.get_next_fire_time(None, datetime.now(timezone.utc).astimezone())
+        if job is not None
+        else None
+    )
+    if event.exception:
+        log.error(
+            "job %s failed: %s — next run at %s", event.job_id, event.exception, next_fire
+        )
+    else:
+        log.info("job %s finished — next run at %s", event.job_id, next_fire)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 
@@ -496,6 +537,11 @@ def main() -> None:
         # `uv run jarvis-sync` shows the same messages live.
         handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stderr)],
     )
+    # APScheduler's own module logger is unconfigured and propagates to root
+    # at INFO, which floods the log with "Added job ... to job store default"
+    # noise on every startup. Our own per-job next-run lines below cover the
+    # useful information, so quiet APScheduler down to warnings and worse.
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
     warn_if_config_readable()
     cfg = get_config()
@@ -512,6 +558,11 @@ def main() -> None:
     }
     write_status(status)
 
+    log.info(
+        "LLM provider: %s (model %s) · embedding model: %s",
+        cfg.provider, active_model(cfg), cfg.embed_model,
+    )
+
     # Load the store (and embedding model) up front: the first inbox event
     # shouldn't stall for a model download, and an embedding-model mismatch
     # should kill the daemon loudly at startup, not mid-job.
@@ -521,8 +572,15 @@ def main() -> None:
     get_store()
     log.info("knowledge base ready")
 
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+
     scheduler = _build_scheduler(cfg)
     digest_trigger = scheduler.get_job("digest").trigger
+
+    _log_next_run_times(scheduler)
+    scheduler.add_listener(
+        lambda event: _log_job_outcome(scheduler, event), EVENT_JOB_EXECUTED | EVENT_JOB_ERROR
+    )
 
     # Catch-up at start: if the Mac was powered off across the scheduled
     # slot, the cron trigger alone would silently wait a whole week. The same

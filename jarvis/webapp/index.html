@@ -17,6 +17,7 @@
       <button id="menu-btn" title="Menu" aria-label="Menu">⋮</button>
       <div id="header-menu" class="hidden">
         <button id="style-menu-item">Set response style…</button>
+        <button id="papers-menu-item">Papers…</button>
       </div>
     </header>
     <div id="messages"></div>
@@ -40,6 +41,19 @@
       <div class="modal-actions">
         <button id="style-cancel">Cancel</button>
         <button id="style-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Papers manager modal, hidden until opened from the ⋮ menu -->
+  <div id="papers-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box papers-modal-box">
+      <label for="papers-search">Papers</label>
+      <input type="text" id="papers-search" placeholder="Search title, authors, DOI, source...">
+      <div id="papers-list" class="papers-list"></div>
+      <div class="modal-actions">
+        <button id="papers-close">Close</button>
       </div>
     </div>
   </div>

@@ -9,7 +9,6 @@ Resolution order (later wins):
 Example ~/.jarvis/config.toml:
 
     [digest]
-    anthropic_model = "claude-sonnet-4-6"
     output_dir = "~/Documents/papers/digest"
     max_results = 10
     # arxiv_categories is a list of [category, limit] pairs:
@@ -39,6 +38,7 @@ Example ~/.jarvis/config.toml:
 
     [chat]
     provider = "ollama"          # "ollama" | "anthropic"
+    anthropic_model = "claude-sonnet-4-6"
     # Ollama model tag (must support tool calling; vision for figure captioning)
     ollama_model = "qwen3-vl:30b"
     vault_path = "~/vault"
@@ -169,8 +169,6 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             data = tomllib.load(f)
 
         d = data.get("digest", {})
-        if "anthropic_model" in d:
-            cfg.anthropic_model = str(d["anthropic_model"])
         if "output_dir" in d:
             cfg.output_dir = Path(str(d["output_dir"])).expanduser()
         if "max_results" in d:
@@ -211,6 +209,18 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
         c = data.get("chat", {})
         if "provider" in c:
             cfg.provider = str(c["provider"])
+        # [chat] anthropic_model is the canonical home; [digest] anthropic_model
+        # is a deprecated fallback kept for existing configs (fail visibly
+        # instead of silently rewriting the user's file).
+        if "anthropic_model" in c:
+            cfg.anthropic_model = str(c["anthropic_model"])
+        elif "anthropic_model" in d:
+            cfg.anthropic_model = str(d["anthropic_model"])
+            print(
+                f"⚠️  [digest] anthropic_model is deprecated — move it to "
+                f"[chat] anthropic_model in {config_file}",
+                flush=True,
+            )
         if "ollama_model" in c:
             cfg.ollama_model = str(c["ollama_model"])
         if "vault_path" in c:

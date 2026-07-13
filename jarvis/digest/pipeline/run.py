@@ -8,7 +8,7 @@ import requests
 
 from jarvis.core.config import get_config
 from jarvis.core.errors import ConversionError
-from jarvis.core.llm import make_provider
+from jarvis.core.llm import active_model, make_provider
 
 from ..arxiv.convert import download_arxiv_pdf, parse_arxiv_url
 from ..arxiv.fetch import deduplicate, fetch_arxiv
@@ -213,7 +213,7 @@ def main() -> None:
     print("Writing digest...", flush=True)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = cfg.output_dir / f"digest-{datetime_str}.md"
-    model_label = cfg.anthropic_model if cfg.provider == "anthropic" else cfg.ollama_model
+    model_label = active_model(cfg)
     digest = format_digest(selected, all_papers, model_label, today, datetime_str)
     output_path.write_text(digest)
     print(f"  Written to {output_path}", flush=True)

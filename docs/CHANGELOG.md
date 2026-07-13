@@ -4,7 +4,540 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — restructure into a single `jarvis` package
+## [current] — webapp: true parallel sessions, papers manager; unverified-metadata flag removed; daemon job logging
+
+The webapp's `/chat` route used to apply every message to a single mutable
+"active session" global, guarded by one global busy flag (`running_turn`).
+That meant: a brand-new session that hit the busy guard could never be
+revisited (it existed only in memory, with nothing on disk to resume); only
+one session could ever be mid-turn at a time, so sending in session B while
+session A was still generating 409'd even though the user wanted true
+parallelism; and worst, a session swap racing a send could apply the
+message to the wrong session entirely, because `/chat` never said which
+session it meant — it just mutated whatever the shared dict currently
+pointed at.
+
+### Changed
+
+- **`/chat` is now session-addressed.** `ChatRequest` gains a required
+  `session_id`; the route resolves the session named in the request — the
+  active in-memory object if the id matches (so a brand-new, not-yet-saved
+  session can accept its first message), otherwise loads it from disk and
+  runs the same `check_resume` safety checks `/sessions/{id}/resume` already
+  applied. A message can no longer land on the wrong session.
+- **The single `running_turn` slot became a `running` registry**
+  (`{session_id: live Session object}`), so any number of sessions can be
+  mid-turn at once, each in its own background thread and SSE stream. The
+  busy guard, `sessions_delete`'s 409, and `GET /sessions`' `busy` field
+  (now a list, not a single id-or-null) all key off this registry instead of
+  a single global.
+- **`pending_actions` entries are now session-scoped**
+  (`{token: {session_id, action}}`). A new turn or a resume clears only its
+  own session's stale confirmation dialogs, never another session's —
+  including one that's mid-turn concurrently. `/confirm-action` itself still
+  does no session check (token possession is the capability).
+- **System prompt and tools are built fresh per turn** from the *resolved*
+  session's own `kb_only`, rather than a cached global rebuilt only by
+  `/config` and `/settings`. This also fixes a latent staleness bug: a
+  `/config` change while viewing a different session, or a resumed
+  session's own `kb_only`, used to be silently ignored by `/chat`.
+  `POST /config` now updates both the default for new sessions and the
+  active session's own flag.
+- **Resuming a still-mid-turn session installs the live registry object
+  directly** instead of a stale disk copy, which is what let `run_agent`'s
+  `finally` block drop its old mid-turn-resume reinstall step entirely —
+  there is no longer a stale copy to reconcile.
+- **Frontend:** `sendMessage()` captures the active session id up front and
+  posts it as `session_id`, so a send always targets the session it was
+  typed into even across a session switch. The composer's disabled state
+  is now per-session (`inFlight` set + the server's `busy` list via
+  `updateComposerState()`), not a single global `sendBtn.disabled` — sending
+  in one session no longer locks the composer for another. A failed send
+  fully rolls back the optimistic user bubble and placeholder and restores
+  the typed text (to the textarea if still viewing that session, to its
+  draft otherwise) instead of leaving an error over an orphaned message.
+  `loadSessions()` now runs on the first SSE event, so a brand-new session
+  appears in the sidebar as soon as its file exists (the early save), and
+  busy sessions get a pulsing-dot indicator in the sidebar.
+
+#### Tests
+
+- `tests/test_webapp_chat.py`: fixture inits the `running` registry; every
+  `/chat` post now carries `session_id`; the mid-turn reinstall regression
+  test is replaced with one driving the real resume route against a blocked
+  turn (asserts `busy: true` and the live object installed); new tests for
+  two genuinely parallel turns with no cross-contamination, an unknown
+  `session_id` 404ing, and a message landing on the addressed (non-active)
+  session rather than the active one.
+- `tests/test_security.py`: seeded `pending_actions` entries adopt the
+  `{session_id, action}` shape; `/sessions/new` is now proven to leave other
+  sessions' dialogs pending (the opposite of its old behaviour); resume and
+  new-turn tests both prove only the targeted session's tokens are cleared.
+
+## Removed `meta_inferred` / the "unverified metadata" flag
+
+Every locally-added PDF got flagged `meta_inferred: true` once auto-inference
+ran, with reminders in `kb stats`, a `kb list --unverified` filter, a webapp
+header banner (`GET /info` → `unverified_count`), and a `vault-chat` startup
+line all nagging about it. In practice almost every paper ended up flagged
+(inference nearly always runs) and getting the LLM to act on the reminder by
+actually reviewing and fixing metadata rarely went anywhere — so the flag was
+noise without a workable follow-through. Removed outright.
+
+### Removed
+
+- `count_unverified_papers()` (`jarvis/kb/store.py`) and its schema docstring
+  line; the `kb stats` unverified-count reminder; `kb list --unverified`
+  (filter, tag, arg, and help text); the `vault-chat` startup "N papers have
+  unverified metadata" line; the webapp's `unverified_count` field in
+  `GET /info` and its header banner (`showUnverifiedBadge`, `#unverified-banner`
+  markup/CSS).
+- The three add-path `meta_inferred` stamping blocks (`kb add`, chat
+  `add_document`, daemon `ingest_pdf`) and the field itself from
+  `resolve_pdf_metadata`'s return value.
+
+### Changed
+
+- `update_paper_metadata` (`store.py`), `kb set-meta`, and the
+  `update_document_metadata` chat tool are unchanged in behaviour — still the
+  way to correct a paper's title/authors/doi metadata-only, no re-embedding —
+  just without the now-gone flag to clear.
+
+## Daemon job logging states next-run time
+
+`jarvis-sync`'s log used to be flooded with APScheduler's own "Added job ...
+to job store default" noise at startup, and gave no indication of when a job
+would actually run next — you had to read the schedule config and do the
+arithmetic yourself.
+
+### Added
+
+- `main()` sets `logging.getLogger("apscheduler")` to `WARNING`, silencing
+  APScheduler's own startup noise.
+- After building the scheduler, one `job <id>: next run at <time>` line is
+  logged per job (`_log_next_run_times`), computed via
+  `job.trigger.get_next_fire_time(None, now)` since `job.next_run_time` stays
+  `None` until `BlockingScheduler.start()` is actually running.
+- A `EVENT_JOB_EXECUTED` / `EVENT_JOB_ERROR` listener (`_log_job_outcome`)
+  logs `job <id> finished — next run at <time>` after every run, so the
+  running log always answers "when will it run next" without cross-checking
+  the schedule by hand.
+- `ingest_pdf` now logs one line per successfully added/updated inbox PDF
+  with its stored title, authors, doi, and source filename — the sync log
+  shows exactly what metadata ended up in the KB for each ingested paper.
+
+## Webapp papers manager
+
+There was previously no way to review or fix a paper's metadata from the
+webapp — only the LLM's own `update_document_metadata`/`remove_document`
+tools, both requiring a chat round trip. A new ⋮ menu → "Papers…" modal lists
+every indexed paper, searchable, with inline metadata editing and removal.
+
+### Added
+
+- `GET /papers?q=<search>`, `POST /papers/meta`, and `POST /papers/remove`
+  (`jarvis/webapp/app.py`). The list route wraps `list_papers` (now sorted
+  most-recent-first, with its default `limit` raised from 50 so a
+  single-user KB is never silently truncated) and applies an optional
+  case-insensitive substring filter over title/authors/doi/source. The meta
+  route wraps `update_paper_metadata` (metadata-only, no re-embedding); the
+  remove route builds the same `{ids, title, doc_type, source}` action
+  `remove_document` does and hands it to the existing `execute_remove()` —
+  **chunks only, never a file on disk**. `/papers/remove` skips the
+  token-confirmed `/confirm-action` flow entirely: it is human-only by
+  construction, since no chat tool references it and the model has no way to
+  reach it.
+- Frontend: a "Papers…" entry in the header menu opens a modal (same
+  open/prefill/close pattern as the response-style modal) with a debounced
+  search box and a scrollable table. Each row supports inline Edit (title/
+  authors/doi become inputs, Save posts `/papers/meta` and re-renders the
+  row) and Remove (a two-step in-modal confirmation stating the "Database
+  entry only — files on disk are never touched by jarvis: `<path>`"
+  invariant verbatim before the explicit Confirm posts `/papers/remove`).
+- `tests/test_webapp_papers.py`: route coverage against a real ChromaDB
+  store — listing, `q=` filtering (title/authors/doi/source), metadata
+  update (only the given fields change) and its 404, removal and its 404,
+  plus a regression pinning that `/papers/remove` never invokes
+  `pathlib.Path.unlink` or `os.remove` (spied via monkeypatch) — the same
+  "database entry only" invariant enforced everywhere else in the codebase.
+
+## Diagnosable validation errors
+
+A stale browser tab still running pre-upgrade JavaScript posted the old
+`/chat` shape (no `session_id`), got a 422, and surfaced as
+`Request failed: [object Object]` with nothing in any log — the rejection
+happened before any route body ran, so chat.log never saw it.
+
+### Added
+
+- A `RequestValidationError` handler logs every 422 (method, path, field
+  errors) to the vault-chat logger before returning FastAPI's standard
+  detail shape, so schema-mismatch requests are diagnosable from chat.log.
+- The frontend renders error `detail` of any shape readably
+  (`errorDetail()` flattens FastAPI's validation-error list into
+  `body.session_id: Field required` instead of `[object Object]`).
+- README: hard-reload an already-open webapp tab after upgrading jarvis.
+
+## Stale-handle diagnosis after `kb reindex`
+
+`kb reindex` swaps in a rebuilt collection with a new UUID, so any jarvis
+process that was already running (webapp, jarvis-sync, vault-chat) is left
+holding a handle to the deleted collection — and every KB operation then
+failed with the cryptic `Collection [<uuid>] does not exist`.
+
+### Added
+
+- Store errors are now routed through a shared diagnosis (`_diagnose_kb_error`):
+  the "Collection … does not exist" signature raises `KBCorruptionError` with
+  a message naming the actual fix (restart the process — nothing is lost),
+  alongside the existing "Error finding id" → `kb reindex` corruption
+  diagnosis. Applied on both the search and add-documents paths.
+- `kb reindex` now ends by warning that already-running jarvis processes hold
+  a stale handle and need a restart.
+
+---
+
+## [previous] — chunk-first retrieval; PDF notes removed; model config relocation + sync logging; skills as folders
+
+The chat agent used to truncate every search hit to 300 characters and had no
+way to read a stored document except `read_file`, which only opens vault
+Markdown — so a question needing more than a snippet forced either a
+speculative `read_file` call (which fails outright on PDFs) or a guess from
+the truncated text.
+
+### Changed
+
+- **`_retrieve_papers` and `_search_notes` no longer truncate hits.** Each
+  result now shows the full chunk text (chunks are ≤1024 chars by
+  construction, and the existing `n_results` clamp of 20 still bounds the
+  reply size) plus a `Section:` line when the chunk carries a markdown
+  header breadcrumb. `_search_chat_history` keeps its 300-char truncation —
+  those results are recall cues, not answer material, and are left alone.
+- **`read_file`'s description** now says it reads one vault Markdown file and
+  cannot open PDFs, pointing to the new `get_document` tool instead of
+  claiming to return "the whole document."
+- **`retrieve_papers`'s description** now notes that hits include the full
+  matching passage — usually enough to answer from directly.
+- **The system prompt's querying workflow** now reads: search first and
+  answer from the full-text hits when they suffice; if not, refine the query
+  and search again, or call `get_document(source)` to read the whole stored
+  document page by page; `read_file` is only for vault text files found by
+  `search_notes` and must never be called speculatively (neither must
+  `get_document`). Anyone with a `~/.jarvis/system_prompt.md` override keeps
+  their existing prompt text — this rewrite only touches the built-in default.
+
+### Added
+
+- **`get_document_chunks(source, store=None)`** (`jarvis/kb/store.py`):
+  fetches every chunk sharing a source and returns them in reading order —
+  body chunks first (by `chunk_index`), then annotation/figure chunks
+  (identified by the `annotation_kind` metadata key). Returns `[]` for an
+  unknown source, mirroring `update_file_path`.
+- **`get_document` chat tool** (`source`, `page` — 1-based, default 1): pages
+  through a document's stored chunks 15 at a time (~4K tokens), works for
+  everything indexed including PDFs. Header format: `"<title>" — chunks
+  1–15 of 87 (page 1 of 6). Call get_document(source, page=2) for more.`
+  Privacy mirrors `read_file` exactly — under Anthropic, any private chunk
+  raises `PrivacyError` before any content (even a title or length hint) is
+  returned; under Ollama the call succeeds and flags the session private.
+  A `storage_mode="summary"` document gets an appended note that the full
+  text isn't in the KB (re-add with `mode='full_text'` for that). Wired into
+  `_dispatch_tool`'s existing privacy/`RETRIEVED DATA`-wrapping tuple
+  alongside `read_file`/`retrieve_papers`/`search_notes` — no other changes
+  needed in the webapp or either provider.
+
+### Rejected
+
+- Automatic neighbor-chunk expansion on a search hit — over-engineering for
+  a single-user app. The agentic search → `get_document` ladder already gets
+  the model surrounding context transparently, one tool call at a time.
+
+### Tests
+
+- `tests/test_store.py`: `get_document_chunks` orders body chunks before
+  annotation/figure chunks; unknown source returns `[]`.
+- `tests/test_privacy_guard.py`: `get_document` — public doc fine under
+  Anthropic; a private source hard-stops with `PrivacyError` and no content
+  leak; the local provider reads it and reports `saw_private=True`.
+- New `tests/test_chat_tools.py`: `_retrieve_papers`/`_search_notes` return
+  text beyond the old 300-char cutoff and include the `Section:` breadcrumb;
+  `get_document` pagination (22 chunks → page 1 of 2 / page 2 of 2, correct
+  chunk ranges); unknown-source message; the `storage_mode="summary"`
+  honesty note; and `_dispatch_tool("get_document", ...)` wraps output in
+  the `RETRIEVED DATA` markers and flags a session private on a local-provider
+  private hit, exactly like the other retrieval tools.
+
+---
+
+### PDF notes removed — local PDFs are always public papers
+
+Local PDFs could previously be added as either a `"paper"` or a `"note"`
+(`--doc-type`/`--visibility`), and a note-type PDF was the only supported way
+to index a *private* local document. This split the "local PDF" concept
+across two `doc_type` values with different storage rules (notes were always
+full-text, hash-tracked for `refresh_vault`'s Phase 2) for no real benefit —
+private local documents are better served by moving them into the Obsidian
+vault, which already has first-class privacy handling. Decision: **local PDFs
+are now always public papers**; notes come exclusively from the vault's
+`.md` files.
+
+#### Changed
+
+- **`kb add <pdf>`, the chat `add_document` tool, and the daemon's inbox
+  ingest** no longer accept a `doc_type`/`visibility` choice for local PDFs —
+  every local PDF is unconditionally indexed as `doc_type="paper"`,
+  `visibility="public"`. The `--doc-type`/`--visibility` CLI flags are gone;
+  the chat tool's schema dropped the matching properties.
+- **`resolve_pdf_metadata()`** (`jarvis/kb/metadata.py`) dropped its
+  `provider_str`/`doc_type`/`visibility` parameters along with the
+  private-note-skips-inference guard they gated — inference always runs now,
+  since a local PDF can never be private.
+- **`index-vault --force`** now clears every indexed note chunk. The filter
+  that used to spare PDF-note chunks (identified by an absolute `.pdf`
+  `file_path`) from the clear is gone along with the PDF-note concept it
+  protected.
+- **`kb stats`'s legacy-private-paper warning** now suggests moving the
+  paper's content into the vault as a note (rather than re-adding it with
+  `--doc-type note`, which no longer exists).
+
+#### Removed
+
+- `refresh_vault`'s Phase 2 (`jarvis/kb/store.py`) — the pass that tracked
+  local PDF notes by absolute `file_path`, warning if the file went missing
+  and re-converting it on a byte-hash change. PDF notes no longer exist, so
+  there is nothing left for it to track.
+- `_caption_figures_for_note` (`jarvis/kb/store.py`) — only called from the
+  now-removed Phase 2.
+- Phase 1's `.pdf` skip filter — it existed solely to hand PDF notes off to
+  Phase 2 without them being misread as a deleted vault file; with Phase 2
+  gone, Phase 1 now treats every `doc_type="note"` chunk's `file_path`
+  uniformly.
+
+#### Added — `kb doctor` legacy PDF-note migration
+
+Existing knowledge bases may still hold `doc_type="note"` chunks with an
+absolute `.pdf` `file_path`, added before this change. `kb doctor` now finds
+them (`find_pdf_notes()`) after its health checks pass:
+
+- **Public** legacy PDF notes are listed, then a single `y/N` prompt
+  reclassifies all of them to `doc_type="paper"` in one pass
+  (`reclassify_notes_as_papers()`) — only `doc_type` changes;
+  `content_hash`/`storage_mode`/`file_path` are left exactly as they were, so
+  the result has the same shape a daemon-ingested paper carries.
+- **Private** legacy PDF notes are never silently made public. `kb doctor`
+  only lists them, with two resolutions: `kb remove <source>` then re-add
+  the PDF as a public paper, or move its content into the vault as a private
+  `.md` note. It keeps reporting them, unprompted, until one of those is done.
+
+**Upgrade note:** if `kb doctor` reports legacy PDF notes, resolve them
+before relying on `index-vault --force` — an un-migrated private PDF note is
+just a `doc_type="note"` chunk like any other, so `--force` (which clears
+every note chunk) will remove it same as a deleted vault file.
+
+#### Tests
+
+- `tests/test_metadata.py`: `resolve_pdf_metadata` signature change; the
+  private-note-skips-inference test removed (nothing left to skip).
+- `tests/test_store.py`: `test_refresh_vault_preserves_pdf_notes` removed
+  (the bug it regression-tested no longer has a code path); new coverage for
+  `find_pdf_notes` (ignores vault `.md` notes, groups a legacy PDF note's
+  chunks by source) and `reclassify_notes_as_papers` (flips only `doc_type`,
+  no-op on an empty source list).
+- `tests/test_kb_cli.py`: new `_check_legacy_pdf_notes` coverage — a public
+  legacy PDF note reclassifies on `y`, stays a note on `n`; a private one is
+  only listed (the reclassify prompt is never shown for it); an empty store
+  prints nothing.
+- `tests/test_privacy_guard.py`: removed the two `_add_document` invariant
+  tests (`doc_type='paper'`+`visibility='private'` rejection, and the
+  private-note-PDF allow path) — both exercised code paths that no longer
+  exist.
+- `tests/test_reingest_replace.py`: dropped the now-nonexistent
+  `doc_type`/`visibility` fields from the CLI args helper and the chat
+  `_add_document` call in the same-title-different-source test.
+
+### Model config relocation + sync daemon LLM logging
+
+`anthropic_model` lived under `[digest]`, which was misleading — it is the
+model used for chat too whenever `provider = "anthropic"`, and for the
+digest pipeline regardless of `[chat] provider`. It now lives under `[chat]`
+next to `provider`/`ollama_model`, where the other model-selection keys
+already are.
+
+#### Changed
+
+- **`[chat] anthropic_model`** is now the canonical config key
+  (`jarvis/core/config.py`). A `[digest] anthropic_model` still works as a
+  fallback for existing configs, but `load_config()` prints a one-line
+  warning telling the user to move it — no silent auto-rewrite of the
+  config file. Precedence: env `ANTHROPIC_MODEL` > `[chat]` > `[digest]`.
+  Default value is unchanged (`claude-sonnet-4-6`).
+- **`active_model(cfg)`** (`jarvis/core/llm.py`, next to `make_provider`)
+  returns `cfg.anthropic_model` or `cfg.ollama_model` depending on
+  `cfg.provider` — consolidates the three copies of that conditional that
+  had drifted into `jarvis/chat/chat.py`, `jarvis/webapp/app.py`, and
+  `jarvis/digest/pipeline/run.py` for display purposes.
+- **`jarvis-sync` now logs which LLM it's using.** A startup line names the
+  active provider/model and the embedding model; `run_digest_job` logs the
+  provider/model right before handing off to the pipeline; `ingest_pdf`
+  logs the model performing metadata inference (runs on every
+  added/updated inbox PDF); `_caption_figures` logs the model only when
+  captioning actually fires (figures found and `figure_captions` on). One
+  line per job invocation, nothing logged on a no-op — `sync.log` now
+  answers "which model produced this?" without cross-referencing config.
+
+#### Upgrade note
+
+Move `[digest] anthropic_model` to `[chat] anthropic_model` in
+`~/.jarvis/config.toml`. jarvis keeps reading the old location as a
+fallback and will warn at startup until it's moved.
+
+#### Tests
+
+- `tests/test_config.py`: reading from `[chat]`; `[digest]` fallback still
+  works and prints the warning (`capsys`); `[chat]` wins over `[digest]`
+  with no warning; env wins over both; default when unset.
+- `tests/test_llm.py`: `active_model()` for both providers.
+- `tests/test_daemon.py`: caplog coverage of the digest-job log line and
+  the `ingest_pdf` metadata-inference log line (present on add, absent on
+  the skip path).
+
+### Skills as folders
+
+A skill used to be a single flat `.md` file, which had no room for the
+templates, checklists, or reference material a real procedure often needs.
+
+#### Changed
+
+- **Skill format** (`jarvis/chat/skills.py`): a skill is now a folder,
+  `skills_dir/<name>/SKILL.md`, plus any supporting files the instructions
+  reference (any depth under the folder). The folder name is the skill
+  name, replacing the old filename-stem convention.
+- **Description parsing** now checks SKILL.md's leading `---` frontmatter
+  block for a `description:` key first (a small hand-rolled single-line-value
+  parser — no new dependency), falling back to the first non-empty body
+  line (`#` stripped) exactly as before when there's no frontmatter or no
+  description key.
+- **`read_skill(name, skills_dir, file=None)`** gained the `file` parameter.
+  With no `file`, it returns SKILL.md's content followed by a
+  "Supporting files:" listing (sorted relative paths, `rglob` of the folder
+  minus SKILL.md itself; omitted when there are none). With `file`, it
+  returns that one supporting file's content instead, capped at 64 KB
+  (a clear error string above that size). `file` is untrusted LLM input,
+  so it gets the same rigor as `name`: absolute paths and `..` are rejected
+  outright, then `resolve()` + `relative_to()` confirm the path stays inside
+  the skill folder — this also defeats a supporting file that is a symlink
+  pointing outside it.
+- **`READ_SKILL_TOOL`** (`jarvis/chat/chat.py`) gained the optional `file`
+  parameter, describing it as reading one of the skill's supporting files
+  by the path shown in the "Supporting files:" listing; `_read_skill`
+  passes it through unchanged otherwise.
+
+#### Removed
+
+- **The flat `skills_dir/*.md` format.** No dual-format support — a stray
+  flat file no longer loads. `list_skills` prints a one-line warning per
+  stray file naming the fix, and a folder missing SKILL.md warns and is
+  skipped, rather than either failing silently.
+
+**Upgrade note:** move each existing `skills_dir/x.md` into its own folder
+as `skills_dir/x/SKILL.md` (`mkdir x && mv x.md x/SKILL.md`). Flat files
+left behind print a warning but otherwise stop loading silently.
+
+#### Tests
+
+- `tests/test_skills.py` rewritten for the folder format: frontmatter
+  description parsing, fallback to the first body line, stray-flat-file
+  warning (`capsys`) and skip, folder-without-SKILL.md warning and skip,
+  `read_skill` default output (content + sorted supporting-files listing,
+  omitted when none), `read_skill(file=...)` content, traversal rejection
+  on both `name` and `file` (including a symlink escaping the skill
+  folder), unknown skill/file errors, oversize supporting-file rejection.
+
+## [previous] — webapp chat fixes: crash logging, mid-turn message persistence, stacked confirmations, per-session drafts
+
+Four bugs reported against the webapp's chat flow, all traced to the same
+`run_agent`/`_session` area of `jarvis/webapp/app.py`:
+
+### Fixed
+
+- **Errors weren't logged.** `run_agent` (the background thread each `/chat`
+  call runs) now imports the same `vault-chat` logger `chat.py` already
+  writes `~/.jarvis/logs/chat.log` with. Its `except LLMError` branch calls
+  `log.exception(...)` before building the `⚠️` reply, and a new broad
+  `except Exception` catches anything else (a genuine bug, not an expected
+  provider failure), logs the full traceback, and replies with
+  `⚠️ Internal error: ...` instead of leaving the SSE stream to hang forever
+  with the "Working..." placeholder stuck on screen. Both error branches
+  persist the error turn with `save_session`, so it survives a refresh. Both
+  the reply event and the sentinel that ends the stream now live in a
+  `finally` block, so the browser always gets a terminating response no
+  matter which path the turn took. The CLI's own `except LLMError` in
+  `run_session` (`chat.py`) gained the same `log.exception(...)` call.
+- **A sent question could disappear.** The user's message was only appended
+  to the in-memory `Session` and saved to disk *after* the LLM call
+  returned — switching sessions (or a crash) mid-turn lost it from the
+  sidebar's history until the reply eventually landed back on the original
+  session. `run_agent` now calls `save_session(session)` (no `store=`, so no
+  indexing/prune side effects) immediately after recording the user turn,
+  before the agentic call even starts.
+- **Bulk removal confirmations superseded each other.** `_session`'s single
+  `pending_action` slot has become `pending_actions: {token: action}`. Each
+  confirmation dialog owns its own token; `/confirm-action` pops only that
+  token, so N stacked dialogs (e.g. the model proposing removal of several
+  documents in one turn) are all independently confirmable instead of the
+  next dialog's token clobbering the previous one. The whole dict is cleared
+  on a new `/chat` turn, `POST /sessions/new`, resuming a session, and
+  deleting the active session — an abandoned dialog's token then 409s
+  instead of silently executing later.
+- **The input draft leaked between sessions.** Pure frontend fix:
+  `static/app.js` now keeps a `drafts` map keyed by session id.
+  `switchDraft(newId)` saves the outgoing session's textarea text and loads
+  the incoming session's (or blank), and is called from `resumeSession`,
+  "New chat", and session delete.
+
+### Added
+
+- **Busy state**, to make the message-persistence fix visible in the UI: a
+  new `running_turn` field on `_session` (the id of the session whose turn is
+  currently in flight, or `None`). `/chat` 409s ("a reply is still being
+  generated — wait for it to finish") if a turn is already running;
+  `DELETE /sessions/{id}` 409s on the busy session; `GET /sessions` returns
+  `busy` (the running session's id or `null`); `POST /sessions/{id}/resume`
+  returns `busy: bool` for that session. The frontend's `resumeSession` shows
+  a "Working..." placeholder and polls `/sessions` every ~2 s (guarded by a
+  generation counter, bumped only on a successful resume, so a stale poll
+  from an earlier resume can't overwrite a conversation the user has since
+  switched away from again — and a failed resume doesn't kill the previous
+  session's still-legitimate poll) until the busy flag clears, then
+  re-renders from `/history`. Because a mid-turn resume installs a
+  fresh-from-disk session object that the background thread never writes to,
+  `run_agent` re-installs its completed object at the end of the turn
+  (before `running_turn` clears) — otherwise the poll's `/history` fetch
+  would render the stale copy and the reply, though saved, would never
+  appear on screen.
+
+### Tests
+
+- `tests/test_security.py`: the single-slot `pending_action` tests rewritten
+  for the dict — two stacked tokens independently confirmable, cancel pops
+  only its own token, an unknown/cleared token 409s without disturbing the
+  rest of the dict, and `/sessions/new`/resume both clear the dict.
+- New `tests/test_webapp_chat.py`: a real `Session` plus a fake provider
+  wired into `/chat` via `TestClient` (no live LLM) covers the
+  save→turn→save ordering (the user message is present at the *first* save),
+  the busy guard (second `/chat` 409, delete-busy 409, `/sessions` reports
+  `busy`, `running_turn` clears once the turn drains), the crash path (an
+  uncaught exception still yields a reply event, the stream still
+  terminates, `caplog` sees an `ERROR` record with a traceback, and the
+  error turn is saved), the `LLMError` path (`⚠️` reply, logged, session
+  saved), and the mid-turn resume regression (a blocked turn's completed
+  session object is re-installed over a fresh copy swapped in while it ran,
+  so `/history` serves the finished reply).
+
+Bug 8 (draft leakage) is frontend-only with no JS test harness in this repo —
+verified manually; see `docs/TESTING.md`.
+
+## [previous] — restructure into a single `jarvis` package
 
 **Run `uv sync` after pulling this change** — the installed package name is
 unchanged (`jarvis`), but every module's dotted path has moved; a stale

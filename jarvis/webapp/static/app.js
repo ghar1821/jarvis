@@ -5,33 +5,71 @@ const sessionList  = document.getElementById('session-list');
 
 let providerKind = '';  // 'ollama' | 'anthropic' — used to grey out unresumable sessions
 
+// Per-session input drafts — keyed by session id, so switching sessions (or
+// starting/deleting one) never leaks half-typed text into the wrong chat.
+// activeSessionId tracks whose draft the textarea currently holds.
+const drafts = {};
+let activeSessionId = null;
+
+// Bumped on every resumeSession call; a busy-poll loop started by an earlier
+// resume checks its own snapshot against the current value and stops once
+// it no longer matches, so a stale poll can't overwrite a conversation the
+// user has since switched away from again.
+let resumeGeneration = 0;
+
+// Session ids the server reports as mid-turn (from /sessions' `busy` list),
+// refreshed by every loadSessions() call.
+let serverBusy = [];
+// Session ids with a /chat request in flight from THIS browser tab. Covers
+// the gap between clicking Send and the server registering the turn in its
+// own "running" registry (loadSessions hasn't necessarily run yet), and is
+// what the composer's disabled state is keyed on — per session, not global,
+// so sending in one session never locks another session's composer.
+const inFlight = new Set();
+
+// FastAPI's `detail` is a plain string for HTTPExceptions but a LIST of
+// error objects for 422 validation failures — rendering that raw gives the
+// useless "[object Object]". Flatten whatever shape arrives into a readable
+// sentence, falling back to the raw JSON rather than ever hiding the cause.
+function errorDetail(body, fallback) {
+  const detail = body && body.detail;
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((e) => (e && e.msg ? `${(e.loc || []).join('.')}: ${e.msg}` : JSON.stringify(e)));
+    return parts.join('; ') || fallback;
+  }
+  return JSON.stringify(detail);
+}
+
+// The composer (send button) is only disabled for the session currently
+// being viewed — a turn running in some other session must never affect it.
+function updateComposerState() {
+  sendBtn.disabled = inFlight.has(activeSessionId) || serverBusy.includes(activeSessionId);
+}
+
+// Saves the outgoing session's textarea content as its draft, then loads
+// the incoming session's draft (or blank) into the textarea.
+function switchDraft(newId) {
+  if (activeSessionId !== null) drafts[activeSessionId] = inputEl.value;
+  activeSessionId = newId;
+  inputEl.value = drafts[newId] || '';
+  resizeInput();
+  updateComposerState();
+}
+
 // ── Startup ──────────────────────────────────────────────────────────────
 
 // Show provider and vault path in the header
 fetch('/info')
   .then(r => r.json())
-  .then(({ provider, provider_kind, vault, unverified_count }) => {
+  .then(({ provider, provider_kind, vault }) => {
     providerKind = provider_kind;
     document.getElementById('header-text').textContent =
       `Jarvis  ·  ${provider}  ·  ${vault}`;
-    if (unverified_count > 0) showUnverifiedBadge(unverified_count);
     loadSessions();
   });
-
-// Dismissible reminder that some papers' title/authors/DOI were auto-inferred
-// and haven't been checked by a human yet (see kb set-meta / update_document_metadata).
-function showUnverifiedBadge(count) {
-  const header = document.getElementById('header');
-  const banner = document.createElement('div');
-  banner.id = 'unverified-banner';
-  banner.textContent = `${count} paper(s) have unverified metadata — ask me to review them.`;
-  const dismiss = document.createElement('button');
-  dismiss.textContent = '×';
-  dismiss.setAttribute('aria-label', 'Dismiss');
-  dismiss.addEventListener('click', () => banner.remove());
-  banner.appendChild(dismiss);
-  header.insertAdjacentElement('afterend', banner);
-}
 
 // Restore conversation history so a page refresh doesn't lose context
 fetch('/history')
@@ -331,6 +369,7 @@ function renderTurn(turn) {
   div.appendChild(bubble);
 
   msgContainer.appendChild(div);
+  return div;
 }
 
 function scrollToBottom() {
@@ -349,12 +388,17 @@ function isResumable(session) {
 }
 
 async function loadSessions() {
-  const { active, sessions } = await (await fetch('/sessions')).json();
+  const { active, sessions, busy } = await (await fetch('/sessions')).json();
+  serverBusy = busy;
+  // First call of the page load: there's no draft to save yet, just adopt
+  // whatever session the backend already has active.
+  if (activeSessionId === null) activeSessionId = active;
   sessionList.replaceChildren();
   for (const session of sessions) {
     const item = document.createElement('div');
     item.className = 'session-item';
     if (session.id === active) item.classList.add('active');
+    if (busy.includes(session.id)) item.classList.add('busy');
     const resumable = isResumable(session);
     if (!resumable && session.id !== active) item.classList.add('unresumable');
 
@@ -411,8 +455,17 @@ async function loadSessions() {
     delBtn.addEventListener('click', async e => {
       e.stopPropagation();
       if (!confirm(`Delete session "${session.title || session.id}"?`)) return;
-      await fetch(`/sessions/${session.id}`, { method: 'DELETE' });
-      if (session.id === active) msgContainer.replaceChildren();
+      const response = await fetch(`/sessions/${session.id}`, { method: 'DELETE' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(errorDetail(body, `Could not delete session (${response.status})`));
+        return;
+      }
+      delete drafts[session.id]; // the deleted session's draft has nowhere to go
+      if (session.id === active) {
+        msgContainer.replaceChildren();
+        switchDraft(body.active); // backend already swapped in a fresh session
+      }
       loadSessions();
     });
     item.appendChild(delBtn);
@@ -422,25 +475,75 @@ async function loadSessions() {
     }
     sessionList.appendChild(item);
   }
+  updateComposerState(); // the active session's busy state may have just changed
 }
 
 async function resumeSession(id) {
   const response = await fetch(`/sessions/${id}/resume`, { method: 'POST' });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    alert(body.detail || `Could not resume session (${response.status})`);
+    alert(errorDetail(body, `Could not resume session (${response.status})`));
     return;
   }
-  const { display, kb_only } = await response.json();
+
+  // Bump the generation counter only now that the resume actually happened —
+  // any poll loop left over from an earlier resume stops as soon as it next
+  // checks, while a FAILED resume (which leaves the view on the previous
+  // session) keeps that session's still-legitimate poll alive.
+  const generation = ++resumeGeneration;
+  const { display, kb_only, busy } = await response.json();
+  switchDraft(id);
   document.getElementById('ai-toggle').checked = kb_only;
   msgContainer.replaceChildren();
   display.forEach(renderTurn);
+
+  if (busy) {
+    // This session's own turn is still running (e.g. we switched away mid-turn
+    // and have now switched back) — show a placeholder and poll until it lands.
+    renderWorkingPlaceholder();
+    pollUntilTurnLands(id, generation);
+  }
+
   scrollToBottom();
   loadSessions();
 }
 
+// Builds the same "Working..." placeholder sendMessage shows while a turn is
+// in flight, for the case where we're resuming into a turn already running.
+function renderWorkingPlaceholder() {
+  const div = document.createElement('div');
+  div.className = 'turn assistant';
+  const thinkingEl = document.createElement('div');
+  thinkingEl.className = 'thinking';
+  thinkingEl.textContent = 'Working...';
+  div.appendChild(thinkingEl);
+  msgContainer.appendChild(div);
+}
+
+// Polls /sessions every ~2s until `id` is no longer in the busy list, then
+// re-renders the conversation from /history so the finished reply (and any
+// tool-call detail recorded along the way) appears. `generation` is this
+// resume's snapshot of resumeGeneration — if the user has since resumed or
+// switched sessions again, it no longer matches and this loop quietly stops.
+function pollUntilTurnLands(id, generation) {
+  setTimeout(async () => {
+    if (generation !== resumeGeneration) return;
+    const { busy } = await (await fetch('/sessions')).json();
+    if (busy.includes(id)) {
+      pollUntilTurnLands(id, generation);
+      return;
+    }
+    if (generation !== resumeGeneration) return;
+    const history = await (await fetch('/history')).json();
+    msgContainer.replaceChildren();
+    history.forEach(renderTurn);
+    scrollToBottom();
+  }, 2000);
+}
+
 document.getElementById('new-chat-btn').addEventListener('click', async () => {
-  await fetch('/sessions/new', { method: 'POST' });
+  const { id } = await (await fetch('/sessions/new', { method: 'POST' })).json();
+  switchDraft(id);
   msgContainer.replaceChildren();
   loadSessions();
   inputEl.focus();
@@ -496,18 +599,249 @@ document.getElementById('style-save').addEventListener('click', async () => {
   closeStyleModal();
 });
 
+// ── Papers manager ───────────────────────────────────────────────────────
+
+const papersMenuItem = document.getElementById('papers-menu-item');
+const papersModal    = document.getElementById('papers-modal');
+const papersSearch   = document.getElementById('papers-search');
+const papersListEl   = document.getElementById('papers-list');
+const papersClose    = document.getElementById('papers-close');
+
+let papersSearchTimer = null;
+
+// Re-fetches the list from the server using whatever is currently in the
+// search box, and re-renders it. Used on open, on (debounced) search input,
+// and after a remove — a save only needs to re-render its own row.
+async function refreshPapersList() {
+  const q = papersSearch.value.trim();
+  const response = await fetch(q ? `/papers?q=${encodeURIComponent(q)}` : '/papers');
+  renderPapersList(await response.json());
+}
+
+function renderPapersList(papers) {
+  papersListEl.replaceChildren();
+  if (papers.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'papers-empty';
+    empty.textContent = 'No papers found.';
+    papersListEl.appendChild(empty);
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'papers-table';
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const label of ['Title', 'Authors', 'DOI', 'Added', 'Mode', '']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const paper of papers) tbody.appendChild(buildPaperRow(paper));
+  table.appendChild(tbody);
+  papersListEl.appendChild(table);
+}
+
+// One row, with three states rendered in place: plain view (default), edit
+// (title/authors/doi become inputs with Save/Cancel), and a two-step remove
+// confirmation (spans the full row, states the "files are never touched"
+// invariant verbatim, and only its own Confirm button posts /papers/remove).
+function buildPaperRow(paper) {
+  const tr = document.createElement('tr');
+
+  function renderView() {
+    tr.replaceChildren();
+    const tdTitle = document.createElement('td');
+    tdTitle.textContent = paper.title || '(untitled)';
+    const tdAuthors = document.createElement('td');
+    tdAuthors.textContent = paper.authors || '';
+    const tdDoi = document.createElement('td');
+    tdDoi.textContent = paper.doi || '';
+    const tdAdded = document.createElement('td');
+    tdAdded.textContent = (paper.date_added || '').slice(0, 10);
+    const tdMode = document.createElement('td');
+    tdMode.textContent = paper.storage_mode || '';
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'papers-actions';
+    const editBtn = document.createElement('button');
+    editBtn.className = 'papers-btn';
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', renderEdit);
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'papers-btn';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', renderConfirm);
+    tdActions.append(editBtn, removeBtn);
+
+    tr.append(tdTitle, tdAuthors, tdDoi, tdAdded, tdMode, tdActions);
+  }
+
+  function renderEdit() {
+    tr.replaceChildren();
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.value = paper.title || '';
+    const authorsInput = document.createElement('input');
+    authorsInput.type = 'text';
+    authorsInput.value = paper.authors || '';
+    const doiInput = document.createElement('input');
+    doiInput.type = 'text';
+    doiInput.value = paper.doi || '';
+
+    const tdTitle = document.createElement('td');
+    tdTitle.appendChild(titleInput);
+    const tdAuthors = document.createElement('td');
+    tdAuthors.appendChild(authorsInput);
+    const tdDoi = document.createElement('td');
+    tdDoi.appendChild(doiInput);
+    const tdAdded = document.createElement('td');
+    tdAdded.textContent = (paper.date_added || '').slice(0, 10);
+    const tdMode = document.createElement('td');
+    tdMode.textContent = paper.storage_mode || '';
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'papers-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'papers-btn';
+    saveBtn.textContent = 'Save';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'papers-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.background = '#888';
+    cancelBtn.addEventListener('click', renderView);
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = cancelBtn.disabled = true;
+      const response = await fetch('/papers/meta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: paper.source,
+          title: titleInput.value,
+          authors: authorsInput.value,
+          doi: doiInput.value,
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        alert(errorDetail(body, `Could not save (${response.status})`));
+        saveBtn.disabled = cancelBtn.disabled = false;
+        return;
+      }
+      paper.title = titleInput.value;
+      paper.authors = authorsInput.value;
+      paper.doi = doiInput.value;
+      renderView();
+    });
+    tdActions.append(saveBtn, cancelBtn);
+
+    tr.append(tdTitle, tdAuthors, tdDoi, tdAdded, tdMode, tdActions);
+  }
+
+  function renderConfirm() {
+    tr.replaceChildren();
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.className = 'papers-confirm';
+
+    const prompt = document.createElement('div');
+    prompt.textContent = `Remove "${paper.title || paper.source}" from the knowledge base?`;
+    const invariant = document.createElement('div');
+    invariant.className = 'file-fate-line';
+    // Verbatim invariant line — a paper without a local file_path (an
+    // arXiv/DOI-only entry) falls back to its source URL, which is exactly
+    // what "the path" means for that entry.
+    invariant.textContent =
+      `Database entry only — files on disk are never touched by jarvis: ${paper.file_path || paper.source}`;
+    td.append(prompt, invariant);
+
+    const buttonRow = document.createElement('div');
+    buttonRow.className = 'papers-confirm-actions';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'papers-btn';
+    confirmBtn.textContent = 'Confirm removal';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'papers-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.background = '#888';
+    cancelBtn.addEventListener('click', renderView);
+    confirmBtn.addEventListener('click', async () => {
+      confirmBtn.disabled = cancelBtn.disabled = true;
+      const response = await fetch('/papers/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: paper.source }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        alert(errorDetail(body, `Could not remove (${response.status})`));
+        renderView();
+        return;
+      }
+      refreshPapersList();
+    });
+    buttonRow.append(confirmBtn, cancelBtn);
+    td.appendChild(buttonRow);
+    tr.appendChild(td);
+  }
+
+  renderView();
+  return tr;
+}
+
+function openPapersModal() {
+  headerMenu.classList.add('hidden');
+  papersSearch.value = '';
+  papersModal.classList.remove('hidden');
+  refreshPapersList();
+  papersSearch.focus();
+}
+
+function closePapersModal() {
+  papersModal.classList.add('hidden');
+}
+
+papersMenuItem.addEventListener('click', openPapersModal);
+papersClose.addEventListener('click', closePapersModal);
+papersModal.querySelector('.modal-backdrop').addEventListener('click', closePapersModal);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !papersModal.classList.contains('hidden')) closePapersModal();
+});
+
+// Debounced: re-fetches from the server a moment after typing stops, rather
+// than on every keystroke.
+papersSearch.addEventListener('input', () => {
+  clearTimeout(papersSearchTimer);
+  papersSearchTimer = setTimeout(refreshPapersList, 300);
+});
+
 // ── Send ─────────────────────────────────────────────────────────────────
 
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
+  // Enter bypasses the button's disabled attribute (it calls sendMessage
+  // directly), so re-check here — this is what actually blocks a same-
+  // session double-send; a different session is never blocked by this.
+  if (inFlight.has(activeSessionId) || serverBusy.includes(activeSessionId)) return;
+
+  // Captured up front: this request is addressed to whichever session was
+  // active when Send was clicked, and stays addressed to it even if the
+  // user switches to another session (or starts another send there) before
+  // this one's reply arrives — true parallel sessions means the composer is
+  // never globally locked.
+  const sessionId = activeSessionId;
+  const stillViewing = () => activeSessionId === sessionId;
 
   inputEl.value = '';
   resizeInput();
-  sendBtn.disabled = true;
+  inFlight.add(sessionId);
+  updateComposerState();
 
   // User message appears immediately
-  renderTurn({ role: 'user', content: text });
+  const userDiv = renderTurn({ role: 'user', content: text });
   scrollToBottom();
 
   // Build the assistant placeholder — filled in as SSE events arrive
@@ -529,6 +863,7 @@ async function sendMessage() {
   scrollToBottom();
 
   let toolCallCount = 0;
+  let loadedSessionsYet = false;
 
   // POST to /chat; read the response body as a stream of SSE lines.
   // (EventSource only supports GET, so we use fetch + ReadableStream instead.)
@@ -538,9 +873,12 @@ async function sendMessage() {
     const response = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, session_id: sessionId }),
     });
-    if (!response.ok) throw new Error(`server returned ${response.status}`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(errorDetail(body, `server returned ${response.status}`));
+    }
 
     const reader  = response.body.getReader();
     const decoder = new TextDecoder();
@@ -558,10 +896,22 @@ async function sendMessage() {
         if (!line.startsWith('data: ')) continue;
         const event = JSON.parse(line.slice(6));
 
+        if (!loadedSessionsYet) {
+          // A brand-new session's file now exists on disk (the early save
+          // in run_agent already landed by the time any event arrives) —
+          // show it in the sidebar as soon as possible rather than waiting
+          // for the whole turn to finish.
+          loadedSessionsYet = true;
+          loadSessions();
+        }
+
         if (event.type === 'confirm') {
           // The model requested a deletion; only these buttons can execute it.
+          // assistantDiv/thinkingEl may be detached from the DOM by now (the
+          // user switched to another session), in which case this update is
+          // simply invisible — harmless.
           renderConfirmDialog(event.description, event.token, assistantDiv, thinkingEl);
-          scrollToBottom();
+          if (stillViewing()) scrollToBottom();
 
         } else if (event.type === 'tool') {
           if (event.name === 'use_own_knowledge') {
@@ -581,7 +931,7 @@ async function sendMessage() {
             toolDetails.appendChild(pre);
             toolSummary.textContent = `${toolCallCount} tool call(s)`;
           }
-          scrollToBottom();
+          if (stillViewing()) scrollToBottom();
 
         } else if (event.type === 'reply') {
           // Replace the placeholder with the finished response
@@ -591,21 +941,42 @@ async function sendMessage() {
           }
           const bubble = buildAssistantBubble(event.content);
           assistantDiv.appendChild(bubble);
-          scrollToBottom();
+          if (stillViewing()) scrollToBottom();
           loadSessions(); // title/privacy badge may have just changed
         }
       }
     }
   } catch (err) {
-    thinkingEl.remove();
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble error';
-    bubble.textContent = `⚠️ Request failed: ${err.message}`;
-    assistantDiv.appendChild(bubble);
-    scrollToBottom();
+    // The request itself never landed (network failure, TrustedHost/pydantic
+    // rejection before the turn ever started, etc.) — nothing was recorded,
+    // so roll the optimistic UI back completely rather than leaving an
+    // orphaned user bubble sitting above a dead placeholder.
+    userDiv.remove();
+    assistantDiv.remove();
+    if (stillViewing()) {
+      // Still looking at the session this message was for — show the error
+      // inline and hand the typed text back to the live textarea so the
+      // user can just hit Send again.
+      const errorTurn = document.createElement('div');
+      errorTurn.className = 'turn assistant';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble error';
+      bubble.textContent = `⚠️ Request failed: ${err.message}`;
+      errorTurn.appendChild(bubble);
+      msgContainer.appendChild(errorTurn);
+      scrollToBottom();
+      inputEl.value = text;
+      resizeInput();
+    } else {
+      // The user has since switched away from sessionId — there's no
+      // visible composer to restore into, so the text goes back into that
+      // session's draft instead of being silently lost.
+      drafts[sessionId] = text;
+    }
   } finally {
-    sendBtn.disabled = false;
-    inputEl.focus();
+    inFlight.delete(sessionId);
+    updateComposerState();
+    if (stillViewing()) inputEl.focus();
   }
 }
 
@@ -647,12 +1018,12 @@ function renderConfirmDialog(description, token, container, beforeEl) {
     });
     const body = await response.json().catch(() => ({}));
     if (response.status === 409) {
-      text.textContent = body.detail || 'This confirmation was superseded.';
+      text.textContent = errorDetail(body, 'This confirmation was superseded.');
       buttonRow.remove();
       loadSessions();
       return;
     }
-    text.textContent = body.result || body.detail || 'Done.';
+    text.textContent = body.result || errorDetail(body, 'Done.');
     buttonRow.remove();
     loadSessions();
   }

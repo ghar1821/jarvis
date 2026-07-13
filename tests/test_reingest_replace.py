@@ -175,8 +175,8 @@ def test_chat_reingest_same_title_different_source_leaves_other_entry(store, tmp
 
     result = _add_document(
         {
-            "source": str(pdf_path), "doc_type": "paper", "visibility": "public",
-            "mode": "summary", "title": shared_title, "allow_duplicate": True,
+            "source": str(pdf_path), "mode": "summary",
+            "title": shared_title, "allow_duplicate": True,
         },
         _StubProvider(),
     )
@@ -199,8 +199,7 @@ def _cli_args(**overrides):
 
     defaults = dict(
         input="", score=0, track="", title="", authors="", doi="",
-        visibility="public", doc_type="paper", provider="", full_text=False,
-        figures=False,
+        provider="", full_text=False, figures=False,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

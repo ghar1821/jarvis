@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from jarvis.core.errors import PrivacyError
-from jarvis.core.llm import AnthropicProvider, OllamaProvider, make_provider
+from jarvis.core.llm import AnthropicProvider, OllamaProvider, active_model, make_provider
 
 TOOLS = [
     {
@@ -95,6 +95,23 @@ def test_make_provider_dispatches_on_spec():
     assert isinstance(make_provider("anthropic"), AnthropicProvider)
     with pytest.raises(ValueError, match="Unknown provider"):
         make_provider("llamacpp")
+
+
+def test_active_model_picks_provider_appropriate_field():
+    """
+    active_model(cfg) consolidates the "which model are we actually using"
+    conditional: anthropic_model under the anthropic provider, ollama_model
+    otherwise. A bare SimpleNamespace stands in for Config since active_model
+    only reads the three attributes it needs.
+    """
+    anthropic_cfg = SimpleNamespace(
+        provider="anthropic", anthropic_model="claude-sonnet-4-6", ollama_model="qwen3-vl:30b"
+    )
+    ollama_cfg = SimpleNamespace(
+        provider="ollama", anthropic_model="claude-sonnet-4-6", ollama_model="qwen3-vl:30b"
+    )
+    assert active_model(anthropic_cfg) == "claude-sonnet-4-6"
+    assert active_model(ollama_cfg) == "qwen3-vl:30b"
 
 
 # ── Unit: OllamaProvider.agentic_turn ──────────────────────────────────────────

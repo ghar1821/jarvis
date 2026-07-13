@@ -5,8 +5,9 @@ infer_pdf_metadata() reads a PDF's first pages and asks the active provider to
 extract title/authors/DOI in one call; a DOI regex runs first since it is
 cheap and exact when a DOI is actually printed on the page.
 resolve_pdf_metadata() is the policy layer every add-path shares: explicit
-overrides win outright, then the private-note-under-Anthropic privacy guard,
-then inference for whatever is still unset.
+overrides win outright, then inference for whatever is still unset. Local
+PDFs are always public papers, so there is no private-note guard here — that
+machinery lives entirely with vault notes instead.
 
 PDFs are generated in-test via pymupdf (same pattern as
 tests/test_daemon.py::_make_pdf) rather than mocked — cheap and real.
@@ -112,42 +113,22 @@ def test_explicit_overrides_always_win(tmp_path):
     pdf = _make_pdf(tmp_path / "overridden.pdf", "Irrelevant PDF text.")
 
     result = resolve_pdf_metadata(
-        pdf, _ExplodingProvider(), "ollama", doc_type="paper", visibility="public",
+        pdf, _ExplodingProvider(),
         title_override="My Title", authors_override="My Authors", doi_override="10.1/mine",
     )
 
-    assert result == {
-        "title": "My Title", "authors": "My Authors", "doi": "10.1/mine", "meta_inferred": False,
-    }
-
-
-def test_resolve_skips_inference_for_private_note_under_anthropic(tmp_path):
-    """
-    A private note's text must never reach a cloud provider — inference is
-    skipped with a visible warning, not silently attempted and then blocked.
-    """
-    pdf = _make_pdf(tmp_path / "private.pdf", "Confidential lab notebook entry.")
-
-    result = resolve_pdf_metadata(
-        pdf, _ExplodingProvider(), "anthropic", doc_type="note", visibility="private",
-    )
-
-    assert result["meta_inferred"] is False
-    assert result["title"] == ""
+    assert result == {"title": "My Title", "authors": "My Authors", "doi": "10.1/mine"}
 
 
 def test_resolve_runs_inference_for_public_paper_under_anthropic(tmp_path):
     """
-    Papers are always public, so inference under Anthropic is allowed even
-    though the same doc_type/visibility combination would be blocked for a note.
+    Local PDFs are always public papers, so inference is always allowed —
+    there is no private-note guard to skip it, even under Anthropic.
     """
     pdf = _make_pdf(tmp_path / "public_paper.pdf", "A Public Paper\nSome body text.")
     provider = _StubProvider('{"title": "A Public Paper", "authors": "Grace Hopper"}')
 
-    result = resolve_pdf_metadata(
-        pdf, provider, "anthropic", doc_type="paper", visibility="public",
-    )
+    result = resolve_pdf_metadata(pdf, provider)
 
     assert result["title"] == "A Public Paper"
     assert result["authors"] == "Grace Hopper"
-    assert result["meta_inferred"] is True

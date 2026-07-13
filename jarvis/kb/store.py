@@ -19,8 +19,6 @@ Document schema
     title       : str  — display title (optional)
     authors     : str  — comma-separated authors, papers only (optional)
     doi         : str  — DOI for papers, regex/LLM-inferred for local PDFs (optional)
-    meta_inferred: bool — title/authors/doi came from auto-inference and has
-                         not been human-verified yet (papers only, optional)
     score       : int  — relevance score 0-10, papers only (optional)
     track       : str  — research track label, papers only (optional)
     file_path   : str  — vault-relative path for notes, absolute for PDFs (optional)
@@ -110,6 +108,41 @@ def _kb_write_lock():
         finally:
             _write_lock_state.depth = 0
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
+def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
+    """
+    Map a raw ChromaDB failure to the most actionable error we can raise.
+
+    Two failure signatures get a specific diagnosis instead of a generic
+    RAGError, both raised as KBCorruptionError so the chat tools relay the
+    message verbatim and never retry (per the KBCorruptionError contract —
+    both describe persistent state a retry would only hide):
+
+    - "Error finding id": a stale HNSW reference to a deleted chunk — real
+      on-disk corruption; the fix is `kb reindex`.
+    - "Collection [...] does not exist": NOT corruption — `kb reindex` swapped
+      in a rebuilt collection (new UUID) while this process was running, so
+      the process-wide store singleton holds a handle to the deleted one.
+      The fix is simply restarting the process.
+    """
+    text = str(exc)
+    if "Error finding id" in text:
+        return KBCorruptionError(
+            "The knowledge base index is corrupted (a stale reference to a "
+            "deleted chunk id). Fix: run `uv run kb reindex` — this rebuilds "
+            "the index from the chunk texts already stored, so nothing is "
+            "lost. This is not retried automatically; the corruption is "
+            "persistent state, and retrying would only hide it."
+        )
+    if "does not exist" in text and "Collection" in text:
+        return KBCorruptionError(
+            "The knowledge-base collection was rebuilt (by `kb reindex`) while "
+            "this process was running, so its database handle is stale. Fix: "
+            "restart this process (webapp, jarvis-sync, or vault-chat) — "
+            "nothing is lost; the rebuilt knowledge base is intact on disk."
+        )
+    return RAGError(fallback_message)
 
 
 # ── Singletons ────────────────────────────────────────────────────────────────
@@ -287,7 +320,7 @@ def add_texts(
         with _kb_write_lock():
             return s.add_documents(documents)
     except Exception as exc:
-        raise RAGError(f"Failed to add documents: {exc}") from exc
+        raise _diagnose_kb_error(exc, f"Failed to add documents: {exc}") from exc
 
 
 def add_annotations(
@@ -572,8 +605,7 @@ def update_paper_metadata(
     """
     Apply user-verified title/authors/doi to every chunk of a paper, no
     re-embedding. Only the fields the caller passes (not None) are changed.
-    Clears meta_inferred — once a human sets any field, the metadata counts
-    as verified. Returns the chunk count updated.
+    Returns the chunk count updated.
     """
     s = store or get_store()
     try:
@@ -594,7 +626,6 @@ def update_paper_metadata(
             new_meta["authors"] = authors
         if doi is not None:
             new_meta["doi"] = doi
-        new_meta["meta_inferred"] = False
         updated_metadatas.append(new_meta)
 
     try:
@@ -606,17 +637,65 @@ def update_paper_metadata(
     return len(ids)
 
 
-def count_unverified_papers(store: Chroma | None = None) -> int:
-    """Count papers whose metadata came from auto-inference and hasn't been verified."""
+# ── Legacy PDF-note migration (kb doctor) ──────────────────────────────────────
+#
+# Local PDFs are now always public papers — notes come exclusively from the
+# Obsidian vault (.md files). Entries added before that decision may still
+# carry doc_type="note" with an absolute PDF file_path; these two helpers let
+# `kb doctor` find and reclassify them.
+
+
+def find_pdf_notes(store: Chroma | None = None) -> list[dict]:
+    """
+    Find leftover doc_type="note" chunks whose file_path is a local PDF path.
+    Returns one summary dict per distinct source, sorted by source:
+    {"source", "title", "visibility", "chunk_count"}.
+    """
     s = store or get_store()
-    try:
-        result = s._collection.get(
-            where={"$and": [{"doc_type": {"$eq": "paper"}}, {"meta_inferred": {"$eq": True}}]},
-            include=["metadatas"],
-        )
-        return len({m.get("source") for m in result["metadatas"] if m.get("source")})
-    except Exception:
+    result = s._collection.get(where={"doc_type": {"$eq": "note"}}, include=["metadatas"])
+    by_source: dict[str, dict] = {}
+    for meta in result["metadatas"]:
+        file_path = meta.get("file_path", "")
+        if not file_path.lower().endswith(".pdf"):
+            continue
+        source = meta.get("source", file_path)
+        entry = by_source.setdefault(source, {
+            "source": source,
+            "title": meta.get("title", "untitled"),
+            "visibility": meta.get("visibility", "public"),
+            "chunk_count": 0,
+        })
+        entry["chunk_count"] += 1
+    return sorted(by_source.values(), key=lambda entry: entry["source"])
+
+
+def reclassify_notes_as_papers(sources: list[str], store: Chroma | None = None) -> int:
+    """
+    Flip doc_type from "note" to "paper" for every chunk belonging to the
+    given sources — every other field (content_hash, storage_mode, file_path,
+    ...) is left untouched, so the result has the same shape a
+    daemon-ingested paper carries. Private chunks are skipped outright —
+    papers are always public, so that invariant holds here by construction
+    rather than by caller discipline. Returns the number of chunks updated.
+    """
+    if not sources:
         return 0
+    s = store or get_store()
+    result = s._collection.get(where={"source": {"$in": sources}}, include=["metadatas"])
+    ids_to_update = []
+    updated_metadatas = []
+    for chunk_id, meta in zip(result["ids"], result["metadatas"]):
+        if meta.get("visibility") == "private":
+            continue
+        new_meta = dict(meta)
+        new_meta["doc_type"] = "paper"
+        ids_to_update.append(chunk_id)
+        updated_metadatas.append(new_meta)
+    if not ids_to_update:
+        return 0
+    with _kb_write_lock():
+        s._collection.update(ids=ids_to_update, metadatas=updated_metadatas)
+    return len(ids_to_update)
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
@@ -735,15 +814,7 @@ def search(
         else:
             candidates = s.similarity_search(query, k=fetch_k, filter=filter_dict)
     except Exception as exc:
-        if "Error finding id" in str(exc):
-            raise KBCorruptionError(
-                "The knowledge base index is corrupted (a stale reference to a "
-                "deleted chunk id). Fix: run `uv run kb reindex` — this rebuilds "
-                "the index from the chunk texts already stored, so nothing is "
-                "lost. This is not retried automatically; the corruption is "
-                "persistent state, and retrying would only hide it."
-            ) from exc
-        raise RAGError(f"Search failed: {exc}") from exc
+        raise _diagnose_kb_error(exc, f"Search failed: {exc}") from exc
 
     if reranker is None or len(candidates) <= n_results:
         return candidates[:n_results]
@@ -852,6 +923,39 @@ def update_file_path(source: str, new_path: str, store: Chroma | None = None) ->
     return len(ids)
 
 
+def get_document_chunks(source: str, store: Chroma | None = None) -> list[Document]:
+    """
+    Fetch every chunk belonging to one document, in reading order.
+
+    Body chunks come first (sorted by chunk_index), followed by annotation
+    and figure chunks (identified by the presence of annotation_kind
+    metadata, also sorted by chunk_index) — this lets a caller page through
+    the source text before hitting highlights/figure captions. Returns []
+    for an unknown source rather than raising, mirroring update_file_path.
+    """
+    s = store or get_store()
+    try:
+        result = s._collection.get(
+            where={"source": {"$eq": source}}, include=["documents", "metadatas"]
+        )
+    except Exception as exc:
+        raise RAGError(f"Failed to look up source: {exc}") from exc
+
+    chunks = [
+        Document(page_content=text, metadata=meta)
+        for text, meta in zip(result["documents"], result["metadatas"])
+    ]
+    body_chunks = sorted(
+        (doc for doc in chunks if "annotation_kind" not in doc.metadata),
+        key=lambda doc: doc.metadata.get("chunk_index", 0),
+    )
+    annotation_chunks = sorted(
+        (doc for doc in chunks if "annotation_kind" in doc.metadata),
+        key=lambda doc: doc.metadata.get("chunk_index", 0),
+    )
+    return body_chunks + annotation_chunks
+
+
 def update_visibility(file_path: str, new_visibility: str, store: Chroma | None = None) -> int:
     """
     Update the visibility metadata for all chunks of a vault note, without
@@ -910,10 +1014,15 @@ def update_chat_title(session_id: str, new_title: str, store: Chroma | None = No
 
 
 def list_papers(
-    limit: int = 50,
+    limit: int = 10_000,
     store: Chroma | None = None,
 ) -> list[dict]:
-    """Return de-duplicated list of indexed papers as metadata dicts."""
+    """
+    Return de-duplicated list of indexed papers as metadata dicts, most
+    recently added first. The default limit is high enough to return every
+    paper in a single-user KB in one call; callers that want a short preview
+    (e.g. the list_papers chat tool) pass their own smaller limit.
+    """
     s = store or get_store()
     try:
         result = s._collection.get(
@@ -933,10 +1042,9 @@ def list_papers(
         if src not in first_meta:
             first_meta[src] = meta
 
-    papers = []
-    for src, meta in list(first_meta.items())[:limit]:
-        papers.append({**meta, "chunk_count": chunk_counts[src]})
-    return papers
+    papers = [{**meta, "chunk_count": chunk_counts[src]} for src, meta in first_meta.items()]
+    papers.sort(key=lambda p: p.get("date_added", ""), reverse=True)
+    return papers[:limit]
 
 
 # ── Vault indexing ────────────────────────────────────────────────────────────
@@ -984,39 +1092,6 @@ def index_vault_file(
     )
 
 
-def _caption_figures_for_note(
-    pdf_path: Path,
-    visibility: str,
-    title: str,
-    file_path: str,
-    store: Chroma,
-) -> None:
-    """
-    Caption a re-indexed PDF note's figures, building the provider lazily only
-    when the note actually has figures (so text-only notes never pay for a
-    provider construction). The private-note privacy guard lives in add_figures
-    itself. Never raises — a captioning failure must not abort the vault sync.
-    """
-    cfg = get_config()
-    if not cfg.figure_captions:
-        return
-    try:
-        from .images import extract_figures
-
-        if not extract_figures(pdf_path, max_figures=1, min_pixels=cfg.figure_min_pixels):
-            return
-        from jarvis.core.llm import make_provider
-
-        provider = make_provider(cfg.provider)
-        add_figures(
-            pdf_path, doc_type="note", visibility=visibility,
-            source=pdf_path.as_uri(), provider_obj=provider,
-            provider_str=cfg.provider, title=title, file_path=file_path, store=store,
-        )
-    except Exception as exc:
-        print(f"  ⚠️  figure captioning failed for {pdf_path.name}: {exc}", flush=True)
-
-
 def refresh_vault(
     vault_root: Path,
     store: Chroma | None = None,
@@ -1038,10 +1113,7 @@ def refresh_vault(
         indexed: dict[str, tuple[str, str]] = {}
         for meta in result["metadatas"]:
             fp = meta.get("file_path", "")
-            # Skip PDF notes — they have absolute paths and are handled in Phase 2.
-            # Including them here caused them to be incorrectly deleted because
-            # absolute paths never match the relative paths in `current`.
-            if fp and not fp.endswith(".pdf") and fp not in indexed:
+            if fp and fp not in indexed:
                 indexed[fp] = (meta.get("content_hash", ""), meta.get("visibility", "public"))
     except Exception:
         indexed = {}
@@ -1082,77 +1154,5 @@ def refresh_vault(
         if rel_path not in current:
             delete_by_metadata("file_path", rel_path, s)
             deleted += 1
-
-    # ── Phase 2: PDF notes (absolute file paths, doc_type="note") ────────────
-    # Local PDFs added as notes — not scanned from vault_root.
-    # Always full_text. Missing file: warn, leave DB unchanged.
-    # Changed file: delete old chunks, re-convert, re-index, then temp dir cleaned up.
-    try:
-        pdf_result = s._collection.get(
-            where={"doc_type": {"$eq": "note"}},
-            include=["metadatas"],
-        )
-        pdf_notes: dict[str, dict] = {}
-        for meta in pdf_result["metadatas"]:
-            fp = meta.get("file_path", "")
-            if not fp or not fp.endswith(".pdf"):
-                continue
-            # Prefer a body chunk's metadata: annotation chunks carry no
-            # content_hash, and using one here would look like a perpetual
-            # "file changed" signal.
-            existing = pdf_notes.get(fp)
-            if existing is None or (not existing.get("content_hash") and meta.get("content_hash")):
-                pdf_notes[fp] = meta
-    except Exception:
-        pdf_notes = {}
-
-    for abs_path_str, meta in pdf_notes.items():
-        pdf_path = Path(abs_path_str)
-        if not pdf_path.exists():
-            print(f"  ⚠️  PDF note not found (keeping DB entry): {abs_path_str}", flush=True)
-            continue
-        current_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-        if current_hash == meta.get("content_hash", ""):
-            continue
-        from jarvis.core.errors import ConversionError
-        from .convert import pdf_to_markdown
-        print(f"  PDF note changed, re-indexing: {pdf_path.name}", flush=True)
-        delete_by_metadata("file_path", abs_path_str, s)
-        # Annotations first: a scanned PDF whose body can't convert can still
-        # carry highlights worth keeping.
-        note_visibility = meta.get("visibility", "public")
-        note_title = meta.get("title", pdf_path.stem)
-        add_annotations(
-            pdf_path,
-            doc_type="note",
-            visibility=note_visibility,
-            source=pdf_path.as_uri(),
-            title=note_title,
-            file_path=abs_path_str,
-            store=s,
-        )
-        _caption_figures_for_note(pdf_path, note_visibility, note_title, abs_path_str, s)
-        try:
-            full_text = pdf_to_markdown(pdf_path)
-        except ConversionError as exc:
-            # Skip the body but keep the refresh going — one bad file
-            # shouldn't abort the whole vault sync. Without body chunks the
-            # stored hash stays empty, so conversion is retried next refresh.
-            print(f"  ⚠️  {exc}", flush=True)
-            continue
-        add_texts(
-            content=full_text,
-            doc_type="note",
-            visibility=meta.get("visibility", "public"),
-            source=pdf_path.as_uri(),
-            extra_metadata={
-                "title": meta.get("title", pdf_path.stem),
-                "file_path": abs_path_str,
-                "content_hash": current_hash,
-                "storage_mode": "full_text",
-            },
-            store=s,
-        )
-        updated += 1
 
     return added, updated, deleted

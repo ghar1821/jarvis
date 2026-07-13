@@ -154,38 +154,201 @@ def test_webapp_session_id_traversal_rejected():
     assert client.post("/sessions/..%2Fx/resume").status_code == 404
 
 
-def test_confirm_action_requires_matching_token():
-    """A token that doesn't match the pending action 409s and leaves it intact."""
+def test_confirm_action_unknown_token_409s_and_leaves_dict_untouched():
+    """A token that was never issued (or already popped) 409s and touches nothing else."""
     from starlette.testclient import TestClient
 
     import jarvis.webapp.app as appmod
 
-    appmod._session["pending_action"] = {
-        "token": "abc123",
-        "action": {"ids": [], "title": "t", "doc_type": "paper", "source": "s"},
+    appmod._session["pending_actions"] = {
+        "abc123": {
+            "session_id": "some-session",
+            "action": {"ids": [], "title": "t", "doc_type": "paper", "source": "s"},
+        },
     }
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     response = client.post("/confirm-action", json={"confirmed": True, "token": "WRONG"})
     assert response.status_code == 409
-    assert appmod._session["pending_action"] is not None  # not cleared on mismatch
+    # the real pending token is untouched — only the unknown one was rejected
+    assert "abc123" in appmod._session["pending_actions"]
 
 
 def test_confirm_action_matching_token_executes(monkeypatch):
-    """The matching token clears the pending action and executes the removal."""
+    """The matching token pops just that entry and executes the removal."""
     from starlette.testclient import TestClient
 
     import jarvis.webapp.app as appmod
 
     monkeypatch.setattr(appmod, "execute_remove", lambda action, store: f"Removed {action['title']}")
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
-    appmod._session["pending_action"] = {
-        "token": "abc123",
-        "action": {"ids": [], "title": "t", "doc_type": "paper", "source": "s"},
+    appmod._session["pending_actions"] = {
+        "abc123": {
+            "session_id": "some-session",
+            "action": {"ids": [], "title": "t", "doc_type": "paper", "source": "s"},
+        },
     }
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     response = client.post("/confirm-action", json={"confirmed": True, "token": "abc123"})
     assert response.status_code == 200
-    assert appmod._session["pending_action"] is None
+    assert "abc123" not in appmod._session["pending_actions"]
+
+
+def test_two_pending_tokens_independently_confirmable(monkeypatch):
+    """
+    Stacked dialogs (e.g. a bulk removal proposing several documents in one
+    turn) must each be resolvable on their own — confirming one must not
+    supersede or clear the other. No session check applies here: token
+    possession is the capability, regardless of which session either dialog
+    belongs to.
+    """
+    from starlette.testclient import TestClient
+
+    import jarvis.webapp.app as appmod
+
+    monkeypatch.setattr(appmod, "execute_remove", lambda action, store: f"Removed {action['title']}")
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
+    appmod._session["pending_actions"] = {
+        "token-a": {
+            "session_id": "session-a",
+            "action": {"ids": [], "title": "Paper A", "doc_type": "paper", "source": "a"},
+        },
+        "token-b": {
+            "session_id": "session-b",
+            "action": {"ids": [], "title": "Paper B", "doc_type": "paper", "source": "b"},
+        },
+    }
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    response_a = client.post("/confirm-action", json={"confirmed": True, "token": "token-a"})
+    assert response_a.status_code == 200
+    assert response_a.json()["result"] == "Removed Paper A"
+    assert "token-b" in appmod._session["pending_actions"]  # untouched by resolving token-a
+
+    response_b = client.post("/confirm-action", json={"confirmed": True, "token": "token-b"})
+    assert response_b.status_code == 200
+    assert response_b.json()["result"] == "Removed Paper B"
+    assert appmod._session["pending_actions"] == {}
+
+
+def test_cancel_pops_only_its_own_token():
+    """Cancelling one dialog leaves any other pending dialog fully intact."""
+    from starlette.testclient import TestClient
+
+    import jarvis.webapp.app as appmod
+
+    appmod._session["pending_actions"] = {
+        "token-a": {
+            "session_id": "session-a",
+            "action": {"ids": [], "title": "Paper A", "doc_type": "paper", "source": "a"},
+        },
+        "token-b": {
+            "session_id": "session-b",
+            "action": {"ids": [], "title": "Paper B", "doc_type": "paper", "source": "b"},
+        },
+    }
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    response = client.post("/confirm-action", json={"confirmed": False, "token": "token-a"})
+    assert response.status_code == 200
+    assert response.json()["result"] == "Cancelled — nothing was removed."
+    assert "token-a" not in appmod._session["pending_actions"]
+    assert "token-b" in appmod._session["pending_actions"]
+
+
+def test_new_chat_leaves_other_sessions_dialogs_pending(monkeypatch):
+    """
+    /sessions/new only swaps in a fresh session for the browser to look at —
+    it owns no pending_actions tokens of its own, and with true parallel
+    sessions a dialog belonging to any other session (including the outgoing
+    one) must keep working rather than being abandoned.
+    """
+    from starlette.testclient import TestClient
+
+    import jarvis.webapp.app as appmod
+
+    monkeypatch.setattr(appmod, "execute_remove", lambda action, store: f"Removed {action['title']}")
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
+    appmod._session["pending_actions"] = {
+        "stale-token": {"session_id": "some-other-session", "action": {"ids": [], "title": "t"}},
+    }
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/sessions/new")
+    assert response.status_code == 200
+    assert "stale-token" in appmod._session["pending_actions"]
+
+    # Unlike the old single-session model, this token still confirms normally.
+    confirm = client.post("/confirm-action", json={"confirmed": True, "token": "stale-token"})
+    assert confirm.status_code == 200
+    assert confirm.json()["result"] == "Removed t"
+
+
+def test_resume_clears_only_the_resumed_sessions_pending_actions(monkeypatch):
+    """
+    Resuming session S abandons only S's own dialogs left over from before
+    the swap — a dialog belonging to a different session T must survive
+    untouched, since T may itself be mid-turn right now.
+    """
+    from starlette.testclient import TestClient
+
+    import jarvis.webapp.app as appmod
+    from jarvis.chat.sessions import new_session
+
+    session_s = new_session(appmod.cfg.provider)
+    session_s.display.append({"role": "user", "content": "hi"})
+
+    # Stub out the load and the resume-safety check so this test exercises
+    # only the endpoint's pending_actions bookkeeping, not real session I/O.
+    monkeypatch.setattr(appmod, "load_session", lambda session_id: session_s)
+    monkeypatch.setattr(appmod, "check_resume", lambda *a, **k: None)
+    appmod._session["pending_actions"] = {
+        "s-token": {"session_id": session_s.id, "action": {"ids": [], "title": "s"}},
+        "t-token": {"session_id": "session-t", "action": {"ids": [], "title": "t"}},
+    }
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(f"/sessions/{session_s.id}/resume")
+    assert response.status_code == 200
+
+    assert "s-token" not in appmod._session["pending_actions"]
+    assert "t-token" in appmod._session["pending_actions"]
+
+    confirm_s = client.post("/confirm-action", json={"confirmed": True, "token": "s-token"})
+    assert confirm_s.status_code == 409
+
+
+def test_turn_start_clears_only_that_sessions_tokens(monkeypatch):
+    """
+    Starting a new /chat turn on session A clears only A's own stale
+    dialogs — a dialog belonging to session B (which might itself be
+    mid-turn concurrently) must survive untouched.
+    """
+    from starlette.testclient import TestClient
+
+    import jarvis.webapp.app as appmod
+    from jarvis.chat.sessions import new_session
+
+    class _StubProvider:
+        def agentic_turn(self, messages, tools, dispatch_fn, system):
+            return "ok"
+
+    session_a = new_session(appmod.cfg.provider)
+    appmod._session["session"] = session_a
+    appmod._session["running"] = {}
+    appmod._session["provider"] = _StubProvider()
+    monkeypatch.setattr(appmod, "maybe_compact", lambda *a, **k: False)
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: "the-store")
+    appmod._session["pending_actions"] = {
+        "a-token": {"session_id": session_a.id, "action": {"ids": [], "title": "a"}},
+        "b-token": {"session_id": "session-b", "action": {"ids": [], "title": "b"}},
+    }
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/chat", json={"message": "hi", "session_id": session_a.id})
+    assert response.status_code == 200
+
+    assert "a-token" not in appmod._session["pending_actions"]
+    assert "b-token" in appmod._session["pending_actions"]
+
+    appmod._session["running"] = {}  # leave the shared state clean
 
 
 # ── Tool-arg display truncation ─────────────────────────────────────────────────
