@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from jarvis.core import transcript
-from jarvis.core.config import get_config, reset_config, set_config_value
+from jarvis.core.config import CONFIG_FILE, get_config, load_config, reset_config, set_config_value
 from jarvis.core.errors import AuthenticationError, LLMError, PrivacyError
 from jarvis.chat.chat import (
     READ_SKILL_TOOL,
@@ -147,6 +147,23 @@ def _build_tools(kb_only: bool) -> list[dict]:
     if not kb_only:
         tools.append(USE_OWN_KNOWLEDGE_TOOL)
     return tools
+
+
+def _live_config():
+    """
+    Config as the file says right now, not as it said when this process
+    started — so `kb models --refresh` or a hand-edit shows up on the next
+    picker open instead of needing a restart.
+
+    Returned as a local rather than through the process-wide singleton:
+    nothing else should have its config change underneath it mid-turn. A
+    malformed file falls back to what the process started with, so a typo
+    empties nothing.
+    """
+    try:
+        return load_config(CONFIG_FILE)
+    except Exception:
+        return cfg
 
 
 def _provider_for(spec: str):
@@ -306,17 +323,21 @@ async def models_index() -> dict:
     The switchable catalogue for the picker, read from config only — this
     route never touches the network, so opening the UI makes no outbound
     request. Refresh the OpenRouter half with `uv run kb models --refresh`.
+
+    Config is re-read per call (see _live_config), so `kb models --refresh` or
+    a hand-edit shows up on the next open without a restart.
     """
     from jarvis.chat.models import list_catalogue
 
+    live = _live_config()
     session: Session = _session["session"]
-    current = session.model_spec if session else cfg.provider
+    current = session.model_spec if session else live.provider
     return {
         "current": current,
         # A private session may only run locally, so the picker can grey out
         # the cloud entries with a reason instead of failing on click.
         "private": bool(session and session.private),
-        "models": list_catalogue(cfg, current),
+        "models": list_catalogue(live, current),
     }
 
 
@@ -340,7 +361,7 @@ async def model_switch(req: ModelRequest) -> dict:
 
     session = _resolve_session(req.session_id)
     try:
-        spec = apply_switch(session, req.spec, cfg)
+        spec = apply_switch(session, req.spec, _live_config())
     except PrivacyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:

@@ -48,6 +48,66 @@ Found by running the thing against a real, genuinely broken store.
   If a file was affected, restore it from **History**: the clobbering write
   snapshotted first, so the pre-corruption version is there.
 
+### Removed
+
+- **The terminal chat client is gone.** `vault-chat` — `run_session`, the
+  `/model` and `/cost` REPL commands, the terminal confirmation and diff-review
+  prompts, `--list-sessions`/`--resume` — is deleted, along with its entry
+  point. 278 lines out of `chat.py`; the tool layer and the agentic loop the
+  webapp uses are untouched.
+
+  It was a second implementation of the same conversation, and the two had
+  drifted apart in a way that actively misled: the terminal accepted **any**
+  model id, while the webapp picker offered only what `[models]` listed. "How
+  do I switch to `openrouter/auto`" had two different answers depending on
+  which client you were in, and the README documented both.
+
+  So the picker gained a **text box** for any model id the provider accepts,
+  applied to the current conversation without touching config. No capability
+  moved with the removal — the server already treated the catalogue as a
+  convenience list rather than an allowlist, and the privacy rule still refuses
+  a typed cloud model on a private session exactly as it refuses a clicked one.
+
+### Fixed
+
+- **The model picker needed a webapp restart to see a config change.** `GET
+  /models` served the `Config` the process started with, so `kb models
+  --refresh` wrote models nobody could see. Config is now re-read per call
+  (`_live_config`), falling back to the startup config if the file is
+  malformed so a typo empties nothing rather than the picker.
+
+### Documentation
+
+- **`docs/` audited against the code, mechanically rather than by reading.**
+  Checking documented claims against what the modules actually export turned up
+  drift that prose review had missed: the whole `[drafts]` config section (8
+  keys) was absent from the DESIGN configuration reference; the `draft_gc`
+  daemon job was missing from the jobs table although the daemon has registered
+  it since Phase 4; `DELETE /drafts/{draft_id}` was undocumented; the module
+  tree still listed `docs/TODO.md` and `docs/ROADMAP.md` (removed in `ceefe30`)
+  while omitting the entire `jarvis/drafts/` package, `chat/models.py`,
+  `core/transcript.py` and `kb/frontmatter.py`; and TESTING.md still pointed at
+  `test_webapp_papers.py`, renamed in Phase 3.
+
+  TESTING.md also gained "what is not tested" rows for the frontend added this
+  session — editor tabs, inline diff rendering, the file context menu, the
+  model picker's text box — each naming what was verified by hand, since none
+  of it is reachable without a JS harness.
+
+- **The README now gets someone from a clean machine to a working install.**
+  It assumed a config file that jarvis never creates, split the settings across
+  two blocks so neither was copy-pasteable, and had no verification step — so a
+  setup that silently used the defaults looked like a setup that worked. There
+  is now one complete OpenRouter config to copy, the prerequisites, what the
+  first index downloads and why, `kb models` as an offline check that the file
+  was read at all, and a section on running the tests.
+
+  Two tests keep it honest: one extracts the OpenRouter block from README.md
+  and asserts it loads into the config it claims to, so a renamed key cannot
+  silently break the instructions; the other checks every `uv run <command>`
+  the README names is a real entry point. Verified by running the documented
+  sequence end to end against a throwaway HOME.
+
 ### Fixed
 
 - **A removal highlighted more than it removed.** The assistant would say it

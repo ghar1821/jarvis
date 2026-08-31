@@ -45,7 +45,7 @@ def test_kb_stats_failure_is_logged_with_traceback(monkeypatch, caplog, isolated
 
     monkeypatch.setattr("jarvis.kb.store.get_store", broken_get_store)
 
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         result = _kb_stats()
 
     assert result == "[kb_stats error: simulated database failure]"
@@ -62,7 +62,7 @@ def test_list_documents_failure_is_logged(monkeypatch, caplog, isolated_log):
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.list_documents", broken_list_documents)
 
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         result = _list_documents({})
 
     assert result == "[list_documents error: boom]"
@@ -87,7 +87,7 @@ def test_search_kb_relays_corruption_error_verbatim(monkeypatch, caplog, isolate
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.search_with_privacy_check", _broken_search)
 
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         result, saw_private = _search_kb({"query": "anything"}, "ollama")
 
     assert result.startswith("[KNOWLEDGE BASE ERROR")
@@ -101,7 +101,7 @@ def test_search_kb_notes_relays_corruption_error_verbatim(monkeypatch, caplog, i
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.search_with_privacy_check", _broken_search)
 
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         result, saw_private = _search_kb({"kinds": ["notes"], "query": "anything"}, "ollama")
 
     assert result.startswith("[KNOWLEDGE BASE ERROR")
@@ -115,7 +115,7 @@ def test_search_chat_history_relays_corruption_error_verbatim(monkeypatch, caplo
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.search_with_privacy_check", _broken_search)
 
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         result = _search_chat_history({"query": "anything"}, "ollama")
 
     assert result.startswith("[KNOWLEDGE BASE ERROR")

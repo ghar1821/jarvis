@@ -11,6 +11,8 @@ All tests call load_config() with an explicit config_file path so the real
 any environment variables changed during a test.
 """
 
+from pathlib import Path
+
 import pytest
 
 from jarvis.core.config import load_config
@@ -329,3 +331,51 @@ def test_digest_enabled_read_from_digest_section(tmp_path):
 
     config_file.write_text('[digest]\nenabled = false\n')
     assert load_config(config_file).digest_enabled is False
+
+
+# ── The README's setup instructions ───────────────────────────────────────────
+#
+# Someone following the README on a fresh machine has nothing else to go on, so
+# a renamed config key that nobody updates the README for is a setup that
+# silently does the wrong thing — the file parses, and the setting is ignored.
+
+
+def test_the_readme_openrouter_config_actually_works(tmp_path):
+    """
+    The copy-pasteable OpenRouter block in README.md must produce the config it
+    claims to. Extracted from the README itself rather than duplicated here, or
+    the test would drift from the thing it is checking.
+    """
+    import re
+
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    match = re.search(r'```toml\n(\[chat\]\nprovider = "openrouter".*?)```', readme, re.S)
+    assert match, "the README no longer has an OpenRouter config block to check"
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(match.group(1))
+    cfg = load_config(config_file)
+
+    assert cfg.provider == "openrouter"
+    assert cfg.openrouter_model, "provider without a model fails at startup"
+    assert cfg.openrouter_api_key, "the [auth] key name must match what config reads"
+    # A literal "~" here would be a path that never resolves.
+    assert cfg.vault_path.is_absolute()
+    assert cfg.models.get("openrouter"), "the [models] catalogue feeds the picker"
+
+
+def test_the_readme_names_commands_that_exist():
+    """
+    Every `uv run <entry-point>` the README tells a new user to type has to be
+    a real entry point in pyproject.toml.
+    """
+    import re
+    import tomllib
+
+    root = Path(__file__).parent.parent
+    readme = (root / "README.md").read_text()
+    with open(root / "pyproject.toml", "rb") as handle:
+        scripts = set(tomllib.load(handle)["project"]["scripts"])
+
+    named = set(re.findall(r"uv run ([a-z][a-z-]+)", readme)) - {"pytest", "python"}
+    assert named <= scripts, f"README names commands that do not exist: {sorted(named - scripts)}"

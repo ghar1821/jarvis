@@ -673,7 +673,20 @@ async function openModelModal() {
     row.addEventListener('click', () => switchModel(entry.spec));
     modelList.appendChild(row);
   }
+  document.getElementById('model-custom-input').value = '';
   modelModal.classList.remove('hidden');
+}
+
+// A model id typed rather than picked. The catalogue is a convenience list,
+// not an allowlist — the server validates the provider and the privacy rule
+// either way, so this cannot reach anywhere the list could not.
+function useCustomModel() {
+  const typed = document.getElementById('model-custom-input').value.trim();
+  if (!typed) return;
+  // A bare model id means the provider the conversation is already on, so the
+  // common case is typing "openrouter/auto" rather than the full spec.
+  const spec = typed.includes(':') ? typed : `${currentModel.split(':')[0]}:${typed}`;
+  switchModel(spec);
 }
 
 async function switchModel(spec) {
@@ -696,6 +709,10 @@ async function switchModel(spec) {
 }
 
 document.getElementById('model-menu-item').addEventListener('click', openModelModal);
+document.getElementById('model-custom-use').addEventListener('click', useCustomModel);
+document.getElementById('model-custom-input').addEventListener('keydown', event => {
+  if (event.key === 'Enter') useCustomModel();
+});
 document.getElementById('model-close').addEventListener('click', closeModelModal);
 modelModal.querySelector('.modal-backdrop').addEventListener('click', closeModelModal);
 document.addEventListener('keydown', e => {

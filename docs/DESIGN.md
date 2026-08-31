@@ -21,7 +21,8 @@ A personal knowledge base and assistant that:
 │   ├── core/                        # Shared infrastructure
 │   │   ├── config.py                # Central configuration (incl. tomlkit write-back)
 │   │   ├── errors.py                # Domain exceptions + retry decorator
-│   │   └── llm.py                   # LLM provider abstraction
+│   │   ├── llm.py                   # LLM provider abstraction
+│   │   └── transcript.py            # Provider-neutral message format (enables model switching)
 │   │
 │   ├── digest/                      # Automated weekly digest
 │   │   ├── arxiv/                   # arXiv paper fetching
@@ -44,6 +45,7 @@ A personal knowledge base and assistant that:
 │   │   ├── annotations.py           # PDF highlight/typed-note extraction (PyMuPDF)
 │   │   ├── images.py                # PDF figure extraction (PyMuPDF)
 │   │   ├── metadata.py              # Title/authors/DOI inference for local PDFs
+│   │   ├── frontmatter.py           # YAML frontmatter -> flat record metadata
 │   │   └── prompts/
 │   │       └── paper_summary.md
 │   │
@@ -52,23 +54,29 @@ A personal knowledge base and assistant that:
 │   │   └── status.py                # `kb sync-status` implementation
 │   │
 │   ├── chat/
-│   │   ├── chat.py                  # `vault-chat` entry point (KB agent)
+│   │   ├── chat.py                  # chat tools + the agentic loop (driven by the webapp)
+│   │   ├── models.py                # Switchable model catalogue + switch validation
 │   │   ├── sessions.py              # Persistent sessions: save/resume/pin/prune/compact
 │   │   └── skills.py                # User-defined skills (list + read)
 │   │
+│   ├── drafts/                      # The agent-writable sandbox
+│   │   ├── workspace.py             # Containment policy, drafts, proposals, versions, retention
+│   │   └── render.py                # Markdown preview, LaTeX compile, PDF export (sandboxed)
+│   │
 │   └── webapp/
 │       ├── app.py                   # FastAPI application (routes, SSE stream, session state)
-│       ├── index.html               # Chat UI page
-│       ├── static/                  # style.css + app.js (vanilla JS, no build step)
-│       └── run.py                   # `webapp` entry point (uvicorn launcher)
+│       ├── index.html               # The UI page
+│       ├── run.py                   # `webapp` entry point (uvicorn launcher)
+│       └── static/                  # style.css + app.js (vanilla JS, no build step)
+│           └── vendor/              # Vendored CodeMirror 5 — see static/vendor/VENDOR.md
+│
+├── examples/skills/                 # Copy a folder into ~/.jarvis/skills to try it
 │
 ├── tests/                           # See docs/TESTING.md
 │
 ├── docs/
 │   ├── DESIGN.md                    # This file
 │   ├── TESTING.md
-│   ├── TODO.md
-│   ├── ROADMAP.md
 │   └── CHANGELOG.md
 └── pyproject.toml
 ```
@@ -82,13 +90,17 @@ A personal knowledge base and assistant that:
 | `jarvis/digest/pipeline/` | Weekly automated digest: scoring, formatting, orchestration |
 | `jarvis/digest/import_digest.py` | `kb add-digest`: bulk-import papers from digest Markdown files |
 | `jarvis/kb/` | Knowledge base: vector store, PDF conversion, annotation + figure extraction, the `kb` CLI |
-| `jarvis/sync/daemon.py` | `jarvis-sync`: scheduled digest (+ 6-hourly catch-up), periodic PDF inbox scan, periodic vault refresh |
+| `jarvis/sync/daemon.py` | `jarvis-sync`: periodic vault refresh, periodic PDF inbox scan, daily draft retention sweep, and — only when `[digest] enabled` — the scheduled digest and its 6-hourly catch-up |
 | `jarvis/sync/status.py` | `kb sync-status`: reports daemon liveness and per-job outcomes |
-| `jarvis/chat/chat.py` | Conversational agent: query and manage via natural language |
+| `jarvis/chat/chat.py` | The agent's tools and the agentic loop; the model's entire surface |
+| `jarvis/chat/models.py` | Switchable model catalogue and switch validation (incl. the privacy rule) |
 | `jarvis/chat/sessions.py` | Persistent chat sessions: persistence, privacy flag, retention, compaction, rename |
 | `jarvis/chat/skills.py` | User-defined skills: discovery and on-demand loading |
-| `jarvis/webapp/` | Browser-based chat UI: FastAPI routes, SSE stream, session state, frontend |
-| `jarvis/core/llm.py` | Shared: LLM provider abstraction (Ollama + Anthropic) |
+| `jarvis/drafts/workspace.py` | The sandbox: one containment policy for every read and write, drafts, proposals, `.versions/`, retention |
+| `jarvis/drafts/render.py` | Markdown preview, sandboxed LaTeX compilation, PDF export |
+| `jarvis/webapp/` | The UI: FastAPI routes, SSE stream, session state, editor, frontend |
+| `jarvis/core/llm.py` | Shared: LLM provider abstraction (Ollama, Anthropic, OpenRouter) |
+| `jarvis/core/transcript.py` | Shared: the provider-neutral message format that makes mid-conversation model switching possible |
 | `jarvis/core/config.py` | Shared: central configuration |
 | `jarvis/core/errors.py` | Shared: domain exceptions and retry decorator |
 
@@ -125,7 +137,6 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 |---|---|---|
 | `uv run run-digest [--force]` | `jarvis.digest.pipeline.run:main` | Run the weekly digest pipeline once. Prints how to enable it and exits without fetching when `[digest] enabled` is false; `--force` runs anyway (typing the command is itself the human request) |
 | `uv run jarvis-sync` | `jarvis.sync.daemon:main` | Start the background sync daemon (foreground; run directly, no service manager) |
-| `uv run vault-chat` | `jarvis.chat.chat:main` | Start the KB agent chat session |
 | `uv run kb` | `jarvis.kb.cli:main` | Manage the knowledge base (CLI), including `kb models [--refresh]` |
 | `uv run convert-pdf` | `jarvis.kb.convert:main` | Convert a PDF to Markdown (standalone) |
 | `uv run webapp` | `jarvis.webapp.run:main` | Start the web UI at `http://127.0.0.1:8080` |
@@ -142,7 +153,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | `~/.jarvis/sessions/` | Persistent chat sessions, one JSON file each (dir 0700, files 0600) |
 | `~/.jarvis/skills/` | User-defined skill folders, `<name>/SKILL.md` + supporting files (configurable via `skills_dir`) |
 | `~/.jarvis/logs/sync.log` | `jarvis-sync` daemon log (written directly by the daemon; also echoed to stderr) |
-| `~/.jarvis/logs/chat.log` | Chat-tool failures — full exception + traceback for every caught tool error, shared by `vault-chat` and the webapp (file only, not echoed to the terminal) |
+| `~/.jarvis/logs/chat.log` | Chat-tool failures — full exception + traceback for every caught tool error, written by the webapp's agent (file only, never shown in the UI) |
 | `~/Documents/papers/digest/` | Weekly digest `.md` output files (configurable) |
 
 ---
@@ -192,11 +203,19 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `digest_hour` | `5` | — | Digest hour (0–23) |
 | `anthropic_api_key` | `""` | `ANTHROPIC_API_KEY` | Anthropic API key (alternative to env var) |
 | `openrouter_api_key` | `""` | `OPENROUTER_API_KEY` | OpenRouter API key (alternative to env var) |
+| `drafts_dir` | `~/.jarvis/drafts` | — | `[drafts] dir` — the agent-writable sandbox. Outside the vault deliberately, so the boundary is a different tree rather than a config rule |
+| `drafts_extensions` | `[".md", ".tex", ".bib", ".txt", ".csv"]` | — | `[drafts] extensions` — the allowlist `resolve_in_draft` enforces; anything else is refused on both read and write |
+| `drafts_max_file_bytes` | `2000000` | — | `[drafts] max_file_bytes` — cap on a single draft file |
+| `drafts_retention_days` | `30` | — | `[drafts] retention_days` — a draft untouched this long is swept by the daemon's `draft_gc` job. `0` disables the sweep entirely; a `keep` draft is exempt regardless |
+| `drafts_gc_hour` | `4` | — | `[drafts] gc_hour` — hour of day (0–23) for the retention sweep |
+| `latex_engine` | `latexmk` | — | `[drafts] latex_engine` — used to compile `.tex`. `""` disables compilation and hides the button rather than failing on click |
+| `compile_timeout_seconds` | `60` | — | `[drafts] compile_timeout_seconds` — hard ceiling on a LaTeX run, so a `\loop` bomb in a model-written document dies instead of pinning a core |
+| `pdf_margin` | `2cm` | — | `[drafts] pdf_margin` — page margin for Markdown → PDF export via pandoc |
 
 Two config helpers matter beyond `load_config()`:
 
 - **`set_config_value(section, key, value)`** — persists one key back into `config.toml` via tomlkit, preserving every other key, comment, and the formatting. The write is atomic (temp file + `os.replace`) and leaves the file mode 0600 (it can hold the API key). Used by the webapp settings endpoint.
-- **`warn_if_config_readable()`** — prints a loud warning at `jarvis-sync` and `vault-chat` startup when `config.toml` is group/world-readable. Fail visibly; never silently chmod the user's file.
+- **`warn_if_config_readable()`** — prints a loud warning at `jarvis-sync` and webapp startup when `config.toml` is group/world-readable. Fail visibly; never silently chmod the user's file.
 
 ---
 
@@ -421,7 +440,7 @@ Local PDFs arrive with nothing but a filename, so `infer_pdf_metadata(pdf_path, 
 
 `resolve_pdf_metadata(...)` is the policy every add path (`kb add`, chat `add_document`, daemon `ingest_pdf`) shares, applied in order: (1) explicit `--title`/`--authors`/`--doi` overrides always win, skipping inference entirely once all three are given; (2) automatic inference for whatever is still unset. Local PDFs are always public papers, so inference always runs regardless of provider — there is no private-note guard to apply here (that machinery lives entirely with vault notes instead).
 
-**Correcting metadata.** `kb set-meta <source> [--title] [--authors] [--doi]` and the matching `update_document_metadata` chat tool apply a human correction metadata-only (no re-embedding). There used to be an "unverified" flag (`meta_inferred`) tracking whether inference had been human-checked, plus reminders surfacing the count in `kb stats`, the webapp header, and a `vault-chat` startup line — it was removed for being unreliable and unactionable in practice (nearly every paper ended up flagged, and asking the LLM to act on the reminder rarely went anywhere); `kb list` is how you review titles/authors/dois now.
+**Correcting metadata.** `kb set-meta <source> [--title] [--authors] [--doi]` and the matching `update_document_metadata` chat tool apply a human correction metadata-only (no re-embedding). There used to be an "unverified" flag (`meta_inferred`) tracking whether inference had been human-checked, plus reminders surfacing the count in `kb stats`, the webapp header, and a startup line — it was removed for being unreliable and unactionable in practice (nearly every paper ended up flagged, and asking the LLM to act on the reminder rarely went anywhere); `kb list` is how you review titles/authors/dois now.
 
 ### Deferred retrieval improvements
 
@@ -491,6 +510,7 @@ One supervised long-running process, run directly with `uv run jarvis-sync` — 
 | `digest_catchup` | `IntervalTrigger(hours=6)` + once at startup; only registered when `digest_enabled` | Re-reads the persisted `last_success` stamp and runs the digest if a slot was missed while powered off |
 | `vault_refresh` | `IntervalTrigger(minutes=vault_refresh_minutes)` + once at startup | Incremental Obsidian vault sync |
 | `pdf_scan` | `IntervalTrigger(minutes=pdf_watch_minutes)` + once at startup; only registered when `pdf_watch_dir` is set | Sweep the PDF inbox and ingest new/changed PDFs serially |
+| `draft_gc` | `CronTrigger(hour=drafts_gc_hour)`; only registered when `drafts_retention_days > 0` | Remove drafts whose newest file is older than the retention window. The one deletion in the codebase — takes a draft id, never a caller-supplied path, walks only the drafts root, and skips a draft marked `keep`. Unregistered rather than no-op when disabled, so an empty schedule reads as the setting it is |
 
 **Digest opt-in** — `_build_scheduler` skips both digest jobs when `digest_enabled` is false, `_validate_sync_config` stops treating `digest_day`/`digest_hour` as fatal (a stale value left behind by someone who switched the feature off must not stop the daemon doing its other work), and `main()` logs `digest: disabled ([digest] enabled = false)` instead of running the startup catch-up. `kb sync-status` prints the same line in the `digest` row, so a missing schedule always reads as a setting rather than a fault. The daemon calls the pipeline as `run_digest([])` — an explicit empty argv, since `main(None)` would parse the *daemon's* command line.
 
@@ -658,7 +678,7 @@ both slashes and dots):
 
 ## Model switching — `jarvis/chat/models.py`
 
-Shared by the CLI's `/model` command and the webapp picker so both validate a
+Used by the webapp picker to validate a
 switch identically.
 
 - `list_catalogue(cfg, current_spec)` — every switchable model annotated
@@ -688,9 +708,16 @@ and `kb` all stay on `cfg.provider` — switching is a chat concern only.
 
 ## KB agent — `jarvis/chat/chat.py`
 
-Single `run_session(vault, kb_only=True, session=None)` loop using `provider.agentic_turn()`. The provider is resolved from the **session's own** `model_spec` per turn (cached per spec), so `/model` takes effect from the next message.
+The agentic loop runs in the webapp (`run_agent`), using
+`provider.agentic_turn()`. The provider is resolved from the **session's own**
+`model_spec` per turn and cached per spec, so a switch takes effect from the
+next message and two sessions can run different models at once.
 
-**In-chat commands** (`_handle_repl_command`, parsed before anything reaches the model): `/model` lists the catalogue and marks the current entry, `/model <provider>:<model>` switches, `/cost` prints session spend. They are typed by a human at the prompt with no tool behind them, so nothing the model emits can reach them. Every tool call is printed to the terminal (`→ tool_name(args)`) so the user sees each step. Each turn runs through the persistent `Session` (see Sessions below): compaction check, turn recorded, saved after the reply. CLI flags `--list-sessions` and `--resume <id>` list and resume stored sessions.
+There was a terminal client (`vault-chat`, `run_session`, and `/model` `/cost`
+REPL commands). It is gone: it duplicated the webapp's loop, could reach models
+the picker could not, and that asymmetry was a live source of confusion about
+how models are configured. The picker gained a free-text box in the same change,
+so no capability moved with it.
 
 `build_system_prompt(kb_only=True, response_style="", skills=None)` loads the base prompt from `~/.jarvis/system_prompt.md` if present, otherwise uses the built-in default, then appends:
 1. a knowledge-source instruction based on `kb_only`,
@@ -705,8 +732,8 @@ Single `run_session(vault, kb_only=True, session=None)` loop using `provider.age
 
 | Mode | `kb_only` | System prompt addendum | Tools list | How to enable |
 |---|---|---|---|---|
-| DB only (default) | `True` | LLM forbidden from drawing on training knowledge | `TOOLS` | `vault-chat` (no flag) |
-| AI fallback | `False` | LLM searches KB first; may fall back to training knowledge after calling `use_own_knowledge` | `TOOLS + [USE_OWN_KNOWLEDGE_TOOL]` | `vault-chat --no-db-only` |
+| DB only (default) | `True` | LLM forbidden from drawing on training knowledge | `TOOLS` | default |
+| AI fallback | `False` | LLM searches KB first; may fall back to training knowledge after calling `use_own_knowledge` | `TOOLS + [USE_OWN_KNOWLEDGE_TOOL]` | **DB only** toggle off |
 
 ### Tools
 
@@ -745,7 +772,7 @@ For local PDFs, an optional `title`/`authors`/`doi` override is also accepted. L
 
 ### `remove_document` flow — one-shot human confirmation
 
-1. The model calls `remove_document(source)` **once**. The tool immediately builds a preview — title, type, source, chunk count, and a line that always names the full local path (or "no local file") and states the fixed invariant: `"Database entry only — files on disk are never touched by jarvis: <path>"` — and hands it to a human via a `request_confirmation` channel: a `y/N` prompt in the terminal CLI, or a Confirm/Cancel dialog in the webapp (whose Confirm hits `/confirm-action`, entirely outside the LLM tool loop).
+1. The model calls `remove_document(source)` **once**. The tool immediately builds a preview — title, type, source, chunk count, and a line that always names the full local path (or "no local file") and states the fixed invariant: `"Database entry only — files on disk are never touched by jarvis: <path>"` — and hands it to a human via a `request_confirmation` channel: a Confirm/Cancel dialog in the webapp (whose Confirm hits `/confirm-action`, entirely outside the LLM tool loop).
 2. If the channel defers (webapp — returns `None`), the tool returns the preview plus an instruction not to call `remove_document` again for this request and not to claim the removal happened until the human confirms.
 3. Only the human's out-of-band answer executes `execute_remove()`, which deletes the DB chunks and returns "No files were touched."
 
@@ -791,7 +818,7 @@ The design is **progressive disclosure**: the system prompt carries only `name: 
 
 ## Web UI — `jarvis/webapp/`
 
-Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (localhost only).
+The interface. Runs on `http://127.0.0.1:8080` (localhost only).
 
 **Stack:** FastAPI + Server-Sent Events + vanilla JS. No npm, no build step, no external JS dependencies. The frontend is `index.html` plus `static/style.css` and `static/app.js` (served via a `/static` mount).
 
@@ -815,7 +842,7 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 | `GET /` | Serves `index.html` |
 | `GET /info` | `{provider, provider_kind, cost_usd, vault}` for the header — the **active session's** model and spend, not a process-wide one |
 | `GET /models` | The switchable catalogue for the picker, `{current, private, models}`. Reads config only; opening the UI makes no outbound request |
-| `POST /model` | `{session_id, spec}` — switch one session's model from the next turn. 409 while that session has a turn in flight, 409 for a private session moving to a cloud model, 400 for an unknown provider or missing credentials |
+| `POST /model` | `{session_id, spec}` — switch one session's model from the next turn. The spec need not be in the catalogue (the picker has a text box for exactly this); config is re-read per call so a `kb models --refresh` needs no restart. 409 while that session has a turn in flight, 409 for a private session moving to a cloud model, 400 for an unknown provider or missing credentials |
 | `GET /history` | The active session's display list for page-refresh restore |
 | `GET /sessions` | `{active, busy, sessions}` — stored session metadata for the sidebar (pinned first, newest first); `busy` is the **list** of session ids currently mid-turn |
 | `POST /sessions/new` | Swap in a fresh session (the outgoing one is already persisted per turn); does **not** touch `pending_actions` — a fresh id owns no tokens, and any other session's dialogs (including the outgoing one's) must keep working |
@@ -841,6 +868,7 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 | `POST /proposals/discard-all` | Drop every pending suggestion. Touches no file — clearing a suggestion is neither applying nor reverting it |
 | `POST /reveal` | `{draft_id, file}` — show a draft file in the OS file manager. Path goes through `resolve_in_draft`, fixed argv, no shell. Human-only by construction; replaced the archive route |
 | `POST /drafts/new` | `{filename, title?, draft_id?}` — start a document, or with `draft_id` add a file to an existing one. The latter is how a LaTeX project grows a chapter or a `.bib` instead of scattering its parts across folders |
+| `DELETE /drafts/{draft_id}` | Delete a draft and everything in it. Human-only by construction: no chat tool is named for deleting a draft, the same reasoning that lets `/documents/remove` skip the token flow. Drops the draft's pending proposals too; a copy the user already made elsewhere is untouched |
 | `POST /chat` | Accepts `{message, session_id}`, streams SSE events; 409 if `session_id` is already in `running`; 404 if `session_id` isn't the active session and has no file on disk; 409 if it's a stored session `check_resume` refuses |
 | `GET /documents` | `?kind=papers\|notes&q=&category=&status=` — the library listing (`list_documents`, de-duplicated, most-recent-first), optionally narrowed by a case-insensitive substring match. Rows carry the paper fields and the record fields (category, status, entity, event_date, tags), so the table's columns can follow the kind |
 | `POST /documents/meta` | `{source, title?, authors?, doi?}` — wraps `update_paper_metadata`; sets only the given fields, no re-embedding; 404 if `source` matches no chunks. Scoped to papers: a note's metadata comes from its file, so editing it here would be undone by the next sync |
@@ -1133,7 +1161,7 @@ evidence → create a draft → iterate via proposals) and are copied into
 
 **Threat model.** A single-user application bound to loopback that nonetheless ingests untrusted content: arXiv PDFs, downloaded papers, and anything dropped into the inbox can contain adversarial text aimed at the LLM (prompt injection). The protections are layered — some are hard guarantees, some are mitigations, and the docs below say which is which.
 
-**Human-in-the-loop for destructive actions (hard).** The model can *request* a deletion; only the human can *execute* it. `remove_document(source)` is a single call that never deletes anything itself — it immediately routes the preview through `request_confirmation`: a terminal `y/N` prompt in the CLI, a Confirm/Cancel dialog in the webapp whose Confirm hits `POST /confirm-action` outside the LLM tool loop. There is no model-controllable `confirmed` boolean left to inject — one round-trip was removed, zero security layers were.
+**Human-in-the-loop for destructive actions (hard).** The model can *request* a deletion; only the human can *execute* it. `remove_document(source)` is a single call that never deletes anything itself — it immediately routes the preview through `request_confirmation`: a Confirm/Cancel dialog in the webapp whose Confirm hits `POST /confirm-action` outside the LLM tool loop. There is no model-controllable `confirmed` boolean left to inject — one round-trip was removed, zero security layers were.
 
 **File deletion outside the drafts sandbox is impossible (hard).** There is no code path anywhere in `jarvis/kb/store.py`, `jarvis/kb/cli.py`, or `jarvis/chat/chat.py` that unlinks a file. The one exception jarvis now contains is draft retention (`prune_drafts`, see Drafts above): age-based, drafts-root only, reachable from the daemon job and `kb drafts --prune` and nothing else, taking a draft id rather than a caller-supplied path. Everything outside `~/.jarvis/drafts/` — the vault, your PDFs, anything `execute_remove()` can see — keeps the absolute guarantee — `delete_local_file()` and the `--delete-file` / `delete_file` params were deleted, not just disabled. `execute_remove()` only ever deletes ChromaDB chunks; the preview, the webapp dialog, and the system prompt all state the same invariant line verbatim: `"Database entry only — files on disk are never touched by jarvis: <path>"`, rendered visually distinct in the webapp dialog. This resolves what was previously an unclear-wording complaint by making the scary case impossible rather than better-worded.
 
@@ -1149,7 +1177,7 @@ evidence → create a draft → iterate via proposals) and are copied into
 
 **Network hardening.** `TrustedHostMiddleware` rejects non-localhost Host headers (DNS-rebinding defence); the server binds to 127.0.0.1 only. Session ids from the network are validated (`[0-9a-z-]{1,64}`) before any file path construction, blocking traversal. Skill names and supporting-file paths from the LLM get the same treatment (separator/traversal rejection + resolved-path containment, which also defeats a supporting file that is a symlink escaping the skill folder).
 
-**File permissions.** Config write-back and session files are 0600; the sessions directory is 0700. `jarvis-sync` and `vault-chat` warn at startup when `config.toml` (which can hold the API key) is group/world-readable — fail visibly rather than silently chmod.
+**File permissions.** Config write-back and session files are 0600; the sessions directory is 0700. `jarvis-sync` and the webapp warn at startup when `config.toml` (which can hold the API key) is group/world-readable — fail visibly rather than silently chmod.
 
 The privacy model (papers-always-public invariant, `PrivacyError` hard stops, resolved-path classification) is part of the same defence and is documented under "Privacy model" above.
 

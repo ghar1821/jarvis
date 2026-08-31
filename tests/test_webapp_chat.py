@@ -39,6 +39,7 @@ from starlette.testclient import TestClient
 import jarvis.chat.chat as chat_module
 import jarvis.webapp.app as appmod
 from jarvis.chat.sessions import new_session
+from jarvis.core.config import Config
 from jarvis.core.errors import LLMError
 
 
@@ -119,6 +120,17 @@ def wired_session(monkeypatch):
         return provider
 
     monkeypatch.setattr(appmod, "_provider_for", strict_provider_for)
+
+    # /models and /model re-read config.toml so a refresh shows up without a
+    # restart. In a test that would be the developer's own file, making the
+    # result depend on whose machine it runs on — pin it to a known one.
+    test_config = Config(
+        provider="ollama",
+        ollama_model="test-model",
+        models={"ollama": ["test-model", "another-local"]},
+    )
+    monkeypatch.setattr(appmod, "cfg", test_config)
+    monkeypatch.setattr(appmod, "_live_config", lambda: test_config)
     return session
 
 
@@ -203,7 +215,7 @@ def test_uncaught_exception_still_replies_and_terminates_stream(wired_session, m
     install_provider(wired_session, FakeProvider(behavior))
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         response = client.post(
             "/chat", json={"message": "trigger a crash", "session_id": wired_session.id}
         )
@@ -239,7 +251,7 @@ def test_llm_error_replies_logs_and_saves(wired_session, monkeypatch, caplog, is
     install_provider(wired_session, FakeProvider(behavior))
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
 
     events = _parse_sse(response.text)
@@ -433,11 +445,11 @@ def test_validation_error_is_logged_and_returns_readable_detail(caplog, isolated
     A request FastAPI rejects at validation time (e.g. a stale browser tab
     posting the pre-parallel-sessions /chat shape without session_id) never
     reaches a route body — the exception handler must log it to the
-    vault-chat logger so it is diagnosable from chat.log, and return the
+    jarvis.chat logger so it is diagnosable from chat.log, and return the
     standard 422 detail list.
     """
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         response = client.post("/chat", json={"message": "no session id here"})
 
     assert response.status_code == 422
@@ -573,3 +585,72 @@ def test_a_local_turn_records_no_cost(wired_session, monkeypatch):
     client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
 
     assert wired_session.cost == {}
+
+
+def test_a_model_can_be_switched_to_without_being_in_the_catalogue(wired_session):
+    """
+    The picker's list comes from config, but the catalogue is a convenience
+    list rather than an allowlist — the browser's text box posts an arbitrary
+    spec, and the server must accept one it never offered. This is how
+    `openrouter/auto`, or anything released since the last refresh, is reached
+    without editing config first.
+    """
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    catalogue = client.get("/models").json()["models"]
+    assert "ollama:never-listed" not in {entry["spec"] for entry in catalogue}
+
+    response = client.post(
+        "/model", json={"session_id": wired_session.id, "spec": "ollama:never-listed"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["spec"] == "ollama:never-listed"
+
+
+def test_an_unlisted_model_still_obeys_the_privacy_rule(wired_session, monkeypatch):
+    """
+    Typing a spec must not be a way around the rule the list enforces: a
+    session holding private content can only ever run locally.
+    """
+    import jarvis.webapp.app as appmod_local
+    from jarvis.core.config import Config
+
+    # A key has to be present, or the switch is refused for the mundane reason
+    # before the privacy rule is ever reached — and it is the privacy rule that
+    # this is about.
+    monkeypatch.setattr(appmod_local, "_live_config", lambda: Config(
+        provider="ollama", ollama_model="test-model",
+        openrouter_model="some-unlisted-model", openrouter_api_key="sk-test",
+    ))
+    wired_session.private = True
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    response = client.post(
+        "/model", json={"session_id": wired_session.id, "spec": "openrouter:some-unlisted-model"}
+    )
+
+    assert response.status_code == 409
+    assert "private" in response.json()["detail"].lower()
+
+
+def test_the_picker_reflects_a_config_edit_without_a_restart(wired_session, monkeypatch):
+    """
+    `kb models --refresh` writes into config.toml. Serving the Config this
+    process started with meant the new models were invisible until the webapp
+    was restarted, which is a confusing thing to have to know.
+    """
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    before = {entry["spec"] for entry in client.get("/models").json()["models"]}
+    assert "ollama:added-later" not in before
+
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(
+        provider="ollama",
+        ollama_model="test-model",
+        models={"ollama": ["test-model", "added-later"]},
+    ))
+
+    after = {entry["spec"] for entry in client.get("/models").json()["models"]}
+    assert "ollama:added-later" in after

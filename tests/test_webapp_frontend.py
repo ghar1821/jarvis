@@ -126,3 +126,23 @@ def test_the_tab_close_control_distinguishes_saved_from_unsaved():
     assert saved.group(1) != unsaved.group(1), (
         "saved and unsaved tabs must not render the same glyph"
     )
+
+
+def test_the_readme_menu_items_exist_in_the_markup():
+    """
+    The README told people to click a ⌘ button in the header for months after
+    model switching moved into the ⋮ menu. Instructions that name a control
+    are only useful while the control is there, and nothing else notices.
+    """
+    readme = (WEBAPP.parent.parent / "README.md").read_text()
+    html = INDEX_HTML.read_text()
+
+    labels = set(re.findall(r"\*\*⋮ → ([^*\n]+?)\*\*", readme))
+    labels |= set(re.findall(r"⋮ → \*\*([^*\n]+?)\*\*", readme))
+    assert labels, "no ⋮ menu instructions found in the README to check"
+
+    menu_items = set(re.findall(r'id="[a-z-]+-menu-item">([^<]+)<', html))
+    assert labels <= menu_items, (
+        f"README names menu items that do not exist: {sorted(labels - menu_items)}; "
+        f"the menu has {sorted(menu_items)}"
+    )

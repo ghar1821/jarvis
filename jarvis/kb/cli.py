@@ -2,7 +2,7 @@
 kb — local knowledge base manager.
 
 Manages a local vector database of research papers and Obsidian vault notes
-that vault-chat draws on during conversations.
+that the webapp agent draws on during conversations.
 
 Subcommands:
   add <url|path>    Add a paper by arXiv URL or local PDF path
@@ -634,7 +634,7 @@ def cmd_reindex(args: "argparse.Namespace | None" = None) -> None:
     print(f"Done — reindexed {len(ids)} chunks with '{cfg.embed_model}'.")
     print(
         "NOTE: the swap gives the collection a new identity, so any jarvis "
-        "process that was already running (webapp, jarvis-sync, vault-chat) "
+        "process that was already running (the webapp or jarvis-sync) "
         "now holds a stale handle — restart those processes before using them."
     )
 
@@ -733,7 +733,7 @@ def cmd_models(args: argparse.Namespace) -> None:
         ids = refresh_openrouter_catalogue(cfg)
         set_config_value("models", "openrouter", ids)
         print(f"Wrote {len(ids)} OpenRouter model(s) to [models] openrouter in config.toml.")
-        print("Reload config (restart vault-chat or the webapp) to see them in the picker.")
+        print("Restart the webapp to see them in the picker.")
         return
 
     entries = list_catalogue(cfg)

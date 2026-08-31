@@ -853,6 +853,25 @@ button:disabled { opacity: 0.45; cursor: default; }
 .edit-proposal-actions button:disabled { opacity: 0.4; cursor: default; }
 .edit-proposal-done { font-size: 0.8rem; color: var(--text-dim); }
 
+/* Typing a model id the catalogue does not list. */
+.model-custom {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.model-custom input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  font-family: inherit;
+  font-size: 0.82rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.model-custom input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
 /* ── Modal notes ──────────────────────────────────────────────────────── */
 
 .modal-note {

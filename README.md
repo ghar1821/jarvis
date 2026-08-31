@@ -13,47 +13,127 @@ Named after Iron Man's J.A.R.V.I.S. — Just A Rather Very Intelligent System.
 
 ## Get started
 
+### What you need first
+
+- **[uv](https://github.com/astral-sh/uv)** and **Python ≥ 3.12**. On a machine
+  with neither: `curl -LsSf https://astral.sh/uv/install.sh | sh`, then
+  `uv python install 3.12`.
+- **An OpenRouter key** — get one at
+  [openrouter.ai/keys](https://openrouter.ai/keys). An Anthropic key works too.
+- **Or, to run locally instead:** [Ollama](https://ollama.com) with a model
+  that does tool calling *and* vision — `ollama pull qwen3-vl:30b`. Tool
+  calling is required (jarvis works by calling tools); vision is only needed
+  for figure captioning.
+- Optional, only for the editor's PDF output: a LaTeX distribution (MacTeX,
+  TeX Live) to compile `.tex`, and `pandoc` to export Markdown as PDF. Buttons
+  for a missing tool are hidden rather than broken, so skip these at first.
+
+### 1. Install
+
 ```bash
+git clone <your-repo-url> jarvis && cd jarvis
 uv sync
 ```
 
-Then pick a model to run against. Either works, and you can switch later:
+### 2. Write the config
 
-**Local (nothing leaves your machine).** Install [Ollama](https://ollama.com)
-and pull a model with tool-calling and vision support:
+**Jarvis does not create this file for you.** Without it you get defaults —
+local Ollama, and a vault at `~/vault` that probably doesn't exist.
 
 ```bash
-ollama pull qwen3-vl:30b
+mkdir -p ~/.jarvis
+$EDITOR ~/.jarvis/config.toml
 ```
 
-**Cloud.** Put a key in `~/.jarvis/config.toml`:
+A complete working OpenRouter config, copy-pasteable:
 
 ```toml
 [chat]
-provider = "openrouter"                     # or "anthropic"
+provider = "openrouter"
 openrouter_model = "anthropic/claude-sonnet-4.6"
+vault_path = "~/Documents/obsidian"          # your notes; must exist
 
 [auth]
-openrouter_api_key = "sk-or-..."            # or ANTHROPIC_API_KEY / [auth] api_key
+openrouter_api_key = "sk-or-..."             # or the OPENROUTER_API_KEY env var
+
+# Models offered in the picker. Jarvis ships no vendor list of its own —
+# `uv run kb models --refresh` fills this in from OpenRouter's own index.
+[models]
+openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
 ```
 
-Point jarvis at your notes and index them:
-
-```toml
-[chat]
-vault_path = "~/Documents/obsidian"
+```bash
+chmod 600 ~/.jarvis/config.toml    # it holds an API key; jarvis warns if it's readable
 ```
+
+Both `provider` and `openrouter_model` are needed. Setting `provider` alone
+fails with *"No model configured for provider 'openrouter'"*, and a missing key
+fails at the first request with *"No OpenRouter credentials found"* — the
+client is built lazily, so nothing complains until then.
+
+**On OpenRouter specifically:** it is a broker — it routes your request to
+somebody else's hardware. Jarvis sends strict settings by default
+(`data_collection = "deny"`, no silent fallbacks). See [Choose a
+model](#choose-a-model) to loosen them.
+
+### 3. Index your notes
 
 ```bash
 uv run kb index-vault
 ```
 
-Now start it:
+First run downloads the embedding model (`BAAI/bge-small-en-v1.5`, ~130 MB from
+HuggingFace) and caches it. That is the only model jarvis downloads, it runs
+locally, and it is why indexing works with no API calls. If your vault path is
+wrong you get `Error: vault path does not exist: ...` immediately, before
+anything is downloaded.
+
+No notes yet? Skip this — the editor and chat work without a vault.
+
+### 4. Check it worked
+
+```bash
+uv run kb models     # which providers are configured, and which lack a key
+uv run kb stats      # what got indexed
+uv run kb doctor     # embedding model and index health
+```
+
+`kb models` makes no network call — it reads your config, so it is the quickest
+way to confirm the file is being picked up:
+
+```
+ollama:qwen3-vl:30b  [local]
+anthropic:claude-sonnet-4-6  [cloud]  (no API key)
+openrouter:anthropic/claude-sonnet-4.6  [cloud]
+```
+
+An entry marked `(no API key)` is configured but unusable. If `openrouter:` is
+missing entirely, `openrouter_model` isn't set.
+
+### 5. Run it
 
 ```bash
 uv run webapp        # browser at http://127.0.0.1:8080 (localhost only)
-uv run vault-chat    # or the terminal
 ```
+
+`webapp --reload` restarts the server when you edit Python. Note that changes
+to `static/app.js` or `index.html` need a **browser** hard-reload (⇧⌘R) rather
+than a server restart — and Python changes need the opposite.
+
+### Working on jarvis
+
+```bash
+uv sync --group dev                  # once, to get pytest
+uv run pytest -m "not integration"   # the suite that must pass before any change
+uv run pytest -m integration         # needs live services (API key, running Ollama)
+uv run pytest tests/test_drafts.py   # one file
+```
+
+Everything jarvis owns lives in `~/.jarvis/`: `config.toml`, the index (`rag/`),
+sessions, drafts and logs. Deleting that directory resets you to a fresh
+install without touching your vault. Architecture, data flows and the privacy
+guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what is covered by tests
+and why is in [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
@@ -70,11 +150,11 @@ add https://arxiv.org/abs/2406.04093
 ```
 
 By default it answers **only** from what it found in your knowledge base. Flip
-the **DB only** toggle off (or run `vault-chat --no-db-only`) to let it fall
-back on the model's own knowledge — it says so on screen when it does.
+the **DB only** toggle off to let it fall back on the model's own knowledge —
+it says so on screen when it does.
 
 Conversations are saved automatically. Resume, rename, pin or delete them from
-the sidebar, or with `vault-chat --list-sessions` and `--resume <id>`.
+the **Chats** section of the sidebar.
 
 ---
 
@@ -104,10 +184,13 @@ single-file draft just shows as one row; a multi-file one lists its parts
 underneath with a count beside the name. Right-click a document to add a file
 to it.
 
-Open the **Editor** view in the webapp: drafts on the left, source in the
-middle, live preview on the right, chat docked beside it. Markdown previews as
-you type; LaTeX compiles to a PDF (with the log underneath when it fails); both
-export to PDF.
+The sidebar has two sections, **Chats** and **Documents**, each with a `+` to
+start a new one. Click a document, or press **Editor** in the header, and the
+editor opens above the chat — so you can talk about the document while looking
+at it. Inside the editor: source on the left, preview on the right, with
+**Recompile** to re-render and a layout control for split / source only /
+output only. Markdown previews as you type; LaTeX compiles to a PDF (with the
+log underneath when it fails); both export to PDF.
 
 - **Open several at once.** Each file gets a tab. The control on a tab is a
   filled dot while it has unsaved changes and an × once it does not, so you can
@@ -258,19 +341,46 @@ default since each figure costs a call. Add `--figures`, or ask for a paper
 
 ## Choose a model
 
-Switch mid-conversation without losing the thread: `/model` in the terminal, or
-the ⌘ button in the webapp header.
+Switch mid-conversation without losing the thread: **⋮ → Switch model…**. It
+applies from your next message, per conversation — two sessions can run
+different models at once. The header shows the active model and what the
+session has cost.
 
-```bash
-uv run kb models              # what's on offer
-uv run kb models --refresh    # pull OpenRouter's catalogue into your config
+**You do not have to configure a catalogue.** Whatever you set as
+`openrouter_model` (or `ollama_model`) already appears in the picker. `[models]`
+just adds more to choose from:
+
+```toml
+[models]
+openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5", "openrouter/auto"]
 ```
 
-List the models you want offered under `[models]` in your config — jarvis ships
-no vendor list of its own.
+```bash
+uv run kb models              # what's on offer right now (no network)
+uv run kb models --refresh    # pull OpenRouter's full catalogue into [models]
+```
+
+`--refresh` is optional and only for browsing — it writes OpenRouter's model
+ids into your config so you can pick from a list instead of typing one. It is
+the only place jarvis fetches a model list; the picker itself never touches the
+network. Consider writing two or three by hand instead: a picker with three
+hundred rows is worse than one with the models you actually use.
+
+**Editing the config needs a webapp restart** before the picker sees the change
+— switching between models already listed does not.
+
+The list is a convenience, not a restriction — the picker also has a box to
+type any model id OpenRouter accepts, listed or not, which is applied to the
+current conversation without touching your config.
+
+**Automatic routing.** OpenRouter's auto router is just a model id, so set
+`openrouter_model = "openrouter/auto"` (or add it to `[models]`) and it picks a
+model per request. Jarvis sends `allow_fallbacks = false` by default, which is
+untested against the auto router — loosen it under `[openrouter]` if requests
+start failing.
 
 **Cost** is shown only for OpenRouter, which reports what each request actually
-cost (`/cost` in the terminal, the header in the webapp). A local model costs
+cost, shown in the header. A local model costs
 nothing, and jarvis won't invent a figure for anything else.
 
 **If you use OpenRouter**, know that it is a broker — it routes your request to
@@ -338,8 +448,7 @@ your machine was asleep. Run one by hand any time with
 
 ```bash
 # Everyday
-uv run webapp                  # browser UI
-uv run vault-chat              # terminal chat
+uv run webapp                  # the UI
 uv run jarvis-sync             # background sync
 
 # Knowledge base
@@ -372,6 +481,18 @@ The full configuration reference is in
 
 ## If something goes wrong
 
+**"No model configured for provider 'openrouter'".** You set `provider` but
+not `openrouter_model`. Both are needed — see [Get started](#get-started).
+
+**"No OpenRouter credentials found".** No key in `[auth] openrouter_api_key`
+and none in `OPENROUTER_API_KEY`. The client is built lazily, so this appears
+at the first message rather than at startup. `uv run kb models` shows which
+providers have a key without sending a request.
+
+**Nothing you configured seems to apply.** Jarvis reads
+`~/.jarvis/config.toml` and nothing else — not a file in the repo, and not the
+working directory. `uv run kb models` reflects what was actually loaded.
+
 **Searches fail with a database error.** Run `uv run kb doctor`. It will tell
 you whether to `uv run kb reindex` or just restart the process.
 
@@ -387,17 +508,6 @@ still has `provider = "llamacpp"`, switch it to `"ollama"`; if it has
 `rag_dir = "~/.seshat/rag"`, change it to `~/.jarvis/rag`; and move
 `anthropic_model` from `[digest]` to `[chat]`. Jarvis warns rather than
 rewriting your file.
-
----
-
-## Requirements
-
-- [uv](https://github.com/astral-sh/uv) and Python ≥ 3.12
-- For local inference: [Ollama](https://ollama.com) with a tool-calling +
-  vision model (e.g. `qwen3-vl:30b`)
-- For cloud inference: an OpenRouter or Anthropic API key
-- Optional, for the editor's PDF output: a LaTeX distribution, and `pandoc` for
-  Markdown export
 
 ---
 

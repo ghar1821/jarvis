@@ -31,6 +31,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr("jarvis.drafts.workspace.get_config", lambda: cfg)
     monkeypatch.setattr("jarvis.drafts.render.get_config", lambda: cfg)
     monkeypatch.setattr(appmod, "cfg", cfg)
+    monkeypatch.setattr(appmod, "_live_config", lambda: cfg)
     workspace._proposals.clear()
     return cfg
 

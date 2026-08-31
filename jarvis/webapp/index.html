@@ -150,6 +150,15 @@
       <label>Model</label>
       <div id="model-note" class="model-note hidden"></div>
       <div id="model-list" class="model-list"></div>
+      <!-- The list is what config offers; this is for anything else the
+           provider accepts — openrouter/auto, or a model released after the
+           last catalogue refresh. Applies to this conversation only. -->
+      <div class="model-custom">
+        <input type="text" id="model-custom-input"
+               placeholder="or type a model id, e.g. openrouter/auto"
+               autocomplete="off" spellcheck="false">
+        <button id="model-custom-use">Use</button>
+      </div>
       <div class="modal-actions">
         <button id="model-close">Close</button>
       </div>

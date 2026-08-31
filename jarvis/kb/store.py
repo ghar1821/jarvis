@@ -155,7 +155,7 @@ def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
         return KBCorruptionError(
             "The knowledge-base collection was rebuilt (by `kb reindex`) while "
             "this process was running, and reopening it did not help. Fix: "
-            "restart this process (webapp, jarvis-sync, or vault-chat) — "
+            "restart this process (the webapp or jarvis-sync) — "
             "nothing is lost; the rebuilt knowledge base is intact on disk."
         )
     return RAGError(fallback_message)

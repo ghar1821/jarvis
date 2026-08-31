@@ -38,7 +38,6 @@ include = ["jarvis*"]
 run-digest  = "jarvis.digest.pipeline.run:main"
 jarvis-sync = "jarvis.sync.daemon:main"
 convert-pdf = "jarvis.kb.convert:main"
-vault-chat  = "jarvis.chat.chat:main"
 kb          = "jarvis.kb.cli:main"
 webapp      = "jarvis.webapp.run:main"
 
