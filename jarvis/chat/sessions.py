@@ -23,15 +23,22 @@ sessions are exempt and uncounted, deleted only explicitly.
 import json
 import os
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jarvis.core import transcript as transcript_module
 from jarvis.core.errors import PrivacyError
 
 SESSIONS_DIR = Path.home() / ".jarvis" / "sessions"
 MAX_UNPINNED_SESSIONS = 50
 TITLE_MAX_CHARS = 60
+
+
+# Bumped when the on-disk shape changes. 1 = provider wire format (a session
+# could only ever be resumed by the provider that wrote it); 2 = the neutral
+# transcript, which any provider can read.
+FORMAT_VERSION = 2
 
 
 @dataclass
@@ -42,12 +49,22 @@ class Session:
     updated_at: str = ""
     pinned: bool = False
     private: bool = False
-    provider: str = "ollama"
+    provider: str = "ollama"                       # provider name, never "name:model"
+    model: str = ""                                # model within that provider
     kb_only: bool = True
-    messages: list = field(default_factory=list)   # provider wire format
+    format_version: int = FORMAT_VERSION
+    messages: list = field(default_factory=list)   # neutral transcript (core/transcript.py)
     display: list = field(default_factory=list)    # human-facing render list
     turn_starts: list = field(default_factory=list)  # messages-index where each user turn began
     indexed_exchanges: int = 0                     # (user, assistant) pairs already in Chroma
+    # Real spend per "provider:model", for the providers that report it.
+    # {"openrouter:openai/gpt-5": {"usd": 0.0123, "requests": 4}}
+    cost: dict = field(default_factory=dict)
+
+    @property
+    def model_spec(self) -> str:
+        """The spec make_provider() takes, e.g. "openrouter:openai/gpt-5"."""
+        return f"{self.provider}:{self.model}" if self.model else self.provider
 
 
 def _now() -> str:
@@ -55,10 +72,47 @@ def _now() -> str:
 
 
 def new_session(provider: str, kb_only: bool = True) -> Session:
+    """
+    Start a session. `provider` accepts a bare name or a "name:model" spec —
+    the two halves are stored separately because the privacy rules key on the
+    provider alone, while switching models keys on both.
+    """
+    from jarvis.core.config import get_config
+    from jarvis.core.llm import default_model, split_spec
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     session_id = f"{stamp}-{uuid.uuid4().hex[:6]}"
+    name, model = split_spec(provider)
+    # Resolve the provider's configured default when the spec names no model,
+    # so model_spec is always concrete — the header, the picker, and the cost
+    # key all read it, and "anthropic" alone would name no model at all.
+    if not model:
+        try:
+            model = default_model(name, get_config())
+        except KeyError:
+            model = ""
     return Session(id=session_id, created_at=_now(), updated_at=_now(),
-                   provider=provider, kb_only=kb_only)
+                   provider=name, model=model, kb_only=kb_only)
+
+
+def record_usage(session: Session, spec: str, usage: "dict | None") -> None:
+    """
+    Add one turn's reported spend to the session total, keyed by model.
+
+    Providers that report no cost (a local model, or one whose price jarvis
+    would have to guess) pass None and nothing is recorded — a session with no
+    entry here shows no cost at all rather than a fabricated zero.
+    """
+    if not usage:
+        return
+    entry = session.cost.setdefault(spec, {"usd": 0.0, "requests": 0})
+    entry["usd"] = round(entry["usd"] + float(usage.get("usd", 0.0)), 6)
+    entry["requests"] += int(usage.get("requests", 0))
+
+
+def session_cost_usd(session: Session) -> float:
+    """Total reported spend across every model the session has used."""
+    return round(sum(entry.get("usd", 0.0) for entry in session.cost.values()), 6)
 
 
 def _jsonable(message):
@@ -102,11 +156,57 @@ def save_session(session: Session, sessions_dir: Path = SESSIONS_DIR, store=None
         prune_sessions(sessions_dir=sessions_dir, store=store)
 
 
+def _migrate_v1_messages(payload: dict) -> list:
+    """
+    Convert a v1 session's provider wire format to the neutral transcript.
+
+    v1 files never recorded which *model* wrote them, only the provider, so
+    every opaque block is tagged with an empty model name. That is deliberate:
+    an opaque block only replays on an exact provider+model match, so an
+    Anthropic thinking block from an unknown model is preserved in the file but
+    never sent back to a model that might not have produced it.
+    """
+    from jarvis.core import transcript
+
+    provider = payload.get("provider", "")
+    messages = payload.get("messages", [])
+    if provider == "anthropic":
+        return transcript.from_anthropic(messages, model="")
+    if provider == "ollama":
+        return transcript.from_ollama(messages, model="")
+    # A provider this build no longer has an adapter for (the retired
+    # "llamacpp", say). Its transcripts were OpenAI-shaped, so read them that
+    # way and say so rather than dropping the history on the floor.
+    print(
+        f"⚠️  session {payload.get('id', '?')} was recorded under the unknown provider "
+        f"{provider!r} — reading its history as OpenAI-shaped messages",
+        flush=True,
+    )
+    return transcript.from_openai(messages, provider=provider, model="")
+
+
 def load_session(session_id: str, sessions_dir: Path = SESSIONS_DIR) -> Session:
-    """Load a session by id. Raises FileNotFoundError for unknown ids."""
+    """
+    Load a session by id, migrating a v1 (provider wire format) file to the
+    neutral transcript on the way. Raises FileNotFoundError for unknown ids.
+
+    The migrated session is not written back here — the next completed turn
+    saves it as v2 through the normal path, so a read never mutates disk.
+    """
     _require_valid_session_id(session_id)
     payload = json.loads((sessions_dir / f"{session_id}.json").read_text(encoding="utf-8"))
-    return Session(**payload)
+
+    if payload.get("format_version", 1) < FORMAT_VERSION:
+        payload["messages"] = _migrate_v1_messages(payload)
+        payload["format_version"] = FORMAT_VERSION
+        # v1 turn_starts index into the old wire list, and the conversion does
+        # not preserve message counts (Anthropic bundles, OpenAI splits).
+        # Dropping them costs only the next compaction's cut precision.
+        payload["turn_starts"] = []
+
+    # Tolerate keys from other versions rather than blowing up on load.
+    known = {f.name for f in fields(Session)}
+    return Session(**{k: v for k, v in payload.items() if k in known})
 
 
 def list_sessions(sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
@@ -232,30 +332,22 @@ def mark_private(session: Session, store=None) -> None:
 
 def check_resume(session: Session, current_provider: str) -> None:
     """
-    Refuse resumes that would be unsafe or unworkable:
-    - private session + cloud provider → PrivacyError (history would replay
-      private content to Anthropic)
-    - cross-provider resume → ValueError (Anthropic content blocks vs the
-      local wire format are incompatible). The match is strict per provider
-      name (only anthropic shares a family with itself), so a session recorded
-      under the retired "llamacpp" provider refuses to resume under "ollama"
-      rather than silently replaying an incompatible history.
+    Refuse a resume that would leak private content.
+
+    The cross-provider check this used to carry is gone: v2 sessions store the
+    neutral transcript, so any provider can read a transcript any other
+    provider wrote. What remains — and is now stated in terms of local vs
+    cloud rather than one vendor's name — is the privacy rule. Once a session
+    has seen private content the whole transcript is private, so it may only
+    ever run on a local model.
     """
-    if session.private and current_provider == "anthropic":
+    from jarvis.core.llm import is_cloud_provider
+
+    if session.private and is_cloud_provider(current_provider):
         raise PrivacyError(
             f"Session {session.id} contains private content and cannot be resumed "
-            "with a cloud provider. Restart with the local provider "
-            "(webapp --provider ollama)."
-        )
-
-    def family(provider: str) -> str:
-        return "anthropic" if provider == "anthropic" else provider
-
-    if family(session.provider) != family(current_provider):
-        raise ValueError(
-            f"Session {session.id} was recorded with the {session.provider!r} provider "
-            f"and cannot be replayed under {current_provider!r} — the stored message "
-            "formats are incompatible. Restart with the matching provider."
+            f"or continued with {current_provider!r}, which sends content off this "
+            "machine. Switch to a local model (ollama) to continue it."
         )
 
 
@@ -350,9 +442,14 @@ def maybe_compact(session: Session, provider_obj, cfg) -> bool:
         max_tokens=1024,
     )
 
+    # Neutral-format messages: compaction rewrites the transcript, so it has
+    # to speak the same schema every provider reads.
     summary_pair = [
-        {"role": "user", "content": f"[Summary of the conversation so far]\n{summary}"},
-        {"role": "assistant", "content": "Understood — continuing from that summary."},
+        transcript_module.user_message(f"[Summary of the conversation so far]\n{summary}"),
+        {
+            "role": "assistant",
+            "content": [transcript_module.text_block("Understood — continuing from that summary.")],
+        },
     ]
     session.messages[:] = summary_pair + session.messages[cut:]
     shift = cut - len(summary_pair)

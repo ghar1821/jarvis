@@ -4,31 +4,109 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Jarvis</title>
+  <link rel="stylesheet" href="/static/vendor/codemirror-5.65.19/lib/codemirror.css">
+  <link rel="stylesheet" href="/static/vendor/codemirror-5.65.19/theme/ayu-dark.css">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <aside id="sidebar">
-    <button id="new-chat-btn">+ New chat</button>
-    <div id="session-list"></div>
+    <!-- Two sections, so the drafts list lives here rather than as a third
+         column inside the editor. Five side-by-side panels was the thing that
+         made the editor feel cramped. -->
+    <div class="sidebar-section">
+      <div class="sidebar-heading">
+        <span>Chats</span>
+        <button id="new-chat-btn" class="icon-btn" title="New chat">+</button>
+      </div>
+      <div id="session-list"></div>
+    </div>
+    <div class="sidebar-section" id="documents-section">
+      <div class="sidebar-heading">
+        <span>Documents</span>
+        <button id="new-draft-btn" class="icon-btn" title="New document">+</button>
+      </div>
+      <div id="draft-list"></div>
+    </div>
   </aside>
   <main id="main">
     <header id="header">
       <span id="header-text">Jarvis</span>
+      <button id="view-btn" title="Show or hide the editor panel">Editor</button>
       <button id="menu-btn" title="Menu" aria-label="Menu">⋮</button>
       <div id="header-menu" class="hidden">
+        <button id="model-menu-item">Switch model…</button>
         <button id="style-menu-item">Set response style…</button>
-        <button id="papers-menu-item">Papers…</button>
+        <button id="papers-menu-item">Library…</button>
+        <button id="proposals-menu-item">Discard pending suggestions…</button>
       </div>
     </header>
-    <div id="messages"></div>
-    <div id="input-bar">
-      <textarea id="input" rows="1" placeholder="Ask about your papers and notes..." autocomplete="off" autofocus></textarea>
-      <label class="toggle-wrap" title="Off: answers from database only. On: uses model training knowledge if database has no results.">
-        <input type="checkbox" id="ai-toggle" checked>
-        <span class="toggle-track"></span>
-        <span>DB only</span>
-      </label>
-      <button id="send-btn">Send</button>
+    <!-- Editor above, chat below. The editor is a panel you open alongside
+         the conversation, not a mode you switch into: the point of having it
+         is to talk about the document while looking at it. Stacked rather
+         than side by side because the editor's own panes are horizontal and
+         competing for width left everything cramped. -->
+    <div id="workspace">
+      <div id="chat-pane">
+        <div id="messages"></div>
+        <div id="input-bar">
+          <textarea id="input" rows="1" placeholder="Ask about your notes and documents..." autocomplete="off" autofocus></textarea>
+          <label class="toggle-wrap" title="Off: answers from database only. On: uses model training knowledge if database has no results.">
+            <input type="checkbox" id="ai-toggle" checked>
+            <span class="toggle-track"></span>
+            <span>DB only</span>
+          </label>
+          <button id="send-btn">Send</button>
+        </div>
+      </div>
+
+      <!-- Editor panel: drafts | source | preview. Hidden until opened. -->
+      <div id="editor-view" class="hidden">
+        <div id="editor-main">
+          <div id="editor-bar">
+            <span id="editor-filename">No draft open</span>
+            <span id="editor-dirty" class="hidden">unsaved</span>
+            <span id="editor-spacer"></span>
+            <!-- Overleaf's three views: both panes, source only, output only.
+                 On a narrow split, one pane at a time is the difference
+                 between readable and unusable. -->
+            <div id="layout-modes">
+              <button id="mode-split" class="mode-btn active" title="Source and output">◫</button>
+              <button id="mode-source" class="mode-btn" title="Source only">◧</button>
+              <button id="mode-output" class="mode-btn" title="Output only">◨</button>
+            </div>
+            <button id="editor-recompile" disabled>Recompile</button>
+            <button id="editor-save" disabled>Save</button>
+            <button id="editor-export" class="hidden">PDF</button>
+            <button id="editor-history" disabled>History</button>
+            <!-- Closing a pane belongs on the pane. Making the only way out a
+                 button in the app's top bar means looking away from the thing
+                 you want to dismiss. -->
+            <button id="editor-close" class="icon-btn" title="Close the editor">×</button>
+          </div>
+          <!-- One tab per open document, VS Code style. The close control is
+               a filled dot while there are unsaved changes and an × once
+               there are not, so the state of every open file is legible
+               without switching to it. -->
+          <div id="editor-tabs" class="hidden"></div>
+          <!-- Shown only while a suggestion is open. The per-change accept
+               and reject controls live in the document itself; this carries
+               the actions that apply to the whole proposal. -->
+          <div id="review-bar" class="hidden">
+            <span id="review-rationale"></span>
+            <span id="review-progress"></span>
+            <span class="review-spacer"></span>
+            <button id="review-accept-all">Accept all</button>
+            <button id="review-reject-all">Reject all</button>
+          </div>
+          <div id="editor-panes">
+            <div id="editor-source"><textarea id="editor-textarea"></textarea></div>
+            <div id="editor-preview-pane" class="hidden">
+              <iframe id="preview-frame" sandbox=""></iframe>
+              <pre id="compile-log" class="hidden"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -45,12 +123,49 @@
     </div>
   </div>
 
-  <!-- Papers manager modal, hidden until opened from the ⋮ menu -->
+  <!-- Right-clicking a document opens this. "Show in Finder" is the whole
+       menu: getting a file out of the sandbox is a copy the user makes
+       themselves, not something jarvis does on their behalf. -->
+  <div id="file-menu" class="hidden"></div>
+
+  <!-- Version history for the open file -->
+  <div id="history-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box">
+      <label>Version history</label>
+      <div class="modal-note">
+        Restoring keeps a copy of what is there now, so a restore is itself undoable.
+      </div>
+      <div id="history-list" class="model-list"></div>
+      <div class="modal-actions">
+        <button id="history-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Model picker, hidden until opened from the header button -->
+  <div id="model-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box">
+      <label>Model</label>
+      <div id="model-note" class="model-note hidden"></div>
+      <div id="model-list" class="model-list"></div>
+      <div class="modal-actions">
+        <button id="model-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Library (papers + notes/records), hidden until opened from the ⋮ menu -->
   <div id="papers-modal" class="modal hidden">
     <div class="modal-backdrop"></div>
     <div class="modal-box papers-modal-box">
-      <label for="papers-search">Papers</label>
-      <input type="text" id="papers-search" placeholder="Search title, authors, DOI, source...">
+      <label for="papers-search">Library</label>
+      <div class="library-kinds">
+        <button id="kind-papers" class="kind-btn active">Papers</button>
+        <button id="kind-notes" class="kind-btn">Notes &amp; records</button>
+      </div>
+      <input type="text" id="papers-search" placeholder="Search title, authors, DOI, record fields...">
       <div id="papers-list" class="papers-list"></div>
       <div class="modal-actions">
         <button id="papers-close">Close</button>
@@ -58,6 +173,12 @@
     </div>
   </div>
 
+  <script src="/static/vendor/codemirror-5.65.19/lib/codemirror.js"></script>
+  <script src="/static/vendor/codemirror-5.65.19/mode/xml/xml.js"></script>
+  <script src="/static/vendor/codemirror-5.65.19/mode/markdown/markdown.js"></script>
+  <script src="/static/vendor/codemirror-5.65.19/mode/stex/stex.js"></script>
+  <script src="/static/vendor/codemirror-5.65.19/addon/edit/closebrackets.js"></script>
+  <script src="/static/vendor/codemirror-5.65.19/addon/display/placeholder.js"></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

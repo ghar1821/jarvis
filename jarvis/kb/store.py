@@ -67,6 +67,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from jarvis.core.config import get_config
+from jarvis.core.llm import is_cloud_provider
 from jarvis.core.errors import KBCorruptionError, LLMError, RAGError
 
 COLLECTION_NAME = "knowledge_base"
@@ -110,6 +111,19 @@ def _kb_write_lock():
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
+def _is_stale_view_error(exc: Exception) -> bool:
+    """
+    Whether this failure is consistent with an out-of-date view of the index
+    rather than damage to it — i.e. worth reopening and retrying once.
+
+    Both signatures arise when another process rebuilt or rewrote the index
+    underneath this one: a deleted chunk id still referenced by this process's
+    view, or the whole collection replaced by `kb reindex`.
+    """
+    text = str(exc)
+    return "Error finding id" in text or ("does not exist" in text and "Collection" in text)
+
+
 def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
     """
     Map a raw ChromaDB failure to the most actionable error we can raise.
@@ -129,16 +143,18 @@ def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
     text = str(exc)
     if "Error finding id" in text:
         return KBCorruptionError(
-            "The knowledge base index is corrupted (a stale reference to a "
-            "deleted chunk id). Fix: run `uv run kb reindex` — this rebuilds "
-            "the index from the chunk texts already stored, so nothing is "
-            "lost. This is not retried automatically; the corruption is "
-            "persistent state, and retrying would only hide it."
+            "The knowledge-base search hit a chunk id that is no longer there. "
+            "This search was already retried once against a freshly reopened "
+            "index, so it is not simply a stale handle left over from another "
+            "process writing (the usual cause, which that retry fixes). "
+            "The index itself is likely damaged: run `uv run kb reindex` to "
+            "rebuild it from the chunk texts already stored — nothing is lost. "
+            "If even that cannot run, use `uv run kb reindex --from-storage`."
         )
     if "does not exist" in text and "Collection" in text:
         return KBCorruptionError(
             "The knowledge-base collection was rebuilt (by `kb reindex`) while "
-            "this process was running, so its database handle is stale. Fix: "
+            "this process was running, and reopening it did not help. Fix: "
             "restart this process (webapp, jarvis-sync, or vault-chat) — "
             "nothing is lost; the rebuilt knowledge base is intact on disk."
         )
@@ -208,6 +224,20 @@ def get_store(rag_dir: Path | None = None) -> Chroma:
         )
         _check_embedding_model_matches(_store, cfg.embed_model)
     return _store
+
+
+def reset_store() -> None:
+    """
+    Drop the process-wide store handle so the next get_store() re-opens it.
+
+    Needed because a long-running reader (the webapp, a chat session) holds an
+    open view of the index, and another process — usually the sync daemon —
+    writes to it on a schedule. After such a write the reader's view refers to
+    chunk ids that no longer exist, and a search fails with "Error finding id".
+    Nothing is damaged; the handle is simply out of date.
+    """
+    global _store
+    _store = None
 
 
 def _check_embedding_model_matches(store: Chroma, embed_model: str) -> None:
@@ -298,12 +328,14 @@ def add_texts(
     chunks = _split_markdown(content)
     if not chunks:
         return []
+    # Caller-supplied metadata first; the four fields every privacy and delete
+    # path keys on go last, so nothing passed in can overwrite them.
     base_metadata = {
+        **(extra_metadata or {}),
         "date_added": datetime.now(timezone.utc).isoformat(),
         "doc_type": doc_type,
         "visibility": visibility,
         "source": source,
-        **(extra_metadata or {}),
     }
     # Each chunk gets its own metadata dict (never a shared reference) carrying
     # its position and section breadcrumb. When a chunk sits under a heading, we
@@ -421,7 +453,7 @@ def add_figures(
     if not captions_on:
         return []
 
-    if visibility == "private" and provider_str == "anthropic":
+    if visibility == "private" and is_cloud_provider(provider_str):
         print(
             "  ⚠️  skipping figure captioning — images of a private note must not "
             "reach a cloud provider (switch to the local model to caption them)",
@@ -765,10 +797,26 @@ def search(
     annotation_kind: str | None = None,
     store: Chroma | None = None,
     rerank: bool = True,
+    category: str | None = None,
+    status: str | None = None,
+    entity: str | None = None,
+    fields: dict | None = None,
+    tags: list[str] | None = None,
 ) -> list[Document]:
     """
     Semantic search with optional metadata filters. doc_type accepts a single
     type or a list of types (e.g. ["paper", "digest"], matched with $in).
+
+    Record filters — category/status/entity, plus `fields` for any custom
+    frontmatter key (e.g. {"x_venue": "NeurIPS"}) — fold into the SAME `where`
+    clause as the visibility filter, so they can only ever narrow the pool the
+    privacy filter already produced. Privacy therefore holds by construction
+    here, not by a second check.
+
+    `tags` is the one exception: ChromaDB has no substring or list-contains
+    operator, so tag filtering happens on the returned metadata AFTER
+    re-ranking. That means a tag filter can only shrink the result set it is
+    handed — ask for a larger n_results when filtering by tag.
 
     When cfg.hybrid is set (the default), candidates come from _hybrid_search
     (dense + BM25 fused by reciprocal rank fusion) instead of plain
@@ -797,6 +845,12 @@ def search(
             conditions.append({"doc_type": {"$in": list(doc_type)}})
     if annotation_kind:
         conditions.append({"annotation_kind": {"$eq": annotation_kind}})
+    for field, value in (
+        ("category", category), ("status", status), ("entity", entity),
+        *(fields or {}).items(),
+    ):
+        if value:
+            conditions.append({field: {"$eq": value}})
 
     filter_dict = None
     if len(conditions) == 1:
@@ -808,20 +862,46 @@ def search(
     fetch_k = max(n_results, get_config().rerank_top_n) if reranker else n_results
 
     cfg = get_config()
-    try:
+
+    def run(active_store):
         if cfg.hybrid:
-            candidates = _hybrid_search(query, fetch_k, filter_dict, s)
-        else:
-            candidates = s.similarity_search(query, k=fetch_k, filter=filter_dict)
+            return _hybrid_search(query, fetch_k, filter_dict, active_store)
+        return active_store.similarity_search(query, k=fetch_k, filter=filter_dict)
+
+    try:
+        candidates = run(s)
     except Exception as exc:
-        raise _diagnose_kb_error(exc, f"Search failed: {exc}") from exc
+        # A long-running reader (webapp, chat session) holds an open view of
+        # the index while the sync daemon writes to it on a schedule. After a
+        # write, the reader's view names ids that no longer exist and the
+        # search fails — but nothing is damaged, the handle is just out of
+        # date. Reopen and try once more. Only a second failure is treated as
+        # real corruption, so a persistent problem still surfaces rather than
+        # being retried away.
+        if store is not None or not _is_stale_view_error(exc):
+            raise _diagnose_kb_error(exc, f"Search failed: {exc}") from exc
+        reset_store()
+        try:
+            candidates = run(get_store())
+        except Exception as retry_exc:
+            raise _diagnose_kb_error(retry_exc, f"Search failed: {retry_exc}") from retry_exc
 
-    if reranker is None or len(candidates) <= n_results:
-        return candidates[:n_results]
+    if reranker is not None and len(candidates) > n_results:
+        scores = reranker.predict([(query, doc.page_content) for doc in candidates])
+        candidates = [
+            doc for _, doc in
+            sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)
+        ]
 
-    scores = reranker.predict([(query, doc.page_content) for doc in candidates])
-    ranked = [doc for _, doc in sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)]
-    return ranked[:n_results]
+    if tags:
+        from .frontmatter import has_tag
+
+        candidates = [
+            doc for doc in candidates
+            if all(has_tag(doc.metadata.get("tags", ""), tag) for tag in tags)
+        ]
+
+    return candidates[:n_results]
 
 
 def search_with_privacy_check(
@@ -830,13 +910,14 @@ def search_with_privacy_check(
     n_results: int = 5,
     doc_type: str | list[str] | None = None,
     store: Chroma | None = None,
+    **filters,
 ) -> tuple[list[Document], bool]:
     """
     Search with provider-aware privacy handling.
 
     Returns (results, has_private_hits).
 
-    For cloud providers (Anthropic):
+    For cloud providers (anything but ollama):
       - Returns public docs only
       - has_private_hits=True if private docs also matched (so the caller
         can warn the user that results may be incomplete)
@@ -844,24 +925,65 @@ def search_with_privacy_check(
     For local providers (Ollama):
       - Returns all docs regardless of visibility
       - has_private_hits is always False
+
+    `filters` (category/status/entity/fields/tags) pass straight through to
+    search(), where they narrow the already-privacy-filtered pool. They are
+    applied to the private-hit probe too, so the "some matches were excluded"
+    caveat reflects the same query the user actually asked.
     """
     s = store or get_store()
-    if provider == "anthropic":
+    if is_cloud_provider(provider):
         results = search(query, n_results=n_results, visibility="public",
-                         doc_type=doc_type, store=s)
+                         doc_type=doc_type, store=s, **filters)
         try:
             # A cheap existence probe — order doesn't matter, so skip re-ranking.
             # The retrieved private document stays in local process memory only;
             # nothing beyond len(...) is used, and the probe runs before any
             # cloud request, so private content cannot leak through this path.
             private_check = search(query, n_results=1, visibility="private",
-                                   doc_type=doc_type, store=s, rerank=False)
+                                   doc_type=doc_type, store=s, rerank=False, **filters)
             has_private = len(private_check) > 0
         except RAGError:
             has_private = False
         return results, has_private
     else:
-        return search(query, n_results=n_results, doc_type=doc_type, store=s), False
+        return search(query, n_results=n_results, doc_type=doc_type, store=s, **filters), False
+
+
+def metadata_key_counts(store: Chroma | None = None) -> dict[str, int]:
+    """
+    How many chunks carry each metadata key, for `kb schema`.
+
+    The point is to make the user's own ontology visible: which record types,
+    statuses, and custom `x_` fields actually exist in the store, so a typo
+    ("stauts: rejected") shows up as its own key rather than silently never
+    matching a filter.
+    """
+    s = store or get_store()
+    counts: dict[str, int] = {}
+    try:
+        result = s._collection.get(include=["metadatas"])
+    except Exception as exc:
+        raise _diagnose_kb_error(exc, f"Failed to read metadata: {exc}") from exc
+    for meta in result["metadatas"] or []:
+        for key in meta:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def metadata_value_counts(key: str, store: Chroma | None = None) -> dict[str, int]:
+    """Distinct values of one metadata key with their chunk counts."""
+    s = store or get_store()
+    counts: dict[str, int] = {}
+    try:
+        result = s._collection.get(include=["metadatas"])
+    except Exception as exc:
+        raise _diagnose_kb_error(exc, f"Failed to read metadata: {exc}") from exc
+    for meta in result["metadatas"] or []:
+        if key in meta:
+            value = str(meta[key])
+            counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -956,12 +1078,19 @@ def get_document_chunks(source: str, store: Chroma | None = None) -> list[Docume
     return body_chunks + annotation_chunks
 
 
-def update_visibility(file_path: str, new_visibility: str, store: Chroma | None = None) -> int:
+def update_metadata_fields(
+    file_path: str,
+    fields: dict,
+    store: Chroma | None = None,
+) -> int:
     """
-    Update the visibility metadata for all chunks of a vault note, without
-    touching content or re-embedding. Used by refresh_vault when a file's
-    classification changes (e.g. private_vault_dirs edited in config) even
-    though its content and path did not.
+    Set metadata fields on every chunk of one file, without touching content
+    or re-embedding. Returns the number of chunks updated.
+
+    This is the cheap half of refresh_vault: when only jarvis's interpretation
+    of a file has moved on — not the file itself — there is nothing to
+    re-embed, and rewriting the vectors would be pure cost plus a window where
+    the note is missing from the index.
     """
     s = store or get_store()
     try:
@@ -975,14 +1104,24 @@ def update_visibility(file_path: str, new_visibility: str, store: Chroma | None 
     if not ids:
         return 0
 
-    updated_metadatas = [{**m, "visibility": new_visibility} for m in result["metadatas"]]
+    updated_metadatas = [{**m, **fields} for m in result["metadatas"]]
     try:
         with _kb_write_lock():
             s._collection.update(ids=ids, metadatas=updated_metadatas)
     except Exception as exc:
-        raise RAGError(f"Failed to update visibility: {exc}") from exc
+        raise RAGError(f"Failed to update metadata: {exc}") from exc
 
     return len(ids)
+
+
+def update_visibility(file_path: str, new_visibility: str, store: Chroma | None = None) -> int:
+    """
+    Update the visibility metadata for all chunks of a vault note, without
+    touching content or re-embedding. Used by refresh_vault when a file's
+    classification changes (e.g. private_vault_dirs edited in config) even
+    though its content and path did not.
+    """
+    return update_metadata_fields(file_path, {"visibility": new_visibility}, store)
 
 
 def update_chat_title(session_id: str, new_title: str, store: Chroma | None = None) -> int:
@@ -1013,38 +1152,54 @@ def update_chat_title(session_id: str, new_title: str, store: Chroma | None = No
     return len(ids)
 
 
-def list_papers(
+def list_documents(
     limit: int = 10_000,
+    doc_type: str | list[str] = "paper",
+    category: str | None = None,
+    status: str | None = None,
+    entity: str | None = None,
     store: Chroma | None = None,
 ) -> list[dict]:
     """
-    Return de-duplicated list of indexed papers as metadata dicts, most
-    recently added first. The default limit is high enough to return every
-    paper in a single-user KB in one call; callers that want a short preview
-    (e.g. the list_papers chat tool) pass their own smaller limit.
+    De-duplicated list of indexed documents as metadata dicts, most recently
+    added first, with a chunk_count per document.
+
+    Papers are keyed by `source`; notes share `source="local"` and are keyed by
+    `file_path` instead, so listing notes returns one entry per file rather
+    than one entry for the entire vault.
+
+    The default limit returns every document in a single-user KB in one call;
+    callers wanting a short preview pass their own smaller limit.
     """
     s = store or get_store()
+    conditions: list[dict] = []
+    if isinstance(doc_type, str):
+        conditions.append({"doc_type": {"$eq": doc_type}})
+    else:
+        conditions.append({"doc_type": {"$in": list(doc_type)}})
+    for field, value in (("category", category), ("status", status), ("entity", entity)):
+        if value:
+            conditions.append({field: {"$eq": value}})
+    where = conditions[0] if len(conditions) == 1 else {"$and": conditions}
+
     try:
-        result = s._collection.get(
-            where={"doc_type": {"$eq": "paper"}},
-            include=["metadatas"],
-        )
+        result = s._collection.get(where=where, include=["metadatas"])
     except Exception as exc:
         raise RAGError(f"List failed: {exc}") from exc
 
     chunk_counts: dict[str, int] = {}
     first_meta: dict[str, dict] = {}
     for meta in result["metadatas"]:
-        src = meta.get("source", "")
-        if not src:
+        key = meta.get("file_path") if meta.get("doc_type") == "note" else meta.get("source")
+        if not key:
             continue
-        chunk_counts[src] = chunk_counts.get(src, 0) + 1
-        if src not in first_meta:
-            first_meta[src] = meta
+        chunk_counts[key] = chunk_counts.get(key, 0) + 1
+        if key not in first_meta:
+            first_meta[key] = meta
 
-    papers = [{**meta, "chunk_count": chunk_counts[src]} for src, meta in first_meta.items()]
-    papers.sort(key=lambda p: p.get("date_added", ""), reverse=True)
-    return papers[:limit]
+    documents = [{**meta, "chunk_count": chunk_counts[key]} for key, meta in first_meta.items()]
+    documents.sort(key=lambda d: d.get("date_added", ""), reverse=True)
+    return documents[:limit]
 
 
 # ── Vault indexing ────────────────────────────────────────────────────────────
@@ -1066,28 +1221,53 @@ def index_vault_file(
     vault_root: Path,
     store: Chroma | None = None,
 ) -> list[str]:
-    """Chunk and index a single vault .md file. Returns list of chunk IDs."""
+    """
+    Chunk and index a single vault .md file. Returns list of chunk IDs.
+
+    YAML frontmatter, when present, becomes filterable metadata (see
+    jarvis/kb/frontmatter.py) — that is what lets a note be a job application
+    with an outcome or a manuscript with a venue rather than just prose. The
+    frontmatter block itself is stripped before chunking (it is structure, not
+    content the user would want retrieved), but the record header derived from
+    it is embedded into every chunk so a query naming the record's type,
+    entity, or status can match any part of it.
+    """
+    from .frontmatter import META_SCHEMA, parse_frontmatter, record_header
+
     content = file_path.read_text(encoding="utf-8", errors="replace")
     rel_path = str(file_path.relative_to(vault_root))
     visibility = get_visibility(file_path, vault_root)
+    # Hashed over the WHOLE file, frontmatter included — editing only the
+    # status of a record must still count as a change.
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     modified_at = datetime.fromtimestamp(
         file_path.stat().st_mtime, tz=timezone.utc
     ).isoformat()
-    title_match = re.search(r"^#\s+(.+)", content, re.MULTILINE)
+
+    record_metadata, body = parse_frontmatter(content, file_label=rel_path)
+    title_match = re.search(r"^#\s+(.+)", body, re.MULTILINE)
     title = title_match.group(1).strip() if title_match else file_path.stem
 
     return add_texts(
-        content=content,
+        content=body,
         doc_type="note",
         visibility=visibility,
         source="local",
         extra_metadata={
+            # Record fields FIRST, jarvis's own keys after, so the note's own
+            # frontmatter can never win a collision. parse_frontmatter already
+            # namespaces user keys under x_, but ordering makes the guarantee
+            # structural rather than dependent on that table staying correct.
+            **record_metadata,
             "file_path": rel_path,
             "title": title,
             "content_hash": content_hash,
             "modified_at": modified_at,
+            # Stamped on every note, frontmatter or not, so refresh_vault can
+            # tell "indexed under the current schema" from "needs a backfill".
+            "meta_schema": META_SCHEMA,
         },
+        embed_header=record_header(record_metadata),
         store=store,
     )
 
@@ -1104,17 +1284,24 @@ def refresh_vault(
     """
     s = store or get_store()
 
-    # Build map of currently indexed notes: file_path → (content_hash, visibility)
+    from .frontmatter import META_SCHEMA
+
+    # Build map of currently indexed notes:
+    #   file_path → (content_hash, visibility, meta_schema)
     try:
         result = s._collection.get(
             where={"doc_type": {"$eq": "note"}},
             include=["metadatas"],
         )
-        indexed: dict[str, tuple[str, str]] = {}
+        indexed: dict[str, tuple[str, str, int]] = {}
         for meta in result["metadatas"]:
             fp = meta.get("file_path", "")
             if fp and fp not in indexed:
-                indexed[fp] = (meta.get("content_hash", ""), meta.get("visibility", "public"))
+                indexed[fp] = (
+                    meta.get("content_hash", ""),
+                    meta.get("visibility", "public"),
+                    int(meta.get("meta_schema", 0)),
+                )
     except Exception:
         indexed = {}
 
@@ -1136,10 +1323,33 @@ def refresh_vault(
             index_vault_file(file_path, vault_root, s)
             added += 1
             continue
-        stored_hash, stored_visibility = stored
+        stored_hash, stored_visibility, stored_schema = stored
         if stored_hash != file_hash:
+            # The file itself changed: its text must be re-chunked and
+            # re-embedded, so the delete-and-re-add is unavoidable.
             delete_by_metadata("file_path", rel_path, s)
             index_vault_file(file_path, vault_root, s)
+            updated += 1
+        elif stored_schema < META_SCHEMA:
+            # The file is untouched; only jarvis's reading of it moved on.
+            # Whether that needs a re-embed depends on one thing: does the note
+            # have a frontmatter block? If it does, both the indexed body (the
+            # block is now stripped from it) and the embedded record header
+            # change, so it has to be re-indexed. If it does not — the common
+            # case for a plain note — nothing about its vectors would differ,
+            # so stamp the marker and move on. That keeps a schema migration
+            # from re-embedding an entire vault to record that most of it had
+            # nothing to record.
+            from .frontmatter import split_frontmatter
+
+            raw, _ = split_frontmatter(
+                file_path.read_text(encoding="utf-8", errors="replace")
+            )
+            if raw.strip():
+                delete_by_metadata("file_path", rel_path, s)
+                index_vault_file(file_path, vault_root, s)
+            else:
+                update_metadata_fields(rel_path, {"meta_schema": META_SCHEMA}, s)
             updated += 1
         else:
             # Content unchanged, but the classification rule may have changed

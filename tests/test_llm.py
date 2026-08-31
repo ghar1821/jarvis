@@ -23,7 +23,16 @@ from types import SimpleNamespace
 import pytest
 
 from jarvis.core.errors import PrivacyError
-from jarvis.core.llm import AnthropicProvider, OllamaProvider, active_model, make_provider
+from jarvis.core.llm import (
+    AnthropicProvider,
+    OllamaProvider,
+    OpenRouterProvider,
+    active_model,
+    is_cloud_provider,
+    make_provider,
+    split_spec,
+)
+from jarvis.core.transcript import message_text, user_message
 
 TOOLS = [
     {
@@ -88,13 +97,52 @@ def test_ollama_is_reachable():
 
 def test_make_provider_dispatches_on_spec():
     """
-    make_provider maps 'ollama' and 'anthropic' to their adapters and rejects
-    anything else.
+    make_provider maps each provider name to its adapter and rejects anything
+    else. A "provider:model" spec names the model inline, which is how a
+    session records the model it is running on.
     """
     assert isinstance(make_provider("ollama"), OllamaProvider)
     assert isinstance(make_provider("anthropic"), AnthropicProvider)
+
+    router = make_provider("openrouter:openai/gpt-5")
+    assert isinstance(router, OpenRouterProvider)
+    assert router.model == "openai/gpt-5"
+
     with pytest.raises(ValueError, match="Unknown provider"):
         make_provider("llamacpp")
+
+
+def test_split_spec_keeps_slashes_and_dots_in_the_model():
+    """OpenRouter model names carry both, so only the first colon splits."""
+    assert split_spec("openrouter:anthropic/claude-sonnet-4.6") == (
+        "openrouter",
+        "anthropic/claude-sonnet-4.6",
+    )
+    assert split_spec("ollama") == ("ollama", "")
+
+
+def test_make_provider_refuses_openrouter_without_a_model():
+    """
+    There is no sensible default model for a broker fronting hundreds of them,
+    so jarvis asks rather than guessing.
+    """
+    with pytest.raises(ValueError, match="No model configured"):
+        make_provider("openrouter")
+
+
+def test_is_cloud_provider_is_local_vs_everything_else():
+    """
+    The privacy model keys on one predicate, not on a vendor name, so adding a
+    provider cannot quietly open a hole. A "provider:model" spec is classified
+    by its provider half.
+    """
+    assert is_cloud_provider("ollama") is False
+    assert is_cloud_provider("ollama:qwen3-vl:30b") is False
+    assert is_cloud_provider("anthropic") is True
+    assert is_cloud_provider("openrouter") is True
+    assert is_cloud_provider("openrouter:openai/gpt-5") is True
+    # An unknown name must fail closed — treated as cloud, never as local.
+    assert is_cloud_provider("some-new-vendor") is True
 
 
 def test_active_model_picks_provider_appropriate_field():
@@ -161,12 +209,14 @@ class _FakeOllamaClient:
 def test_ollama_agentic_turn_dispatches_tools_with_dict_args():
     """
     Ollama returns tool arguments as a mapping already, so they reach dispatch
-    as a dict without any JSON parsing; results feed back as role='tool'
-    messages and the final text is returned.
+    as a dict without any JSON parsing. The wire sent to Ollama uses its
+    role="tool" / tool_name shape, while the history appended to `messages` is
+    the provider-neutral transcript — that split is what lets the next turn run
+    on a different model.
 
     Input:  scripted tool_use response then a text response
-    Expected output: dispatch got dict args; reply text returned; history has
-            the assistant tool-call dict + tool result + final assistant text
+    Expected output: dispatch got dict args; reply text returned; neutral
+            history has the tool_call block, its tool_result, and the reply
     """
     provider = OllamaProvider(model="test-model")
     provider._client = _FakeOllamaClient(
@@ -182,14 +232,23 @@ def test_ollama_agentic_turn_dispatches_tools_with_dict_args():
         dispatched.append((name, args))
         return "file contents"
 
-    messages = [{"role": "user", "content": "read notes.md"}]
+    messages = [user_message("read notes.md")]
     reply = provider.agentic_turn(messages, TOOLS, dispatch_fn, system="be helpful")
 
     assert reply == "Here is the summary."
     assert dispatched == [("read_file", {"path": "notes.md"})]
-    assert messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
-    assert messages[2] == {"role": "tool", "tool_name": "read_file", "content": "file contents"}
-    assert messages[3] == {"role": "assistant", "content": "Here is the summary."}
+
+    call = messages[1]["content"][0]
+    assert call["type"] == "tool_call" and call["name"] == "read_file"
+    result = messages[2]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["tool_call_id"] == call["id"]
+    assert result["content"] == "file contents"
+    assert message_text(messages[3]) == "Here is the summary."
+
+    # The wire Ollama actually saw keys the result by tool name, not by id.
+    sent = provider._client.calls[-1]["messages"]
+    assert {"role": "tool", "tool_name": "read_file", "content": "file contents"} in sent
 
 
 def test_ollama_agentic_turn_privacy_error_stops_cleanly():
@@ -210,11 +269,11 @@ def test_ollama_agentic_turn_privacy_error_stops_cleanly():
     def dispatch_fn(name, args):
         raise PrivacyError("blocked: private content")
 
-    messages = [{"role": "user", "content": "read my private note"}]
+    messages = [user_message("read my private note")]
     reply = provider.agentic_turn(messages, TOOLS, dispatch_fn)
 
     assert reply == "blocked: private content"
-    assert messages == [{"role": "user", "content": "read my private note"}]
+    assert messages == [user_message("read my private note")]
     assert len(client.calls) == 1
 
 
@@ -251,11 +310,11 @@ def test_anthropic_agentic_turn_privacy_error_stops_cleanly():
     def dispatch_fn(name, args):
         raise PrivacyError("blocked: private content")
 
-    messages = [{"role": "user", "content": "read my private note"}]
+    messages = [user_message("read my private note")]
     reply = provider.agentic_turn(messages, TOOLS, dispatch_fn, system="be helpful")
 
     assert reply == "blocked: private content"
-    assert messages == [{"role": "user", "content": "read my private note"}]
+    assert messages == [user_message("read my private note")]
     assert len(client.calls) == 1
 
 
@@ -277,10 +336,179 @@ def test_anthropic_agentic_turn_bundles_tool_results_in_one_user_message():
     provider = AnthropicProvider(model="claude-test")
     provider._client = _FakeAnthropicClient(responses)
 
-    messages = [{"role": "user", "content": "read both files"}]
+    messages = [user_message("read both files")]
     reply = provider.agentic_turn(messages, TOOLS, lambda name, args: f"contents of {args['path']}")
 
     assert reply == "Done."
+    # Neutral history keeps both results together in one user message...
     tool_result_message = messages[2]
     assert tool_result_message["role"] == "user"
-    assert [b["tool_use_id"] for b in tool_result_message["content"]] == ["tu_a", "tu_b"]
+    assert [b["tool_call_id"] for b in tool_result_message["content"]] == ["tu_a", "tu_b"]
+
+    # ...and so does the wire actually sent to the API, which is the rule that
+    # matters: separate messages are a 400.
+    sent = provider._client.calls[-1]["messages"]
+    result_messages = [
+        m for m in sent
+        if m["role"] == "user" and any(b.get("type") == "tool_result" for b in m["content"])
+    ]
+    assert len(result_messages) == 1
+    assert [b["tool_use_id"] for b in result_messages[0]["content"]] == ["tu_a", "tu_b"]
+
+# ── Unit: OpenRouterProvider ───────────────────────────────────────────────────
+
+
+def _openai_tool_call(call_id: str, name: str, arguments: str):
+    return SimpleNamespace(
+        id=call_id, type="function",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _openai_response(content=None, tool_calls=None, cost=None):
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    usage = SimpleNamespace(cost=cost) if cost is not None else None
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+
+class _FakeOpenAIClient:
+    """Replays scripted chat.completions responses; records every request."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._responses.pop(0)
+
+
+def test_openrouter_agentic_turn_runs_the_tool_loop():
+    """
+    OpenAI-shaped tool calling: arguments arrive as a JSON string and are
+    parsed before dispatch, each result goes back as its own role="tool"
+    message keyed by call id, and the neutral history records the pairing.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([
+        _openai_response(tool_calls=[_openai_tool_call("c1", "read_file", '{"path": "notes.md"}')]),
+        _openai_response(content="Here is the summary."),
+    ])
+
+    dispatched = []
+
+    def dispatch_fn(name, args):
+        dispatched.append((name, args))
+        return "file contents"
+
+    messages = [user_message("read notes.md")]
+    reply = provider.agentic_turn(messages, TOOLS, dispatch_fn, system="be helpful")
+
+    assert reply == "Here is the summary."
+    assert dispatched == [("read_file", {"path": "notes.md"})]
+
+    call = messages[1]["content"][0]
+    result = messages[2]["content"][0]
+    assert call["type"] == "tool_call" and call["id"] == "c1"
+    assert result["tool_call_id"] == "c1" and result["content"] == "file contents"
+    assert message_text(messages[3]) == "Here is the summary."
+
+    sent = provider._client.calls[-1]["messages"]
+    assert {"role": "tool", "tool_call_id": "c1", "content": "file contents"} in sent
+
+
+def test_openrouter_privacy_error_stops_cleanly():
+    """Same PrivacyError contract as the other two adapters."""
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    client = _FakeOpenAIClient([
+        _openai_response(tool_calls=[_openai_tool_call("c1", "read_file", '{"path": "private/x.md"}')]),
+    ])
+    provider._client = client
+
+    def dispatch_fn(name, args):
+        raise PrivacyError("blocked: private content")
+
+    messages = [user_message("read my private note")]
+    reply = provider.agentic_turn(messages, TOOLS, dispatch_fn)
+
+    assert reply == "blocked: private content"
+    assert messages == [user_message("read my private note")]
+    assert len(client.calls) == 1
+
+
+def test_openrouter_sends_the_routing_hardening_on_every_request():
+    """
+    OpenRouter is a broker, so each request must carry the strict routing
+    preferences — otherwise it may pick an upstream provider that trains on
+    what it is sent. Usage accounting is requested too; it is the only cost
+    figure jarvis reports.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([_openai_response(content="hi")])
+
+    provider.agentic_turn([user_message("hello")], TOOLS, lambda n, a: "")
+
+    extra = provider._client.calls[0]["extra_body"]
+    assert extra["provider"]["data_collection"] == "deny"
+    assert extra["provider"]["allow_fallbacks"] is False
+    assert extra["usage"] == {"include": True}
+
+
+def test_openrouter_omits_leaderboard_headers():
+    """
+    The optional HTTP-Referer / X-Title headers exist to list the app on
+    OpenRouter's public leaderboards — sending them would be telemetry by
+    another name, so no request may carry them.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([_openai_response(content="hi")])
+
+    provider.agentic_turn([user_message("hello")], TOOLS, lambda n, a: "")
+
+    request = provider._client.calls[0]
+    headers = request.get("extra_headers") or {}
+    assert "HTTP-Referer" not in headers
+    assert "X-Title" not in headers
+
+
+def test_openrouter_accumulates_reported_cost_and_pop_resets():
+    """
+    Cost comes from what OpenRouter reports per request, summed across the
+    whole turn (a tool loop is several requests). pop_usage() drains it so the
+    caller can add exactly one turn's spend to the session.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([
+        _openai_response(tool_calls=[_openai_tool_call("c1", "read_file", "{}")], cost=0.001),
+        _openai_response(content="done", cost=0.002),
+    ])
+
+    provider.agentic_turn([user_message("go")], TOOLS, lambda n, a: "result")
+
+    usage = provider.pop_usage()
+    assert usage == {"usd": 0.003, "requests": 2}
+    assert provider.pop_usage() is None  # drained
+
+
+def test_openrouter_reports_no_cost_when_none_came_back():
+    """
+    A response without a cost figure contributes nothing — jarvis never
+    invents a number. The request is still counted.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([_openai_response(content="hi")])
+
+    provider.agentic_turn([user_message("hello")], TOOLS, lambda n, a: "")
+
+    assert provider.pop_usage() == {"usd": 0.0, "requests": 1}
+
+
+def test_local_and_anthropic_providers_report_no_cost():
+    """
+    Ollama runs on the user's own hardware, and turning Anthropic's token
+    counts into dollars would need a price table that ages silently. Both
+    report nothing rather than something unreliable.
+    """
+    assert OllamaProvider(model="m").pop_usage() is None
+    assert AnthropicProvider(model="m").pop_usage() is None

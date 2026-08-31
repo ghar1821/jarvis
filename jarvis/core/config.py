@@ -9,6 +9,9 @@ Resolution order (later wins):
 Example ~/.jarvis/config.toml:
 
     [digest]
+    # The weekly paper digest is off by default — jarvis is a general
+    # assistant, and fetching arXiv on a schedule is opt-in.
+    enabled = false
     output_dir = "~/Documents/papers/digest"
     max_results = 10
     # arxiv_categories is a list of [category, limit] pairs:
@@ -37,8 +40,10 @@ Example ~/.jarvis/config.toml:
     hybrid = true
 
     [chat]
-    provider = "ollama"          # "ollama" | "anthropic"
+    provider = "ollama"          # "ollama" | "anthropic" | "openrouter"
     anthropic_model = "claude-sonnet-4-6"
+    # Default model when provider = "openrouter"
+    openrouter_model = "anthropic/claude-sonnet-4.6"
     # Ollama model tag (must support tool calling; vision for figure captioning)
     ollama_model = "qwen3-vl:30b"
     vault_path = "~/vault"
@@ -59,8 +64,36 @@ Example ~/.jarvis/config.toml:
     digest_day = "mon"           # APScheduler day_of_week token
     digest_hour = 5
 
+    [drafts]
+    # The agent-writable sandbox. It sits OUTSIDE the vault on purpose: the
+    # boundary between "the agent may write here" and "only you may put things
+    # here" is a filesystem fact, not a config rule that could be mistyped.
+    dir = "~/.jarvis/drafts"
+    extensions = [".md", ".tex", ".bib", ".txt", ".csv"]
+    max_file_bytes = 2000000
+    retention_days = 30          # 0 disables the sweep entirely
+    gc_hour = 4                  # daily sweep slot
+    latex_engine = "latexmk"     # "" disables .tex compilation and PDF export
+    compile_timeout_seconds = 60
+    pdf_margin = "2cm"           # margin for Markdown -> PDF export
+
+    [openrouter]
+    # OpenRouter is a broker: without these it may route a request to any
+    # upstream inference provider it has a route for. The defaults are strict.
+    data_collection = "deny"     # exclude providers that train on prompts
+    allow_fallbacks = false      # never silently reroute to an unvetted provider
+    only = []                    # optional allowlist of upstream provider slugs
+
+    [models]
+    # The switchable catalogue shown by /model and the webapp picker. Entirely
+    # user-maintained — jarvis ships no vendor model list. Populate the
+    # OpenRouter entry automatically with: uv run kb models --refresh
+    openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
+    ollama = ["qwen3-vl:30b"]
+
     [auth]
-    api_key = "sk-ant-..."    # Anthropic API key (alternative to ANTHROPIC_API_KEY env var)
+    api_key = "sk-ant-..."         # Anthropic API key (or ANTHROPIC_API_KEY env var)
+    openrouter_api_key = "sk-or-..."  # OpenRouter key (or OPENROUTER_API_KEY env var)
 """
 
 import os
@@ -83,6 +116,9 @@ _DEFAULT_ARXIV_CATS: list[tuple[str, int]] = [
 @dataclass
 class Config:
     # ── Digest pipeline ───────────────────────────────────────────────────────
+    # Off unless the user opts in. Everything below only matters when it's on:
+    # the daemon skips both digest jobs and `run-digest` refuses to fetch.
+    digest_enabled: bool = False
     anthropic_model: str = "claude-sonnet-4-6"
     output_dir: Path = field(default_factory=lambda: Path("~/Documents/papers/digest").expanduser())
     max_results: int = 10
@@ -126,7 +162,12 @@ class Config:
     hybrid: bool = True
 
     # ── Chat / LLM provider ──────────────────────────────────────────────────
-    provider: str = "ollama"  # "ollama" | "anthropic"
+    # "ollama" | "anthropic" | "openrouter", optionally "<provider>:<model>"
+    provider: str = "ollama"
+    # Default model when the provider is openrouter and no model is named.
+    # Empty by default: there is no sensible default model for a broker that
+    # fronts hundreds of them, so jarvis asks rather than guessing.
+    openrouter_model: str = ""
     # Ollama model tag. qwen3-vl:30b is a vision + thinking MoE (3.3B active
     # params) that fits comfortably in 36GB on an M3 Max. Confirm the exact
     # registry tag with `ollama list` — Ollama's naming can shift over time.
@@ -143,6 +184,26 @@ class Config:
     compact_after_tokens: int = 12000
     compact_keep_exchanges: int = 6
 
+    # ── Drafts sandbox ───────────────────────────────────────────────────────
+    # The only place on disk the model can write. Outside the vault so the
+    # boundary is physical rather than a config rule.
+    drafts_dir: Path = field(default_factory=lambda: Path("~/.jarvis/drafts").expanduser())
+    drafts_extensions: list[str] = field(
+        default_factory=lambda: [".md", ".tex", ".bib", ".txt", ".csv"]
+    )
+    drafts_max_file_bytes: int = 2_000_000
+    # Drafts untouched for this long are removed by the daemon's sweep. This is
+    # the only file deletion anywhere in jarvis; 0 disables it.
+    drafts_retention_days: int = 30
+    drafts_gc_hour: int = 4
+    # Compilation and PDF export run locally with no model in the loop, which
+    # is why they are allowed on a private draft. "" hides the compile button.
+    latex_engine: str = "latexmk"
+    compile_timeout_seconds: int = 60
+    # Margin for Markdown -> PDF export. pandoc's default leaves an inch and a
+    # half of white space on every side, which wastes most of the page.
+    pdf_margin: str = "2cm"
+
     # ── Sync daemon ──────────────────────────────────────────────────────────
     # PDF inbox scanned periodically by jarvis-sync; None disables the scan.
     pdf_watch_dir: Path | None = None
@@ -156,8 +217,21 @@ class Config:
     # misfire handling, so a slot closer to working hours misses less often.
     digest_hour: int = 5
 
+    # ── OpenRouter routing ───────────────────────────────────────────────────
+    # Sent with every OpenRouter request. Strict by default: a broker that can
+    # route to any upstream provider should not do so silently.
+    openrouter_data_collection: str = "deny"
+    openrouter_allow_fallbacks: bool = False
+    openrouter_only: list[str] = field(default_factory=list)
+
+    # ── Model catalogue ──────────────────────────────────────────────────────
+    # {provider: [model, ...]} offered by /model and the webapp picker.
+    # User-maintained — jarvis never hardcodes a vendor model list.
+    models: dict[str, list[str]] = field(default_factory=dict)
+
     # ── Auth ──────────────────────────────────────────────────────────────────
     anthropic_api_key: str = ""
+    openrouter_api_key: str = ""
 
 
 def load_config(config_file: Path = CONFIG_FILE) -> Config:
@@ -169,6 +243,8 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             data = tomllib.load(f)
 
         d = data.get("digest", {})
+        if "enabled" in d:
+            cfg.digest_enabled = bool(d["enabled"])
         if "output_dir" in d:
             cfg.output_dir = Path(str(d["output_dir"])).expanduser()
         if "max_results" in d:
@@ -223,6 +299,8 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             )
         if "ollama_model" in c:
             cfg.ollama_model = str(c["ollama_model"])
+        if "openrouter_model" in c:
+            cfg.openrouter_model = str(c["openrouter_model"])
         if "vault_path" in c:
             cfg.vault_path = Path(str(c["vault_path"])).expanduser()
         if "private_vault_dirs" in c:
@@ -248,11 +326,53 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
         if "digest_hour" in s:
             cfg.digest_hour = int(s["digest_hour"])
 
+        dr = data.get("drafts", {})
+        if "dir" in dr:
+            cfg.drafts_dir = Path(str(dr["dir"])).expanduser()
+        if "extensions" in dr:
+            cfg.drafts_extensions = [str(ext).lower() for ext in dr["extensions"]]
+        if "max_file_bytes" in dr:
+            cfg.drafts_max_file_bytes = int(dr["max_file_bytes"])
+        if "retention_days" in dr:
+            cfg.drafts_retention_days = int(dr["retention_days"])
+        if "gc_hour" in dr:
+            cfg.drafts_gc_hour = int(dr["gc_hour"])
+        if "latex_engine" in dr:
+            cfg.latex_engine = str(dr["latex_engine"])
+        if "compile_timeout_seconds" in dr:
+            cfg.compile_timeout_seconds = int(dr["compile_timeout_seconds"])
+        if "pdf_margin" in dr:
+            cfg.pdf_margin = str(dr["pdf_margin"])
+
+        o = data.get("openrouter", {})
+        if "data_collection" in o:
+            cfg.openrouter_data_collection = str(o["data_collection"])
+        if "allow_fallbacks" in o:
+            cfg.openrouter_allow_fallbacks = bool(o["allow_fallbacks"])
+        if "only" in o:
+            cfg.openrouter_only = [str(slug) for slug in o["only"]]
+
+        # [models] is the user's own switchable catalogue: every key is a
+        # provider name, every value a list of model names. Nothing is
+        # validated against a vendor list — jarvis does not keep one.
+        m = data.get("models", {})
+        if m:
+            cfg.models = {
+                str(provider): [str(name) for name in names]
+                for provider, names in m.items()
+            }
+
         a = data.get("auth", {})
         if "api_key" in a:
             cfg.anthropic_api_key = str(a["api_key"])
+        if "openrouter_api_key" in a:
+            cfg.openrouter_api_key = str(a["openrouter_api_key"])
 
     # Env var overrides (always win over TOML)
+    if v := os.environ.get("OPENROUTER_API_KEY"):
+        cfg.openrouter_api_key = v
+    if v := os.environ.get("OPENROUTER_MODEL"):
+        cfg.openrouter_model = v
     if v := os.environ.get("OLLAMA_MODEL"):
         cfg.ollama_model = v
     if v := os.environ.get("ANTHROPIC_MODEL"):

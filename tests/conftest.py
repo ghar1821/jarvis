@@ -66,3 +66,40 @@ def store(embeddings):
     )
     yield s
     s.delete_collection()
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_jarvis_home():
+    """
+    Fail any test that writes into the developer's own ~/.jarvis.
+
+    A `Config()` built in a test inherits home-rooted defaults for every path
+    it does not override, so forgetting one silently points a test at real
+    data. That happened: a fixture overrode drafts_dir and vault_path but left
+    a third path at its default, and a test wrote into the developer's actual
+    home directory.
+
+    Watching the paths that get *written* by default-constructed Configs is
+    cheap (a stat call per test) and turns that whole class of mistake into a
+    failing test instead of a surprise on someone's machine.
+    """
+    watched = [
+        Path.home() / ".jarvis" / "drafts",
+    ]
+
+    def snapshot():
+        state = {}
+        for path in watched:
+            try:
+                state[path] = path.stat().st_mtime_ns
+            except FileNotFoundError:
+                state[path] = None
+        return state
+
+    before = snapshot()
+    yield
+    for path, was in snapshot().items():
+        assert was == before[path], (
+            f"a test modified {path}, which is real user data — give the test "
+            f"a tmp_path for it (see the drafts fixture)"
+        )

@@ -31,8 +31,10 @@ def test_defaults_when_no_config_file(tmp_path):
         rerank_model    == "cross-encoder/ms-marco-MiniLM-L6-v2"
         rerank_top_n    == 25
         figure_captions == False   (off by default — vision calls cost per figure)
+        digest_enabled  == False   (off by default — jarvis is a general assistant)
     """
     cfg = load_config(tmp_path / "nonexistent.toml")
+    assert cfg.digest_enabled is False
     assert cfg.ollama_model == "qwen3-vl:30b"
     assert cfg.provider == "ollama"
     assert cfg.chunk_size == 1024
@@ -308,3 +310,22 @@ def test_api_key_loaded_from_auth_section(tmp_path):
     config_file.write_text('[auth]\napi_key = "sk-ant-test"\n')
     cfg = load_config(config_file)
     assert cfg.anthropic_api_key == "sk-ant-test"
+
+
+def test_digest_enabled_read_from_digest_section(tmp_path):
+    """
+    The digest is opt-in: [digest] enabled = true switches it back on, and
+    anything else leaves it off.
+
+    Input:  config.toml with [digest] enabled = true
+    Expected output:
+        digest_enabled is True
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[digest]\nenabled = true\nmax_results = 5\n')
+    cfg = load_config(config_file)
+    assert cfg.digest_enabled is True
+    assert cfg.max_results == 5
+
+    config_file.write_text('[digest]\nenabled = false\n')
+    assert load_config(config_file).digest_enabled is False

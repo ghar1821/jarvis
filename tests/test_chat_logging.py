@@ -17,7 +17,7 @@ import pytest
 
 import jarvis.chat.chat as chat_module
 from jarvis.core.errors import KBCorruptionError
-from jarvis.chat.chat import _kb_stats, _list_papers, _retrieve_papers, _search_chat_history, _search_notes
+from jarvis.chat.chat import _kb_stats, _list_documents, _search_chat_history, _search_kb
 
 
 @pytest.fixture
@@ -54,19 +54,19 @@ def test_kb_stats_failure_is_logged_with_traceback(monkeypatch, caplog, isolated
     assert caplog.records[0].exc_info is not None
 
 
-def test_list_papers_failure_is_logged(monkeypatch, caplog, isolated_log):
+def test_list_documents_failure_is_logged(monkeypatch, caplog, isolated_log):
     """Same contract on a second tool, to confirm this isn't a one-off wire-up."""
-    def broken_list_papers(*args, **kwargs):
+    def broken_list_documents(*args, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
-    monkeypatch.setattr("jarvis.kb.store.list_papers", broken_list_papers)
+    monkeypatch.setattr("jarvis.kb.store.list_documents", broken_list_documents)
 
     with caplog.at_level(logging.ERROR, logger="vault-chat"):
-        result = _list_papers({})
+        result = _list_documents({})
 
-    assert result == "[list_papers error: boom]"
-    assert any("list_papers tool failed" in r.message for r in caplog.records)
+    assert result == "[list_documents error: boom]"
+    assert any("list_documents tool failed" in r.message for r in caplog.records)
     assert caplog.records[0].exc_info is not None
 
 
@@ -83,31 +83,31 @@ def _broken_search(*args, **kwargs):
     )
 
 
-def test_retrieve_papers_relays_corruption_error_verbatim(monkeypatch, caplog, isolated_log):
+def test_search_kb_relays_corruption_error_verbatim(monkeypatch, caplog, isolated_log):
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.search_with_privacy_check", _broken_search)
 
     with caplog.at_level(logging.ERROR, logger="vault-chat"):
-        result, saw_private = _retrieve_papers({"query": "anything"}, "ollama")
+        result, saw_private = _search_kb({"query": "anything"}, "ollama")
 
     assert result.startswith("[KNOWLEDGE BASE ERROR")
     assert "run `uv run kb reindex`" in result
     assert saw_private is False
-    assert any("retrieve_papers tool failed" in r.message for r in caplog.records)
+    assert any("search_kb tool failed" in r.message for r in caplog.records)
     assert caplog.records[0].exc_info is not None
 
 
-def test_search_notes_relays_corruption_error_verbatim(monkeypatch, caplog, isolated_log):
+def test_search_kb_notes_relays_corruption_error_verbatim(monkeypatch, caplog, isolated_log):
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: None)
     monkeypatch.setattr("jarvis.kb.store.search_with_privacy_check", _broken_search)
 
     with caplog.at_level(logging.ERROR, logger="vault-chat"):
-        result, saw_private = _search_notes({"query": "anything"}, "ollama")
+        result, saw_private = _search_kb({"kinds": ["notes"], "query": "anything"}, "ollama")
 
     assert result.startswith("[KNOWLEDGE BASE ERROR")
     assert "run `uv run kb reindex`" in result
     assert saw_private is False
-    assert any("search_notes tool failed" in r.message for r in caplog.records)
+    assert any("search_kb tool failed" in r.message for r in caplog.records)
     assert caplog.records[0].exc_info is not None
 
 

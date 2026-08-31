@@ -13,8 +13,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["ollama", "anthropic"],
-        help="LLM provider to use. Overrides config and CHAT_PROVIDER env var.",
+        choices=["ollama", "anthropic", "openrouter"],
+        help=(
+            "Provider for new sessions. Overrides config and CHAT_PROVIDER. "
+            "Each session can then switch model from the picker."
+        ),
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help=(
+            "Restart the server automatically when the Python changes. "
+            "Static files (HTML/CSS/JS) are already re-read per request, so "
+            "this is only needed while editing the backend."
+        ),
     )
     args = parser.parse_args()
 
@@ -24,4 +36,14 @@ def main() -> None:
     if args.provider:
         os.environ["CHAT_PROVIDER"] = args.provider
 
-    uvicorn.run("jarvis.webapp.app:app", host="127.0.0.1", port=8080, reload=False)
+    # Without --reload a backend change is invisible until you restart, which
+    # shows up as a 404 on a route that plainly exists in the source. Static
+    # files are served from disk on every request, so those only ever need a
+    # browser reload.
+    uvicorn.run(
+        "jarvis.webapp.app:app",
+        host="127.0.0.1",
+        port=8080,
+        reload=args.reload,
+        reload_dirs=["jarvis"] if args.reload else None,
+    )

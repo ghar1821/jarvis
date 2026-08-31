@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pymupdf
+import os
+
 import pytest
 from apscheduler.triggers.cron import CronTrigger
 
@@ -470,7 +472,10 @@ def test_run_digest_job_releases_lock_so_a_second_call_runs(tmp_path, monkeypatc
     """
     calls = []
 
-    def fake_pipeline_main():
+    def fake_pipeline_main(argv=None):
+        # The daemon passes an explicit empty argv so the pipeline's parser
+        # never sees the daemon's own command line.
+        assert argv == []
         calls.append(1)
 
     monkeypatch.setattr(daemon_module, "get_config", lambda: Config(provider="anthropic"))
@@ -491,7 +496,7 @@ def test_run_digest_job_logs_provider_and_model(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(
         daemon_module, "get_config", lambda: Config(provider="anthropic", anthropic_model="claude-test-9")
     )
-    monkeypatch.setattr("jarvis.digest.pipeline.run.main", lambda: None)
+    monkeypatch.setattr("jarvis.digest.pipeline.run.main", lambda argv=None: None)
     status_file = tmp_path / "state" / "sync_status.json"
 
     with caplog.at_level("INFO", logger="jarvis-sync"):
@@ -517,6 +522,7 @@ def test_validate_sync_config_rejects_bad_values(tmp_path):
     refresh interval are each reported.
     """
     cfg = Config(
+        digest_enabled=True,
         pdf_watch_dir=tmp_path / "no-such-dir",
         digest_day="funday",
         digest_hour=99,
@@ -532,21 +538,31 @@ def test_validate_sync_config_rejects_bad_values(tmp_path):
     assert any("pdf_watch_minutes" in p for p in problems)
 
 
+def test_validate_sync_config_ignores_digest_schedule_when_disabled(tmp_path):
+    """
+    A stale digest_day/hour left behind by someone who switched the feature
+    off must not stop the daemon doing its other work.
+    """
+    cfg = Config(digest_enabled=False, digest_day="funday", digest_hour=99)
+    assert _validate_sync_config(cfg) == []
+
+
 # ── scheduler construction ───────────────────────────────────────────────────
 
 def test_build_scheduler_holds_core_jobs_without_watch_dir():
     """
     Regression for the launchd crash-loop: BlockingScheduler(timezone="local")
     handed the literal string "local" to ZoneInfo and raised at construction.
-    _build_scheduler must build cleanly and register the digest, catch-up,
-    and vault-refresh jobs; the pdf_scan job only exists when a watch dir is
-    configured. Its timezone must be a real zone object, not the string "local".
+    With the digest enabled, _build_scheduler must build cleanly and register
+    the digest, catch-up, and vault-refresh jobs; the pdf_scan job only exists
+    when a watch dir is configured. Its timezone must be a real zone object,
+    not the string "local".
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
     # Construction alone reproduced the original crash, so nothing needs to
     # start the scheduler here.
-    scheduler = _build_scheduler(Config())
+    scheduler = _build_scheduler(Config(digest_enabled=True))
     assert isinstance(scheduler, BlockingScheduler)
     assert scheduler.get_job("digest") is not None
     assert scheduler.get_job("digest_catchup") is not None
@@ -554,6 +570,17 @@ def test_build_scheduler_holds_core_jobs_without_watch_dir():
     assert scheduler.get_job("pdf_scan") is None  # no watch dir configured
     # The bug was a bare string; a resolved zone is never a str.
     assert not isinstance(scheduler.timezone, str)
+
+
+def test_build_scheduler_omits_digest_jobs_when_disabled():
+    """
+    The digest is off by default, so neither digest job is registered — but
+    the vault refresh, which has nothing to do with papers, still is.
+    """
+    scheduler = _build_scheduler(Config())
+    assert scheduler.get_job("digest") is None
+    assert scheduler.get_job("digest_catchup") is None
+    assert scheduler.get_job("vault_refresh") is not None
 
 
 def test_build_scheduler_adds_pdf_scan_when_watch_dir_set(tmp_path):
@@ -586,7 +613,7 @@ def test_log_job_outcome_reports_next_run_after_success_and_error(caplog):
     """A finished job (success or error) logs its next scheduled run time."""
     from types import SimpleNamespace
 
-    scheduler = _build_scheduler(Config())
+    scheduler = _build_scheduler(Config(digest_enabled=True))
     ok_event = SimpleNamespace(job_id="vault_refresh", exception=None)
     error_event = SimpleNamespace(job_id="digest", exception=RuntimeError("boom"))
 
@@ -639,3 +666,70 @@ def test_read_status_missing_or_corrupt_file(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
     assert read_status(bad) == {"daemon": {}, "jobs": {}}
+
+# ── draft retention ────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def drafts_sandbox(tmp_path, monkeypatch):
+    """Isolated drafts folder so the sweep never sees a real draft."""
+    cfg = Config(drafts_dir=tmp_path / "drafts", vault_path=tmp_path / "vault")
+    monkeypatch.setattr("jarvis.drafts.workspace.get_config", lambda: cfg)
+    monkeypatch.setattr(daemon_module, "get_config", lambda: cfg)
+    return cfg
+
+
+def _age_draft(cfg, draft_id, days):
+    """Back-date every file in a draft so it looks untouched for `days`."""
+    from datetime import timedelta
+
+    when = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+    for entry in (cfg.drafts_dir / draft_id).rglob("*"):
+        if entry.is_file():
+            os.utime(entry, (when, when))
+
+
+def test_draft_gc_job_removes_stale_drafts_and_records_status(drafts_sandbox, tmp_path, caplog):
+    """
+    The one scheduled job that deletes anything. Every removal is logged with
+    its age, so a disappearing draft is never a mystery.
+    """
+    from jarvis.drafts import create_draft
+    from jarvis.sync.daemon import run_draft_gc_job
+
+    fresh = create_draft("Fresh", "new.md", "recent\n")
+    stale = create_draft("Stale", "old.md", "forgotten\n")
+    _age_draft(drafts_sandbox, stale["id"], 40)
+    status_file = tmp_path / "state" / "sync_status.json"
+
+    with caplog.at_level("INFO", logger="jarvis-sync"):
+        removed = run_draft_gc_job(status_file=status_file)
+
+    assert removed == 1
+    assert not (drafts_sandbox.drafts_dir / stale["id"]).exists()
+    assert (drafts_sandbox.drafts_dir / fresh["id"]).exists()
+    assert any("draft_gc: removed" in r.message for r in caplog.records)
+    assert read_status(status_file)["jobs"]["draft_gc"]["last_success"]
+
+
+def test_draft_gc_job_never_raises(drafts_sandbox, tmp_path, monkeypatch):
+    """One failing job must never take the daemon down."""
+    from jarvis.sync.daemon import run_draft_gc_job
+
+    def boom():
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr("jarvis.drafts.prune_drafts", boom)
+    status_file = tmp_path / "state" / "sync_status.json"
+
+    assert run_draft_gc_job(status_file=status_file) == 0
+    assert "disk on fire" in read_status(status_file)["jobs"]["draft_gc"]["last_error"]
+
+
+def test_build_scheduler_registers_draft_gc_unless_retention_is_zero(tmp_path):
+    """An empty schedule should read as the setting it is, not as a fault."""
+    scheduler = _build_scheduler(Config(drafts_dir=tmp_path / "drafts"))
+    assert scheduler.get_job("draft_gc") is not None
+
+    off = _build_scheduler(Config(drafts_dir=tmp_path / "drafts", drafts_retention_days=0))
+    assert off.get_job("draft_gc") is None
+    assert off.get_job("vault_refresh") is not None

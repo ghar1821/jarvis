@@ -4,7 +4,454 @@ Prototype stage — no deployments. Changes documented for development reference
 
 ---
 
-## [current] — webapp: true parallel sessions, papers manager; unverified-metadata flag removed; daemon job logging
+## [current] — index recovery, and a stale view is no longer called corruption
+
+Found by running the thing against a real, genuinely broken store.
+
+### Fixed
+
+- **`kb reindex` could not run when it was most needed.** It reads chunks via
+  `collection.get()` — the exact call that dies when the vector index is
+  damaged. A corrupt HNSW header (claiming 70 trillion elements against 8455
+  real rows) makes hnswlib map an absurd allocation and the kernel kills the
+  process with SIGBUS. New `kb reindex --from-storage` reads chunk text and
+  metadata straight from SQLite, bypassing the index; nothing of value was ever
+  in it, since vectors are derived data.
+- **`kb doctor` died instead of diagnosing.** Its probe now runs in a
+  subprocess, so the child dies and doctor survives to explain what happened
+  and name the recovery command. The previous advice was literally "if this
+  command dies with no output, that is the diagnosis".
+- **A stale view was reported as corruption.** A long-running reader (the
+  webapp) holds an open index view while the sync daemon writes on a schedule;
+  after an ingest the reader's view names ids that have gone, and the search
+  failed with a message telling the user to rebuild their whole index.
+  `search()` now calls `reset_store()` and retries **once** against a reopened
+  handle. Only a second failure is corruption, and the message says it was
+  already retried. A caller passing `store=` explicitly is never retried.
+- **Autosave wrote review documents into the file being reviewed, so autosave
+  is gone.** While a proposal is on screen the editor buffer deliberately holds
+  the current text and the suggested text at once. Loading it called
+  CodeMirror's `setValue`, whose change event armed the autosave timer, which
+  then wrote that buffer to disk — so accepting a change appeared to add the
+  new text without removing the old, because the file genuinely contained both.
+  The pause meant to prevent this consulted a `pendingProposal` variable that
+  the inline-review rewrite left nothing assigning, so it never fired once, and
+  the `expect_hash` guard passed because the hash still matched what was on
+  disk.
+
+  The guards were fixable, but the underlying assumption is not: an idle timer
+  cannot know whether the buffer is a document or a review of one. Saving is
+  now explicit — ⌘S, plus the existing implicit save before preview, compile,
+  export and archive. `saveDraft` also stands down while a review is open, and
+  loading text no longer counts as editing it.
+
+  If a file was affected, restore it from **History**: the clobbering write
+  snapshotted first, so the pre-corruption version is there.
+
+### Fixed
+
+- **A removal highlighted more than it removed.** The assistant would say it
+  was dropping three sections and the diff would light up four. The file was
+  never wrong — only the highlighting was, and the extra block was context that
+  the edit left alone.
+
+  `get_grouped_opcodes` includes three lines of context on each side of a
+  change, so a hunk's `old_lines` span more than the change does, and the
+  editor tinted all of it. Each hunk now carries `old_spans`/`new_spans` —
+  offsets, relative to its own lines, of the lines that actually change — and
+  both the inline view and the side-by-side columns tint only those, leaving
+  context visible but untinted.
+
+  This is the second bug from the same source: `kind` moved to opcode-derived
+  for the same reason (a group's sides are never empty, so line counts called
+  everything a replacement). The context-carrying behaviour is now written down
+  in DESIGN.md rather than rediscovered.
+
+### Removed
+
+- **The archive gate is gone, and with it the only way anything could reach the
+  vault.** `POST /archive`, the scrypt password store, `kb archive-password`,
+  the `[archive]` config keys and `jarvis/drafts/archive.py` are all deleted.
+  Getting a document out of the sandbox is now right-click → **Show in Finder**
+  (`POST /reveal`), and you copy it wherever you want.
+
+  This is less code and a stronger guarantee. A password-gated door is still a
+  door: it has to be reasoned about, kept out of tool schemas, and defended
+  against brute force. A sandbox with no promotion path at all has none of
+  that. `/reveal` still resolves through `resolve_in_draft` and runs a fixed
+  argv with no shell, so the only thing it can show is a file inside the
+  sandbox.
+
+  If you set an archive password, `~/.jarvis/archive_auth.json` is now inert and
+  can be deleted.
+
+### Added
+
+- **Pending suggestions are reachable again.** A proposal the assistant made
+  but nobody acted on was held in the server's memory with nothing in the UI
+  able to get back to it — it simply vanished from view while still existing.
+  `GET /proposals` now lists what is waiting: a ✎ marks the tab, reopening the
+  file brings the diff back, right-click offers review or discard, and ⋮ →
+  **Discard pending suggestions…** clears them all. They are still in-process
+  state, so restarting the webapp clears them too.
+
+- **A draft is visibly a folder, and files can join one.** Drafts have always
+  been folders — `compile_latex` seeds its temp directory from the whole draft,
+  which is why a `.tex` finds its `.bib`. What was missing was any way to *use*
+  that: `create_draft` was the only way to make a file, so related LaTeX files
+  ended up scattered across separate drafts. `POST /drafts/new` now takes an
+  optional `draft_id` and adds to an existing document, reachable from
+  right-click → **New file in this document…**. The `create_draft` and
+  `add_draft_file` tool descriptions now say plainly that one document is one
+  folder and that a `.tex` compiles only against the files beside it, and a
+  multi-file document shows a file count in the sidebar.
+
+- **Editor tabs.** The editor held one file at a time, so opening a second
+  meant losing whatever was in the first. Each open file is now a tab backed by
+  its own CodeMirror `Doc`, carrying its own text, undo history and cursor;
+  switching is a `swapDoc`, so an unsaved tab stays unsaved while you work
+  elsewhere. The control on a tab is a filled dot while it has unsaved changes
+  and an × once it does not — the state of every open file is legible without
+  switching to it — and clicking it saves before closing rather than prompting
+  or discarding.
+
+  Dirtiness is asked of the `Doc` (`isClean` against the generation recorded at
+  the last successful save) instead of a flag kept beside it, so undoing back
+  to the last save reports clean, a save that the server refuses leaves the tab
+  dirty, and nothing that merely loads text can leave a flag set.
+
+  A proposal is now rendered into a `Doc` of its own rather than over the file
+  being reviewed. `saveDraft` reads `tab.doc`, so the buffer holding both
+  versions is not reachable by a save at all — the same bug is now prevented by
+  the structure rather than by a guard. Reviewing also no longer costs you an
+  unsaved edit, and switching tabs mid-review and back finds the review intact,
+  since line classes and widgets belong to the `Doc` they were added to.
+
+---
+
+## [2026-08-31] — schema migration made cheap
+
+Following up on phase 3. Marking every note with `meta_schema` meant the first
+`refresh_vault` after upgrading re-indexed the **entire vault** — deleting and
+re-embedding every note to record that most of them had no frontmatter to read.
+That is a lot of work for no gain, and a delete-then-re-add leaves a window in
+which a note is missing from the index.
+
+### Changed
+
+- `refresh_vault` now asks whether a note behind the schema marker actually has
+  a frontmatter block. If it does, the indexed body and the embedded record
+  header both change, so it is re-indexed as before. If it does not, the marker
+  is stamped in place with a metadata-only update — no re-embedding, no delete,
+  no gap. Upgrading a vault of ordinary notes is now near-instant.
+- New `update_metadata_fields(file_path, fields)`, the generic metadata-only
+  update; `update_visibility` delegates to it rather than duplicating it.
+
+---
+
+## [2026-08-28] — general assistant, phase 5: the editor
+
+Drafts existed but could only be reached through chat. The webapp now has an
+Overleaf-shaped editor: drafts list, source, preview, with the composer docked
+beside it.
+
+### Added
+
+- **Vendored CodeMirror 5** (`static/vendor/codemirror-5.65.19/`, MIT) with only
+  the files used and a `VENDOR.md` recording version, source, license, and how
+  to update. Version 5 rather than 6 because 6 needs a bundler and this project
+  deliberately has none. **No CDN**: the page still makes zero outbound requests
+  on load, so the editor works offline.
+- **Editor view** with a header toggle, per-draft file list showing what expires
+  when, dirty indicator, ⌘S, and a keep/pin button.
+- **Explicit saving**: ⌘S, and an implicit save before previewing, compiling,
+  exporting or archiving so none of those act on a stale file. Every write
+  carries the file hash, so a second tab cannot be clobbered.
+- **Undo at two levels**: CodeMirror's own, and a History panel over
+  `.versions/` that survives reloads. Restoring snapshots the current text
+  first, so a restore is itself undoable — the recovery path for a hunk accepted
+  by mistake.
+- **Inline diff review.** `propose_draft_edit` now pushes an `edit_proposal` SSE
+  event; the browser renders a checkbox per hunk and posts `/apply-edit` with a
+  one-shot token. Same discipline as `/confirm-action`, and the only thing that
+  writes an agent's change.
+- **Preview and export.** `POST /preview` (markdown-it-py, HTML disabled) into a
+  `sandbox=""` iframe; `POST /compile` (latexmk) returning the PDF or a 422 with
+  the LaTeX log; `POST /export` (pandoc) for Markdown → PDF. Buttons for a
+  missing toolchain are hidden rather than disabled.
+- **`jarvis/drafts/render.py`** with the compilation sandbox: `-no-shell-escape`,
+  `openin_any=p`/`openout_any=p`, an emptied `TEXMFHOME`, a temp-dir copy never
+  compiled in place, and a hard timeout. Verified against a real hostile
+  document — `\write18` did not run and an existing file at an absolute path
+  could not be `\input`.
+- **Archive dialog** stating plainly that the draft is copied not moved and that
+  a vault file is never overwritten, and naming the terminal command when no
+  password is set.
+- Config: `[drafts] latex_engine`, `[drafts] compile_timeout_seconds`. New
+  dependency: `markdown-it-py`.
+
+### Fixed
+
+Both found by running the thing rather than by the tests:
+
+- **`hashlib.scrypt` failed at the production work factors.** n=2**15, r=8 needs
+  32 MB, which is exactly OpenSSL's default cap, so setting an archive password
+  raised "memory limit exceeded". The unit tests lowered the work factor for
+  speed and so never hit it. Fixed by passing `maxmem` sized from the
+  parameters, and a test now exercises the real constants.
+- **`ArchiveError` returned a 500 instead of its message.** The webapp's draft
+  error handler converted `DraftError` and `RenderError` but not `ArchiveError`,
+  so "no archive password is set, run this command" — the whole point of the
+  message — arrived as an internal server error.
+- **Empty frontmatter values warned on every vault sync.** An Obsidian template
+  full of `title:` with nothing after it is the normal case; each empty key was
+  being reported as unstorable. Empty now means absent and says nothing;
+  genuinely unstorable (nested) values still warn.
+
+---
+
+## [2026-08-28] — general assistant, phase 4: the draft sandbox and the archive gate
+
+The agent could retrieve but never produce. It can now write — into a scratch
+folder it cannot escape, with a password gate as the only way anything reaches
+the vault.
+
+### Added
+
+- **`jarvis/drafts/workspace.py`** — the agent-writable sandbox at
+  `~/.jarvis/drafts/`, outside the vault so the boundary is a filesystem fact
+  rather than a config rule. One containment policy (`resolve_in_draft`) covers
+  every read and write: the resolved path is checked against the drafts *root*
+  and the draft id re-checked as its first component, because resolving the
+  draft folder first would follow a symlink planted there and validate a path
+  outside the sandbox.
+- **Creation is free, agent mutation is reviewed.** `propose_edit` writes
+  nothing; it returns hunks built from `SequenceMatcher.get_grouped_opcodes`
+  (not from parsing a text diff, so the rendered diff and the applied change
+  cannot disagree) and a token. Only `apply_hunks`, with a token a human
+  answered, writes — and it refuses a stale proposal rather than overwriting a
+  hand-edit.
+- **`.versions/` snapshots** before every overwrite, never pruned. Restoring
+  snapshots the current text first, so a restore is itself undoable.
+- **`jarvis/drafts/archive.py`** — the one door into the vault. scrypt hash
+  with a random salt, constant-time compare, escalating backoff then lockout;
+  the password is checked *before* the destination resolves, so a failure
+  reveals nothing about the vault. Never overwrites, never moves; refused
+  outright when no password is set.
+- **Six chat tools** — `create_draft`, `create_draft_from`, `add_draft_file`,
+  `list_drafts`, `read_draft`, `propose_draft_edit`. That is the model's entire
+  write surface: **no archive tool, no vault-write tool, no delete tool, and no
+  password parameter in any schema.**
+- **`draft_gc`, the daemon's fifth job** — a daily sweep of drafts nothing has
+  touched for `[drafts] retention_days`. Age is the newest file in the folder,
+  so editing a `.bib` keeps its `.tex` alive; `keep` exempts a draft;
+  `retention_days = 0` unregisters the job entirely.
+- **`kb drafts [--prune [--dry-run]]`** and **`kb archive-password [--status]`**
+  (terminal-only, via `getpass` — a browser page is a weaker channel than a
+  shell, so no HTTP route sets it).
+- **Two example skills** in `examples/skills/` — `tailor-document` and
+  `draft-from-notes` — composing the tools into workflows. New document types
+  are new skills, not new code.
+- Config: `[drafts]` (dir, extensions, max_file_bytes, retention_days,
+  gc_hour) and `[archive]` (default_dir, auth_file).
+
+### Changed
+
+- **The no-file-deletion guarantee is now scoped rather than absolute.** This is
+  the one existing invariant this work amends, and it is stated that way in
+  DESIGN rather than buried: `prune_drafts` is the only deletion in jarvis, it
+  takes a draft id rather than a path, it only ever walks the drafts root, it
+  re-checks containment immediately before each delete, and it is reachable
+  from exactly two places — the daemon job and `kb drafts --prune`. Everything
+  outside `~/.jarvis/drafts/` keeps the absolute guarantee.
+- **A draft inherits its session's visibility**, so one built from private notes
+  is private and `read_draft` hard-stops for a cloud provider — the transcript
+  rule extended to the artefact.
+
+### Fixed
+
+- **The digest job probed Ollama for any non-Anthropic provider.** Introducing
+  OpenRouter in phase 2 turned that into a pointless health check that would
+  fail an OpenRouter digest before it started; it now keys on
+  `is_cloud_provider`.
+
+---
+
+## [2026-08-28] — general assistant, phase 3: records with an open schema
+
+A note could only ever be prose. Now it can be a job application with an
+outcome, a manuscript with a venue and a deadline, or any record type the user
+invents — without jarvis knowing what any of those are.
+
+### Added
+
+- **`jarvis/kb/frontmatter.py`** — YAML frontmatter becomes flat, filterable
+  metadata. Five well-known keys (`type`/`category`, `status`,
+  `entity`/`org`/`company`, `date`/`applied`, `tags`) take named fields worth a
+  UI filter; **every other scalar key passes through as `x_<key>`**, so a new
+  record type needs no code change.
+- **The `x_` prefix is a security boundary.** A `.md` file can arrive in the
+  vault from anywhere; without namespacing, a note carrying `visibility: public`
+  in its own frontmatter would overwrite the folder-derived classification when
+  the metadata dicts merged. Prefixing makes that impossible rather than
+  something to remember to check.
+- **Record filters on `search()`** — `category`/`status`/`entity` plus a generic
+  `fields` map for `x_` keys, folded into the *same* `where` clause as the
+  visibility filter, so they can only narrow the already-privacy-filtered pool.
+  `tags` is filtered after re-ranking (ChromaDB has no substring operator) and
+  is documented as such.
+- **The record header is embedded** into every chunk
+  (`"job_application · Acme Bio · rejected"`), reusing the mechanism papers
+  already use for title/authors — that is what makes "jobs I was rejected from"
+  match a record whose body never uses those words.
+- **`kb schema` / `kb schema <key>`** — which metadata keys and values actually
+  exist. Jarvis enforces no vocabulary, so a typo (`stauts: rejected`) becomes
+  its own key that silently never matches a filter; this is how you catch it.
+  `kb_stats` shows the same vocabulary to the model.
+- **`kb list --notes [--category --status --entity]`**.
+- New dependency: `pyyaml` (`safe_load` only — frontmatter is untrusted input).
+
+### Changed
+
+- **`retrieve_papers` + `search_notes` → one `search_kb`.** The papers/notes
+  split was exactly the research-shaped distinction being removed; a general
+  assistant should answer from whatever kind of document holds the answer. The
+  privacy core (`search_with_privacy_check`) is untouched — only the tool
+  surface merged — and the unified semantics are the notes ones (caveat line on
+  mixed results, hard stop only when every match is private).
+- **`list_papers` → `list_documents(kind=, category=, status=, entity=)`**, in
+  the store, the chat tool, and the CLI. Papers key on `source`; notes share
+  `source="local"` so they key on `file_path` instead.
+- **`/papers*` routes → `/documents*`**, with `?kind=notes` listing records and
+  their fields. The webapp's "Papers…" modal became "Library…" with a
+  Papers / Notes & records switch. Notes are read-only there: their KB entry is
+  derived from a vault file, so editing it would be undone by the next sync.
+- **Every note carries `meta_schema`**, and `refresh_vault` re-indexes anything
+  behind the current version — the backfill happens on the next daemon sweep
+  with no user action and no migration script.
+
+---
+
+## [2026-08-28] — general assistant, phase 2: OpenRouter, mid-conversation model switching, session cost
+
+Sessions stored whatever wire format the active provider spoke, which is
+precisely why a conversation could never move between providers. Introducing a
+provider-neutral transcript removes that constraint, and OpenRouter turns "which
+model" into a per-session choice rather than a process-wide one.
+
+### Added
+
+- **`jarvis/core/transcript.py`** — one neutral message schema
+  (`text` / `tool_call` / `tool_result` / `provider_opaque`) that all three
+  adapters convert to and from. `provider_opaque` carries what the schema cannot
+  express (Anthropic `thinking`, OpenAI `reasoning`) and replays **only** on an
+  exact provider+model match, so a switch never sends one vendor's internal
+  state to another.
+- **`OpenRouterProvider`** on the official `openai` SDK. Strict routing
+  preferences on every request (`data_collection = "deny"`,
+  `allow_fallbacks = false`, optional upstream allowlist) because OpenRouter is
+  a broker; the optional `HTTP-Referer` / `X-Title` leaderboard headers are
+  deliberately omitted; PDFs are converted locally rather than uploaded.
+- **`pop_usage()`** on the provider protocol, and per-model `cost` on the
+  session. Only OpenRouter reports real spend — Ollama runs on your own
+  hardware and pricing Anthropic usage would need a table that ages silently, so
+  both report nothing and the UI shows no figure rather than a fabricated zero.
+- **Model switching**: `/model` and `/cost` in `vault-chat`, a ⌘ picker in the
+  webapp header, `GET /models` and `POST /model`, and `kb models [--refresh]`.
+  Shared validation lives in `jarvis/chat/models.py` so both front ends behave
+  identically.
+- **`is_cloud_provider()`** — one predicate for the privacy model.
+- Config: `[chat] openrouter_model`, `[openrouter]` routing, `[models]`
+  catalogue, `[auth] openrouter_api_key`, and their env-var overrides.
+
+### Changed
+
+- **All three `agentic_turn` implementations speak the neutral transcript.**
+  Each converts neutral → wire on entry and converts only the messages it
+  generated back on exit, so history written by another provider is never
+  round-tripped through a lossy conversion. The `PrivacyError` contract is
+  preserved verbatim in all three.
+- **Every `provider_str == "anthropic"` privacy check became
+  `is_cloud_provider(...)`**, which fails closed for an unknown provider name.
+  Adding a provider can no longer quietly open a hole.
+- **Sessions are format_version 2**: `provider` and `model` stored separately
+  (the privacy rules key on the provider alone, switching keys on both), plus
+  `cost`. v1 files migrate on read and are not written back — the next
+  completed turn saves them as v2 through the normal path.
+- **`check_resume` drops the cross-provider refusal** — the neutral transcript
+  removed the reason for it — and states the remaining rule in terms of local
+  vs cloud: once private content is in the transcript, the transcript itself is
+  private and may only run on a local model.
+- **The webapp has no single active provider.** `_session["provider"]` became
+  `_session["providers"]`, a cache keyed by `"provider:model"`; each turn
+  resolves from the session it serves, so two sessions can be mid-turn on
+  different models at once. `/info` and the header now report the *active
+  session's* model and spend.
+- **The sidebar no longer greys out cross-provider sessions** — any session can
+  be resumed under any model now. Only the privacy block remains.
+
+### Fixed
+
+- **The webapp tests read the developer's live `config.toml`** and, once
+  providers became per-session, one of them built a real Anthropic client and
+  made a billed API call. Test sessions are now pinned to an explicit local
+  spec, and a strict `_provider_for` fails the test rather than constructing a
+  real client for a spec no fake was installed for.
+- **`new_session` resolves the provider's default model** when a spec names
+  none, so `model_spec` is always concrete — `"anthropic"` alone named no model
+  and left the picker unable to mark the current entry.
+
+---
+
+## [2026-08-28] — general assistant, phase 1: the paper digest is opt-in
+
+Jarvis is becoming a general personal assistant rather than a research-only
+tool (see `docs/plans/2026-08-28-general-assistant-evolution.md` for the full
+five-phase plan). The first step is making the feature that most defines it as
+research software optional: a general assistant should not fetch arXiv on a
+schedule unless asked.
+
+### Added
+
+- **`[digest] enabled`** (`Config.digest_enabled`, default **`false`**). Every
+  other `[digest]` key is only consulted when it is true.
+- **`run-digest --force`** — runs a one-off digest even while the feature is
+  switched off. Typing the command is itself the human request; what `--force`
+  overrides is only the scheduled-behaviour setting.
+
+### Changed
+
+- **The daemon registers no digest jobs when the digest is off.** Neither
+  `digest` nor `digest_catchup` is added to the scheduler, the startup
+  catch-up does not run, and `main()` logs
+  `digest: disabled ([digest] enabled = false)` so an empty schedule reads as
+  a setting rather than a fault. `kb sync-status` prints the same line in the
+  `digest` row.
+- **`_validate_sync_config` no longer treats `digest_day`/`digest_hour` as
+  fatal while the digest is disabled** — a stale value left behind by someone
+  who switched the feature off must not stop the daemon doing its other work.
+- **`run-digest` with the feature off prints how to enable it and exits 0**
+  without fetching anything.
+- **The daemon calls the pipeline as `run_digest([])`** — an explicit empty
+  argv, since `main(None)` would parse the *daemon's* own command line now
+  that the pipeline has an argument parser.
+- **Wording pass toward general-assistant framing**: the default system prompt
+  now describes the knowledge base as the user's notes, documents and past
+  conversations rather than "research papers and Obsidian vault notes", cites
+  sources generally rather than "the source URL when discussing a paper", and
+  the webapp's composer placeholder reads "Ask about your notes and
+  documents...". README and DESIGN lead with the general framing, with the
+  digest documented as opt-in.
+
+### Not changed
+
+Nothing under `jarvis/digest/` was removed. `doc_type="digest"` stays, already
+indexed digests stay searchable, `kb add-digest` keeps working, and turning the
+feature back on is one config line.
+
+---
+
+## [2026-07-13] — webapp: true parallel sessions, papers manager; unverified-metadata flag removed; daemon job logging
 
 The webapp's `/chat` route used to apply every message to a single mutable
 "active session" global, guarded by one global busy flag (`running_turn`).

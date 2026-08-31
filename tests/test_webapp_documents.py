@@ -1,14 +1,14 @@
 """
 Tests for the webapp's papers manager routes (jarvis/webapp/app.py):
 
-- GET /papers lists every indexed paper (de-duplicated by source) with the
+- GET /documents lists every indexed paper (de-duplicated by source) with the
   fields the frontend table renders
 - q= filters case-insensitively across title/authors/doi/source
-- POST /papers/meta updates only the fields the caller passes and 404s on
+- POST /documents/meta updates only the fields the caller passes and 404s on
   an unknown source
-- POST /papers/remove deletes the paper's ChromaDB chunks via execute_remove
+- POST /documents/remove deletes the paper's ChromaDB chunks via execute_remove
   and 404s on an unknown source
-- CRITICAL regression: /papers/remove never touches the filesystem — the
+- CRITICAL regression: /documents/remove never touches the filesystem — the
   same "database entry only" invariant enforced everywhere else in the
   codebase (see test_security.py), pinned here with spies on every
   plausible deletion API (Path.unlink/rmdir, os.remove, os.unlink,
@@ -27,7 +27,7 @@ from pathlib import Path
 from starlette.testclient import TestClient
 
 import jarvis.webapp.app as appmod
-from jarvis.kb.store import add_paper, list_papers
+from jarvis.kb.store import add_paper, list_documents
 
 
 def _paper(n: int, **overrides) -> dict:
@@ -41,7 +41,7 @@ def _paper(n: int, **overrides) -> dict:
     return paper
 
 
-# ── GET /papers ──────────────────────────────────────────────────────────
+# ── GET /documents ──────────────────────────────────────────────────────────
 
 
 def test_get_papers_lists_every_indexed_paper(store, monkeypatch):
@@ -50,7 +50,7 @@ def test_get_papers_lists_every_indexed_paper(store, monkeypatch):
     add_paper(_paper(2), dense_summary="Diffusion models generate images.", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.get("/papers")
+    response = client.get("/documents")
     assert response.status_code == 200
 
     rows = response.json()
@@ -76,7 +76,7 @@ def test_get_papers_q_filters_title_case_insensitively(store, monkeypatch):
     add_paper(_paper(2, title="Diffusion Models Beat GANs"), dense_summary="y", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.get("/papers", params={"q": "ATTENTION"})
+    response = client.get("/documents", params={"q": "ATTENTION"})
     assert response.status_code == 200
     assert [row["title"] for row in response.json()] == ["Attention Is All You Need"]
 
@@ -90,14 +90,14 @@ def test_get_papers_q_matches_authors_doi_or_source(store, monkeypatch):
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
 
     def titles_for(q):
-        return {row["title"] for row in client.get("/papers", params={"q": q}).json()}
+        return {row["title"] for row in client.get("/documents", params={"q": q}).json()}
 
     assert titles_for("lovelace") == {"Test Paper 1"}
     assert titles_for("uniquedoi") == {"Test Paper 2"}
     assert titles_for("2401.00003") == {"Test Paper 3"}  # source URL substring
 
 
-# ── POST /papers/meta ────────────────────────────────────────────────────
+# ── POST /documents/meta ────────────────────────────────────────────────────
 
 
 def test_post_papers_meta_updates_only_given_fields(store, monkeypatch):
@@ -106,11 +106,11 @@ def test_post_papers_meta_updates_only_given_fields(store, monkeypatch):
     add_paper(paper, dense_summary="x", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/meta", json={"source": paper["link"], "title": "New Title"})
+    response = client.post("/documents/meta", json={"source": paper["link"], "title": "New Title"})
     assert response.status_code == 200
     assert response.json()["chunks_updated"] >= 1
 
-    updated = next(p for p in list_papers(store=store) if p["source"] == paper["link"])
+    updated = next(p for p in list_documents(store=store) if p["source"] == paper["link"])
     assert updated["title"] == "New Title"
     assert updated["authors"] == "Author 1"  # untouched — only title was sent
 
@@ -118,11 +118,11 @@ def test_post_papers_meta_updates_only_given_fields(store, monkeypatch):
 def test_post_papers_meta_unknown_source_404s(store, monkeypatch):
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/meta", json={"source": "https://arxiv.org/abs/nope", "title": "x"})
+    response = client.post("/documents/meta", json={"source": "https://arxiv.org/abs/nope", "title": "x"})
     assert response.status_code == 404
 
 
-# ── POST /papers/remove ──────────────────────────────────────────────────
+# ── POST /documents/remove ──────────────────────────────────────────────────
 
 
 def test_post_papers_remove_calls_execute_remove(store, monkeypatch):
@@ -139,7 +139,7 @@ def test_post_papers_remove_calls_execute_remove(store, monkeypatch):
     ids = add_paper(paper, dense_summary="x", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/remove", json={"source": paper["link"]})
+    response = client.post("/documents/remove", json={"source": paper["link"]})
     assert response.status_code == 200
     assert response.json()["result"] == "Removed Test Paper 1"
 
@@ -151,7 +151,7 @@ def test_post_papers_remove_calls_execute_remove(store, monkeypatch):
 def test_post_papers_remove_unknown_source_404s(store, monkeypatch):
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/remove", json={"source": "https://arxiv.org/abs/nope"})
+    response = client.post("/documents/remove", json={"source": "https://arxiv.org/abs/nope"})
     assert response.status_code == 404
 
 
@@ -168,10 +168,10 @@ def test_post_papers_remove_deletes_only_the_matching_paper(store, monkeypatch):
     add_paper(paper_b, dense_summary="y", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/remove", json={"source": paper_a["link"]})
+    response = client.post("/documents/remove", json={"source": paper_a["link"]})
     assert response.status_code == 200
 
-    remaining_sources = {p["source"] for p in list_papers(store=store)}
+    remaining_sources = {p["source"] for p in list_documents(store=store)}
     assert paper_a["link"] not in remaining_sources
     assert paper_b["link"] in remaining_sources
 
@@ -182,7 +182,7 @@ def test_post_papers_remove_deletes_only_the_matching_paper(store, monkeypatch):
 def test_papers_remove_never_touches_the_filesystem(store, monkeypatch):
     """
     Regression pin for the CLAUDE.md invariant that jarvis has no
-    file-deletion code path anywhere: /papers/remove must only ever call
+    file-deletion code path anywhere: /documents/remove must only ever call
     ChromaDB's own delete. Spies on every plausible deletion API
     (pathlib.Path.unlink/rmdir, os.remove, os.unlink, shutil.rmtree —
     os.remove and os.unlink are distinct objects, so both need patching)
@@ -203,14 +203,14 @@ def test_papers_remove_never_touches_the_filesystem(store, monkeypatch):
     add_paper(paper, dense_summary="x", store=store)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/papers/remove", json={"source": paper["link"]})
+    response = client.post("/documents/remove", json={"source": paper["link"]})
 
     assert response.status_code == 200
     assert deletion_calls == []
 
 
 def test_papers_routes_are_scoped_to_papers(store, monkeypatch):
-    """A note's source 404s on both /papers/meta and /papers/remove — the
+    """A note's source 404s on both /documents/meta and /documents/remove — the
     routes only ever act on doc_type="paper" entries."""
     from jarvis.kb.store import add_texts
 
@@ -225,9 +225,77 @@ def test_papers_routes_are_scoped_to_papers(store, monkeypatch):
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     meta_response = client.post(
-        "/papers/meta", json={"source": "file:///tmp/some-note.md", "title": "hijacked"}
+        "/documents/meta", json={"source": "file:///tmp/some-note.md", "title": "hijacked"}
     )
-    remove_response = client.post("/papers/remove", json={"source": "file:///tmp/some-note.md"})
+    remove_response = client.post("/documents/remove", json={"source": "file:///tmp/some-note.md"})
 
     assert meta_response.status_code == 404
     assert remove_response.status_code == 404
+
+
+# ── GET /documents?kind=notes ─────────────────────────────────────────────
+
+def test_get_documents_lists_notes_with_their_record_fields(store, monkeypatch, tmp_path):
+    """
+    The library's notes half returns one row per vault file with the record
+    fields the table shows — this is what makes a job application legible as a
+    record rather than as anonymous prose.
+    """
+    from jarvis.kb.store import index_vault_file
+
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    vault = tmp_path / "vault"
+    path = vault / "records/acme.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\ntype: job_application\nentity: Acme Bio\nstatus: rejected\n"
+        "date: 2026-05-02\n---\n\n# Senior Bioinformatician\n\nBody.\n",
+        encoding="utf-8",
+    )
+    index_vault_file(path, vault, store)
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    rows = client.get("/documents", params={"kind": "notes"}).json()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["title"] == "Senior Bioinformatician"
+    assert row["category"] == "job_application"
+    assert row["entity"] == "Acme Bio"
+    assert row["status"] == "rejected"
+    assert row["event_date"] == "2026-05-02"
+    assert row["file_path"] == "records/acme.md"
+
+
+def test_get_documents_filters_notes_by_record_fields(store, monkeypatch, tmp_path):
+    """category/status narrow the list server-side, not in the browser."""
+    from jarvis.kb.store import index_vault_file
+
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    vault = tmp_path / "vault"
+    for name, status in (("a", "rejected"), ("b", "applied")):
+        path = vault / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ntype: job_application\nstatus: {status}\n---\n\n# {name}\n\nBody.\n",
+            encoding="utf-8",
+        )
+        index_vault_file(path, vault, store)
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    rejected = client.get(
+        "/documents", params={"kind": "notes", "category": "job_application", "status": "rejected"}
+    ).json()
+    assert [row["file_path"] for row in rejected] == ["a.md"]
+
+
+def test_get_documents_defaults_to_papers(store, monkeypatch):
+    """An omitted kind keeps the previous behaviour: papers."""
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    add_paper(
+        paper={"link": "https://arxiv.org/abs/1234.5678", "title": "A Paper", "authors": "Ada"},
+        dense_summary="Summary text.", score=9, track="Track 1", store=store,
+    )
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    rows = client.get("/documents").json()
+    assert [row["title"] for row in rows] == ["A Paper"]
