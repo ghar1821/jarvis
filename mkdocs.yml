@@ -1,0 +1,84 @@
+site_name: jarvis
+site_description: A personal research knowledge base with an arXiv digest and a local-first LLM agent
+site_url: https://ghar1821.github.io/jarvis/
+repo_url: https://github.com/ghar1821/jarvis
+repo_name: ghar1821/jarvis
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# The home page is the repository README, pulled into the build by this hook
+# rather than copied into docs/ — see mkdocs_hooks.py for why.
+hooks:
+  - mkdocs_hooks.py
+
+# ROADMAP.md and docs/plans/ are gitignored working notes. Keep them off the
+# public site even when they exist in a local checkout.
+exclude_docs: |
+  ROADMAP.md
+  plans/
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.top
+    - navigation.tracking
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+  palette:
+    # Follows the reader's system setting, with a manual override either way.
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+plugins:
+  - search
+  - blog:
+      blog_dir: blog
+      post_url_format: "{slug}"
+      post_excerpt: optional
+
+nav:
+  - Home: index.md
+  - Design: DESIGN.md
+  - Testing: TESTING.md
+  - Changelog: CHANGELOG.md
+  - Blog: blog/index.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true

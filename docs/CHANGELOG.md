@@ -19,6 +19,19 @@ pointed at.
 
 ### Added
 
+- **The docs are a published site.** `mkdocs.yml` plus
+  `.github/workflows/docs.yml` build the Markdown in `docs/` into a Material
+  for MkDocs site at <https://ghar1821.github.io/jarvis/> on every push to
+  `main`. Nothing in `docs/` had to change and nothing is duplicated: a build
+  hook (`mkdocs_hooks.py`) serves the README itself as the home page, so the
+  site and the repository can never disagree about it, and rewrites links that
+  point outside `docs/` (a workflow file, say) to their GitHub URLs instead of
+  letting them 404. The build runs `--strict`, so a broken link or a page
+  missing from the nav fails CI rather than shipping. `uv sync --only-group
+  docs` keeps the site build off the runtime dependencies — it has no use for
+  torch. A **Blog** section is wired up and empty, waiting for posts under
+  `docs/blog/posts/`.
+
 - **CI runs the unit suite on main.** `.github/workflows/tests.yml` runs
   `uv run pytest -m "not integration"` on `ubuntu-latest` / Python 3.12 for
   pushes to `main` and PRs targeting `main` — nothing else, since feature
