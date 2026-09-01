@@ -7,9 +7,7 @@ your machine, and can write documents with you.
 
 Named after Iron Man's J.A.R.V.I.S. — Just A Rather Very Intelligent System.
 
-> This README is about **using** jarvis. For how it works inside — architecture,
-> data flows, the privacy and safety guarantees and why they hold — see
-> [`docs/DESIGN.md`](docs/DESIGN.md).
+Full documentation: **<https://ghar1821.github.io/jarvis/>**
 
 ---
 
@@ -549,23 +547,36 @@ instead of rewriting your file for you.
 ### Working on jarvis
 
 ```bash
-uv sync --group dev                  # once, to get pytest
-uv run pytest -m "not integration"   # the suite that must pass before any change
-uv run pytest -m integration         # needs live services (API key, running Ollama)
-uv run pytest tests/test_drafts.py   # one file
+uv run jarvis-sync
 ```
 
-Everything jarvis owns lives under `~/.jarvis/`: `config.toml`, the index
-(`rag/`), sessions, drafts, logs. Delete that directory and you're back to a
-fresh install — your vault is untouched. Architecture, data flows and the
-privacy guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what the tests
-cover and why is in [`docs/TESTING.md`](docs/TESTING.md).
+It logs to `~/.jarvis/logs/sync.log` (and to the terminal) by default, and stays in the foreground — `Ctrl-C` to stop it. There is no built-in service/daemon management (no launchd, no auto-restart-on-crash): if you want it to survive closing the terminal or to restart automatically, run it under a terminal multiplexer (`tmux`/`screen`) or a process manager of your choice. The daemon does not start Ollama for you either; run Ollama as a login-item app or `ollama serve`.
 
 ---
 
-## Documentation
+## Documentation site
 
-- [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, data flows, and the
-  security and privacy guarantees
-- [`docs/CHANGELOG.md`](docs/CHANGELOG.md) — what changed and why
-- [`docs/TESTING.md`](docs/TESTING.md) — what's covered and how to run the tests
+The Markdown in `docs/` is published as a site at
+<https://ghar1821.github.io/jarvis/>, rebuilt by `.github/workflows/docs.yml`
+on every push to `main`. This README is its home page — the build reads the
+real file rather than a copy, so the two cannot drift apart.
+
+```bash
+uv run --group docs mkdocs serve   # preview at http://127.0.0.1:8000
+uv run --group docs mkdocs build --strict   # what CI runs
+```
+
+Blog posts go in `docs/blog/posts/` as Markdown files with a `date:` in their
+front matter; `draft: true` keeps one visible in `mkdocs serve` but out of the
+published site. `docs/blog/posts/hello.md` is a placeholder that spells out the
+format.
+
+---
+
+## Requirements
+
+- [uv](https://github.com/astral-sh/uv)
+- Python ≥ 3.12
+- [Ollama](https://ollama.com) with a tool-calling + vision model pulled, e.g. `qwen3-vl:30b` (for local inference)
+- Anthropic API key (for cloud inference only; set via env var or `~/.jarvis/config.toml`)
+- `fastapi` and `uvicorn` (included in `uv sync`; required for the web UI only)

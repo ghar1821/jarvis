@@ -43,6 +43,7 @@ webapp      = "jarvis.webapp.run:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
+docs = ["mkdocs-material>=9.6,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
