@@ -28,71 +28,70 @@ uv run pytest tests/test_store.py::test_add_paper_is_idempotent
 
 ### Dedicated ChromaDB store
 
-KB tests use a real ChromaDB instance persisted at `tests/.chroma/` (gitignored,
-never committed). Each test creates a collection named `test_<uuid8>` inside that
-directory and deletes it at teardown. This means:
-
-- Tests are fully isolated from each other (separate collections)
-- The store directory itself persists between runs (no re-initialisation overhead)
-- The embedding model is not reloaded for every test
+KB tests run against a real ChromaDB instance at `tests/.chroma/` (gitignored,
+never committed). Each test creates its own `test_<uuid8>` collection there and
+deletes it at teardown, which gets us three things for free: tests are fully
+isolated from each other, the store directory itself persists between runs
+without needing to be rebuilt, and the embedding model doesn't reload for
+every single test.
 
 ### Real HuggingFace models
 
-The actual embedding model named in the default config (`BAAI/bge-small-en-v1.5`)
-is used in the KB tests rather than a mock or a deterministic stub, built through
-the same `build_embeddings()` helper production uses so the query prefix and
-normalisation match real retrieval. The cross-encoder reranker
-(`cross-encoder/ms-marco-MiniLM-L6-v2`) is likewise loaded for real by any test
-that calls `search()`. Both models download once to `~/.cache/huggingface/` on
-the first run (embedding ~133 MB, reranker ~90 MB) and are reused from local cache
-afterwards.
+The KB tests use the real embedding model from the default config
+(`BAAI/bge-small-en-v1.5`) rather than a mock or a deterministic stub, built
+through the same `build_embeddings()` helper production uses, so the query
+prefix and normalization actually match real retrieval. Any test that calls
+`search()` loads the real cross-encoder reranker too
+(`cross-encoder/ms-marco-MiniLM-L6-v2`). Both models download once, to
+`~/.cache/huggingface/` (embedding ~133 MB, reranker ~90 MB), then come from
+local cache after that.
 
-**Why not mock the models?** A fake embedding function that returns zeroes or
-random vectors would hide real failure modes — ChromaDB filter behaviour, the
-LangChain wrapper's batching logic, and search result ranking all depend on actual
-vector values, and the reranker's effect can only be observed with a real model.
-The one-off download cost is worth the fidelity. This preference (a modest one-off
-setup cost over a mock that obscures real behaviour) is the general policy for this
-project; apply the same reasoning to other test decisions.
+Why not mock them? A fake embedding function that returns zeros or random
+vectors would hide the failure modes that actually matter — ChromaDB filter
+behavior, the LangChain wrapper's batching logic, and search ranking all
+depend on real vector values, and you can't observe what the reranker
+actually does without running it. The one-off download is a cheap price for
+that fidelity, and it's the general policy here: pay a modest one-time setup
+cost rather than test against a mock that hides how the thing really behaves.
 
 ### Real vs mocked, by boundary
 
-The policy in practice:
-
-- **Real dependencies:** embeddings, the reranker, ChromaDB, PyMuPDF, and
-  pymupdf4llm all run for real. PDF fixtures (annotated pages, scanned-like
-  pages) are generated in-test with PyMuPDF — no binary fixtures are committed,
-  and the real extraction/conversion paths run end-to-end.
-- **Mocked boundaries (sanctioned):** the arxiv client's network calls
-  (live HTTP to export.arxiv.org — `_client.results` is stubbed, with real
+- **Real:** embeddings, the reranker, ChromaDB, PyMuPDF, and pymupdf4llm all
+  run for real. PDF fixtures — annotated pages, scanned-like pages — are
+  generated in-test with PyMuPDF, so no binary fixtures are committed and the
+  real extraction/conversion paths run end to end.
+- **Mocked, and deliberately so:** the arxiv client's network calls (live HTTP
+  to export.arxiv.org — `_client.results` is stubbed, using real
   `arxiv.Result` objects), the bioRxiv API (`requests.get` stubbed with fake
-  responses shaped like the real payload), and the LLM API clients (billed per
-  token / need a running model server — mocked at the Ollama/Anthropic client
-  boundary, including `describe_image` for figure captioning). These are
-  genuine system boundaries where real calls are expensive or non-deterministic;
-  the retry/tool-loop logic under test is ours, not the libraries'.
+  responses shaped like the real payload), and the LLM API clients, mocked at
+  the Ollama/Anthropic client boundary since they're billed per token or need
+  a running model server. These are genuine system boundaries: what's under
+  test at each is our retry and tool-loop logic, not the library's.
 
 ### Retrieval-quality benchmark
 
-`test_retrieval_quality.py` measures *how good* retrieval is, not just whether it
-runs. It seeds a small module-scoped corpus (paper summaries + markdown notes) once
-and runs a fixed golden set of ~24 queries through the real `search()` pipeline
-(hybrid BM25+RRF, the default), asserting hit-rate@5 and MRR@5 stay above a floor.
-Its purpose is twofold: catch regressions (a broken query prefix, chunker, or
-reranker drops the metrics well below the floor), and provide a place to observe
-retrieval accuracy when tuning. The corpus includes acronym/proper-noun queries
-(`LoRA`, `BERT`, `Dr. Tanaka`) and author-name queries (`"papers by Vaswani"`) that
-only the embed_header prepended to every paper chunk can satisfy.
+`test_retrieval_quality.py` measures how *good* retrieval is, not just
+whether it runs. It seeds a small module-scoped corpus once — paper
+summaries and Markdown notes — and runs a fixed golden set of about 24
+queries through the real `search()` pipeline (hybrid BM25+RRF, the default),
+checking that hit-rate@5 and MRR@5 stay above a floor. It does two jobs at
+once: catching regressions (a broken query prefix, chunker, or reranker drops
+the metrics well below floor) and giving you a place to actually watch
+retrieval accuracy while tuning. The corpus includes acronym and proper-noun
+queries (`LoRA`, `BERT`, `Dr. Tanaka`) plus author-name queries (`"papers by
+Vaswani"`) that only match because of the `embed_header` prepended to every
+paper chunk.
 
-Thresholds are set as a regression floor with margin, not at the current ceiling —
-on a small, topically distinct corpus the pipeline scores near-perfectly, so tighten
-the thresholds only as far as stays stable across query rewording.
+The thresholds are set as a regression floor with margin, not at the current
+ceiling. On a corpus this small and topically distinct, the pipeline scores
+near-perfectly — tighten the thresholds only as far as stays stable across
+query rewording.
 
 ---
 
 ## Integration tests
 
-Tests marked `@pytest.mark.integration` require live external services:
+Tests marked `@pytest.mark.integration` need live external services:
 
 | Test | Requirement |
 |---|---|
@@ -100,8 +99,8 @@ Tests marked `@pytest.mark.integration` require live external services:
 | `test_anthropic_models_list_confirms_auth` | API key + internet access |
 | `test_ollama_is_reachable` | Running Ollama server (checked via `ollama.list()` at `http://localhost:11434`) |
 
-Integration tests make no token-consuming LLM calls — they only validate
-connectivity and credentials.
+None of these spend a token — they only check that credentials and
+connectivity work.
 
 ---
 
@@ -109,11 +108,11 @@ connectivity and credentials.
 
 | File | Module | Behaviours covered |
 |---|---|---|
-| `test_transcript.py` | `jarvis/core/transcript.py` | Round-trip identity for each adapter (neutral → wire → neutral); the Anthropic tool-result bundling rule and the OpenAI one-message-per-result rule; Ollama's name-keyed results and synthesised call ids; JSON-string vs mapping arguments, including malformed JSON; opaque blocks replaying to the same provider+model and being dropped for any other model, provider, or wire format |
-| `test_frontmatter.py` | `jarvis/kb/frontmatter.py` | Well-known keys mapping to named fields and the frontmatter block being stripped from the body; unknown keys passing through as `x_<key>` (string, int, bool); **the shadowing defence** — `visibility`/`doc_type`/`source`/`file_path` in a note's own frontmatter cannot overwrite jarvis's schema; tags joined to `"|a|b|c|"` with exact membership testing (`remote` must not match `remote-first`); malformed YAML warning but keeping the note; nested values skipped with a warning; a note with no frontmatter left untouched; a `---` rule partway down a file not mistaken for a header; `record_header` for full, partial, and empty records |
-| `test_drafts.py` | `jarvis/drafts/workspace.py` | The containment policy (plain names accepted; paths, traversal, hidden names, disallowed extensions and invalid ids refused; **a symlinked draft folder pointing outside the root refused**, which is why containment is checked against the root and not the draft folder; a symlinked file escaping a draft refused); creation writing file + metadata and inheriting session visibility; `add_draft_file` free only for a new name; the size limit; **`propose_edit` writing nothing**; hunk arithmetic (all hunks = the proposed text, none = unchanged, either one of two separated hunks applied exactly, insertions and deletions); hunk `kind` taken from the opcodes rather than line counts (a group carries context, so neither side is ever empty); **`old_spans`/`new_spans` covering only the lines that change** — the regression behind "it says 3 blocks but highlights 4", checked with a surviving block that must not be marked, and with spans asserted to be offsets into the hunk's own lines rather than into the file; stale-proposal refusal after a hand-edit, one-shot tokens, unknown tokens; `.versions/` snapshot before every write, restore snapshotting first so it is itself undoable, a version from another file refused, save refused on a moved hash; retention (stale removed, activity in any file keeping the whole draft, `keep` exempt, `retention_days = 0` disabling, dry-run deleting nothing, **a symlinked draft folder never followed by the prune**); and the reason a draft is a folder — `compile_latex` seeds its working directory from the whole draft, so a `.tex` reaches its `.bib` and chapters and nothing from any other draft, with `draft.json` excluded. Deleting a draft leaves a copy the user made elsewhere untouched |
-| `test_webapp_editor.py` | `jarvis/webapp/app.py` (editor routes) | The human side of the sandbox via `TestClient`: `/drafts` listing with toolchain availability; save writing through and refusing a stale hash; every route refusing paths outside the sandbox; `/preview` escaping embedded HTML **and** the markup carrying `sandbox=""` on the frame it lands in; compilation invoked with `-no-shell-escape`, `openin_any=p`/`openout_any=p`, an emptied `TEXMFHOME`, the configured timeout, and a working directory that is never the draft folder (asserted on the *invocation*, so the security properties are verified even with no TeX installed), plus a failed compile returning its log, a missing toolchain degrading to a clear 400, and a non-`.tex` refused; `/apply-edit` applying only the accepted hunks, one-shot tokens, unknown tokens, and a stale proposal refused after a hand-edit; `/discard-edit` leaving the file alone; `/proposals` listing what is still waiting in the same shape the live SSE event carries (so a re-opened suggestion renders through one code path) while withholding the whole proposed file, and `/proposals/discard-all` clearing them without touching a file; `/reveal` invoking a fixed argv with no shell, refusing every path outside the sandbox before any subprocess runs, and 404ing on a missing file; `/drafts/new` with a `draft_id` adding to an existing document rather than starting a second one, still containment-checked and still refusing an existing filename; the compile directory excluding `draft.json`; and restore putting a version back while snapshotting the current one |
-| `test_config.py` | `jarvis/core/config.py` | Defaults when no TOML (incl. `digest_enabled` false, `figure_captions` false, `digest_hour` 5, `pdf_watch_minutes` 30); `[digest] enabled` parsed both ways; TOML overrides defaults; env vars override TOML; `~` in paths expanded; `[auth] api_key` loaded; `[chat] ollama_model` + `OLLAMA_MODEL` env; `[rag]` retrieval and figure-caption keys, including `hybrid` (defaults true, parses from TOML); `[digest]` bioRxiv keys; `[sync]` section defaults, overrides (incl. `pdf_watch_minutes`), and `PDF_WATCH_DIR` env override |
+| `test_transcript.py` | `jarvis/core/transcript.py` | Round-trip identity for each adapter (neutral → wire → neutral). The Anthropic tool-result bundling rule and the OpenAI one-message-per-result rule. Ollama's name-keyed results and synthesised call ids. JSON-string vs mapping arguments, including malformed JSON. Opaque blocks replaying to the same provider+model and being dropped for any other model, provider, or wire format |
+| `test_frontmatter.py` | `jarvis/kb/frontmatter.py` | Well-known keys mapping to named fields and the frontmatter block being stripped from the body. Unknown keys passing through as `x_<key>` (string, int, bool). **The shadowing defence** — `visibility`/`doc_type`/`source`/`file_path` in a note's own frontmatter cannot overwrite jarvis's schema. Tags joined to `"|a|b|c|"` with exact membership testing (`remote` must not match `remote-first`). Malformed YAML warning but keeping the note; nested values skipped with a warning; a note with no frontmatter left untouched; a `---` rule partway down a file not mistaken for a header. `record_header` for full, partial, and empty records |
+| `test_drafts.py` | `jarvis/drafts/workspace.py` | The containment policy: plain names accepted; paths, traversal, hidden names, disallowed extensions and invalid ids refused; **a symlinked draft folder pointing outside the root refused**, which is why containment is checked against the root and not the draft folder; a symlinked file escaping a draft refused. Creation writing file + metadata and inheriting session visibility; `add_draft_file` free only for a new name; the size limit. **`propose_edit` writing nothing**. Hunk arithmetic — all hunks equal the proposed text, none equal unchanged, either one of two separated hunks applies exactly, insertions and deletions both work. Hunk `kind` taken from the opcodes rather than line counts, since a group carries context on both sides and neither side is ever empty. **`old_spans`/`new_spans` covering only the lines that change** — the regression behind "it says 3 blocks but highlights 4," checked with a surviving block that must not be marked, and spans asserted to be offsets into the hunk's own lines rather than into the file. Stale-proposal refusal after a hand-edit, one-shot tokens, unknown tokens. `.versions/` snapshot before every write, restore snapshotting first so it's itself undoable, a version from another file refused, save refused on a moved hash. Retention: stale removed, activity in any file keeping the whole draft alive, `keep` exempt, `retention_days = 0` disabling, dry-run deleting nothing, **a symlinked draft folder never followed by the prune**. And the reason a draft is a folder in the first place — `compile_latex` seeds its working directory from the whole draft, so a `.tex` reaches its `.bib` and chapters and nothing from any other draft, with `draft.json` excluded. Deleting a draft leaves a copy the user made elsewhere untouched |
+| `test_webapp_editor.py` | `jarvis/webapp/app.py` (editor routes) | The human side of the sandbox via `TestClient`: `/drafts` listing with toolchain availability; save writing through and refusing a stale hash; every route refusing paths outside the sandbox. `/preview` escaping embedded HTML **and** the markup carrying `sandbox=""` on the frame it lands in. Compilation invoked with `-no-shell-escape`, `openin_any=p`/`openout_any=p`, an emptied `TEXMFHOME`, the configured timeout, and a working directory that is never the draft folder — asserted on the *invocation*, so the security properties are verified even with no TeX installed — plus a failed compile returning its log, a missing toolchain degrading to a clear 400, and a non-`.tex` refused. `/apply-edit` applying only the accepted hunks, one-shot tokens, unknown tokens, and a stale proposal refused after a hand-edit; `/discard-edit` leaving the file alone. `/proposals` listing what's still waiting in the same shape the live SSE event carries (so a re-opened suggestion renders through one code path) while withholding the whole proposed file, and `/proposals/discard-all` clearing them without touching a file. `/reveal` invoking a fixed argv with no shell, refusing every path outside the sandbox before any subprocess runs, and 404ing on a missing file. `/drafts/new` with a `draft_id` adding to an existing document rather than starting a second one, still containment-checked and still refusing an existing filename. The compile directory excluding `draft.json`. Restore putting a version back while snapshotting the current one |
+| `test_config.py` | `jarvis/core/config.py` | Defaults when no TOML (incl. `digest_enabled` false, `figure_captions` false, `digest_hour` 5, `pdf_watch_minutes` 30); `[digest] enabled` parsed both ways; TOML overrides defaults; env vars override TOML; `~` in paths expanded; `[auth] api_key` loaded; `[chat] ollama_model` + `OLLAMA_MODEL` env; `[rag]` retrieval and figure-caption keys, including `hybrid` (defaults true, parses from TOML); `[digest]` bioRxiv keys; `[sync]` section defaults, overrides (incl. `pdf_watch_minutes`), and `PDF_WATCH_DIR` env override. Plus two tests that keep the README honest: its OpenRouter config block actually parses into a working config, and every `uv run <command>` it names is a real entry point |
 | `test_errors.py` | `jarvis/core/errors.py` | `@with_retries`: success on first try; retry on matching exception; raise after max attempts; no retry on non-matching exception; backoff grows exponentially with jitter (sleep monkeypatched) |
 | `test_arxiv_convert.py` | `jarvis/digest/arxiv/convert.py` | `parse_arxiv_url()`: `/abs/` URL; `/pdf/` URL; version suffix preserved; non-arXiv URL returns None |
 | `test_arxiv_fetch.py` | `jarvis/digest/arxiv/fetch.py` | `_to_paper` field mapping including `doi` (empty by default, surfaced when the arXiv result has one); fetch success; empty-feed-with-200 treated as transient (retried, then raises `FetchError`); recovery when the empty feed is transient; library errors wrapped as `FetchError`; single-paper fetch by ID; deduplication. The arxiv client's network calls are stubbed (real `arxiv.Result` objects, no HTTP); retries run with `time.sleep` monkeypatched |

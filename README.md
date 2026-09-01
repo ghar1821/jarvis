@@ -15,18 +15,18 @@ Named after Iron Man's J.A.R.V.I.S. — Just A Rather Very Intelligent System.
 
 ### What you need first
 
-- **[uv](https://github.com/astral-sh/uv)** and **Python ≥ 3.12**. On a machine
-  with neither: `curl -LsSf https://astral.sh/uv/install.sh | sh`, then
+- **[uv](https://github.com/astral-sh/uv)** and **Python ≥ 3.12**. Neither
+  installed yet? `curl -LsSf https://astral.sh/uv/install.sh | sh`, then
   `uv python install 3.12`.
-- **An OpenRouter key** — get one at
+- **An OpenRouter key.** Get one at
   [openrouter.ai/keys](https://openrouter.ai/keys). An Anthropic key works too.
-- **Or, to run locally instead:** [Ollama](https://ollama.com) with a model
-  that does tool calling *and* vision — `ollama pull qwen3-vl:30b`. Tool
-  calling is required (jarvis works by calling tools); vision is only needed
-  for figure captioning.
-- Optional, only for the editor's PDF output: a LaTeX distribution (MacTeX,
-  TeX Live) to compile `.tex`, and `pandoc` to export Markdown as PDF. Buttons
-  for a missing tool are hidden rather than broken, so skip these at first.
+- **Or run locally instead:** install [Ollama](https://ollama.com) and pull a
+  model that does tool calling *and* vision — `ollama pull qwen3-vl:30b`. Tool
+  calling is required, since jarvis works by calling tools; vision is only
+  needed for figure captioning.
+- Optional, and only for the editor's PDF output: a LaTeX distribution (MacTeX,
+  TeX Live) to compile `.tex`, and `pandoc` to export Markdown as PDF. Skip
+  these for now if you want — a button for a missing tool just stays hidden.
 
 ### 1. Install
 
@@ -37,7 +37,7 @@ uv sync
 
 ### 2. Write the config
 
-**Jarvis does not create this file for you.** Without it you get defaults —
+Jarvis won't create this file for you. Skip it and you get the defaults —
 local Ollama, and a vault at `~/vault` that probably doesn't exist.
 
 ```bash
@@ -66,15 +66,16 @@ openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
 chmod 600 ~/.jarvis/config.toml    # it holds an API key; jarvis warns if it's readable
 ```
 
-Both `provider` and `openrouter_model` are needed. Setting `provider` alone
-fails with *"No model configured for provider 'openrouter'"*, and a missing key
-fails at the first request with *"No OpenRouter credentials found"* — the
-client is built lazily, so nothing complains until then.
+You need both `provider` and `openrouter_model`. Set `provider` alone and it
+fails with *"No model configured for provider 'openrouter'"*. Leave the key
+out and nothing complains until your first message, when it fails with *"No
+OpenRouter credentials found"* — the client is built lazily, so there's
+nothing to check at startup.
 
-**On OpenRouter specifically:** it is a broker — it routes your request to
-somebody else's hardware. Jarvis sends strict settings by default
-(`data_collection = "deny"`, no silent fallbacks). See [Choose a
-model](#choose-a-model) to loosen them.
+OpenRouter is a broker: it routes your request to somebody else's hardware.
+Jarvis sends strict settings by default (`data_collection = "deny"`, no
+silent fallbacks) — see [Choose a model](#choose-a-model) if you want to
+loosen them.
 
 ### 3. Index your notes
 
@@ -82,13 +83,13 @@ model](#choose-a-model) to loosen them.
 uv run kb index-vault
 ```
 
-First run downloads the embedding model (`BAAI/bge-small-en-v1.5`, ~130 MB from
-HuggingFace) and caches it. That is the only model jarvis downloads, it runs
-locally, and it is why indexing works with no API calls. If your vault path is
-wrong you get `Error: vault path does not exist: ...` immediately, before
-anything is downloaded.
+The first run downloads the embedding model (`BAAI/bge-small-en-v1.5`, about
+130 MB from HuggingFace) and caches it. That's the only model jarvis ever
+downloads, it runs locally, and it's why indexing needs no API calls. Get the
+vault path wrong and you'll know immediately — `Error: vault path does not
+exist: ...` — before anything downloads at all.
 
-No notes yet? Skip this — the editor and chat work without a vault.
+No notes yet? Skip this step. Chat and the editor both work without a vault.
 
 ### 4. Check it worked
 
@@ -98,8 +99,8 @@ uv run kb stats      # what got indexed
 uv run kb doctor     # embedding model and index health
 ```
 
-`kb models` makes no network call — it reads your config, so it is the quickest
-way to confirm the file is being picked up:
+`kb models` reads your config rather than the network, so it's the fastest way
+to confirm the file is actually being picked up:
 
 ```
 ollama:qwen3-vl:30b  [local]
@@ -107,8 +108,8 @@ anthropic:claude-sonnet-4-6  [cloud]  (no API key)
 openrouter:anthropic/claude-sonnet-4.6  [cloud]
 ```
 
-An entry marked `(no API key)` is configured but unusable. If `openrouter:` is
-missing entirely, `openrouter_model` isn't set.
+`(no API key)` means configured but unusable. No `openrouter:` line at all
+means `openrouter_model` was never set.
 
 ### 5. Run it
 
@@ -116,9 +117,9 @@ missing entirely, `openrouter_model` isn't set.
 uv run webapp        # browser at http://127.0.0.1:8080 (localhost only)
 ```
 
-`webapp --reload` restarts the server when you edit Python. Note that changes
-to `static/app.js` or `index.html` need a **browser** hard-reload (⇧⌘R) rather
-than a server restart — and Python changes need the opposite.
+`webapp --reload` restarts the server on a Python edit. `static/app.js` and
+`index.html` are different: those need a **browser** hard-reload (⇧⌘R), not a
+server restart. Each half of the app needs the opposite kind of refresh.
 
 ### Working on jarvis
 
@@ -129,18 +130,18 @@ uv run pytest -m integration         # needs live services (API key, running Oll
 uv run pytest tests/test_drafts.py   # one file
 ```
 
-Everything jarvis owns lives in `~/.jarvis/`: `config.toml`, the index (`rag/`),
-sessions, drafts and logs. Deleting that directory resets you to a fresh
-install without touching your vault. Architecture, data flows and the privacy
-guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what is covered by tests
-and why is in [`docs/TESTING.md`](docs/TESTING.md).
+Everything jarvis owns lives under `~/.jarvis/`: `config.toml`, the index
+(`rag/`), sessions, drafts, logs. Delete that directory and you're back to a
+fresh install — your vault is untouched. Architecture, data flows and the
+privacy guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what the tests
+cover and why is in [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
 ## Ask it things
 
 Just talk to it. It searches your notes, papers and past conversations before
-answering, and shows you every step it takes.
+answering, and shows you every step along the way.
 
 ```
 what did I conclude about batch effects in the cytometry project?
@@ -149,27 +150,27 @@ what did we discuss about this last week?
 add https://arxiv.org/abs/2406.04093
 ```
 
-By default it answers **only** from what it found in your knowledge base. Flip
-the **DB only** toggle off to let it fall back on the model's own knowledge —
-it says so on screen when it does.
+By default it only answers from what it finds in your knowledge base. Flip
+the **DB only** toggle off and it can fall back on the model's own training
+knowledge instead — and it says so on screen when it does.
 
-Conversations are saved automatically. Resume, rename, pin or delete them from
-the **Chats** section of the sidebar.
+Conversations save themselves. Resume, rename, pin or delete one from the
+**Chats** section of the sidebar.
 
 ---
 
 ## Write documents with it
 
-Ask for a document and you get a real file you can open, not a wall of chat
-text:
+Ask for a document and you get a real file you can open — not a wall of chat
+text.
 
 ```
 tailor my CV to this job ad
 draft the methods section from my notes on the pipeline
 ```
 
-Those land in **drafts** — a scratch folder the assistant can write to freely.
-Your vault is read-only to it, permanently.
+These land in **drafts**, a scratch folder the assistant can write to freely.
+Your vault stays read-only to it, permanently.
 
 ```
 ~/.jarvis/drafts/          your vault
@@ -177,72 +178,71 @@ assistant writes here      it can never write here, with or without your say-so
 you edit here              you copy files across yourself, in Finder
 ```
 
-**A draft is a folder, not a file.** That is what makes LaTeX work: `main.tex`,
+A draft is a folder, not a file, and that's what makes LaTeX work: `main.tex`,
 its chapters and its `.bib` live in one draft and compile together, because
-compiling copies the whole folder. Markdown is usually one file, so a
+compiling copies the whole folder at once. Markdown is usually one file, so a
 single-file draft just shows as one row; a multi-file one lists its parts
-underneath with a count beside the name. Right-click a document to add a file
-to it.
+underneath, with a count beside the name. Right-click a document to add
+another file to it.
 
-The sidebar has two sections, **Chats** and **Documents**, each with a `+` to
-start a new one. Click a document, or press **Editor** in the header, and the
-editor opens above the chat — so you can talk about the document while looking
-at it. Inside the editor: source on the left, preview on the right, with
-**Recompile** to re-render and a layout control for split / source only /
+The sidebar has two sections — **Chats** and **Documents** — each with a `+`
+to start a new one. Click a document, or press **Editor** in the header, and
+the editor opens above the chat, so you can talk about the document while
+looking at it. Source sits on the left, preview on the right, **Recompile**
+re-renders, and a layout control switches between split / source only /
 output only. Markdown previews as you type; LaTeX compiles to a PDF (with the
 log underneath when it fails); both export to PDF.
 
-- **Open several at once.** Each file gets a tab. The control on a tab is a
-  filled dot while it has unsaved changes and an × once it does not, so you can
-  see what still needs saving without switching to it. Clicking it saves first
-  if it needs saving, then closes — closing a tab is never how work is lost.
-- **⌘S saves** the tab you are in. Previewing, compiling or exporting saves
-  first, so what you act on is always what you see.
-- Every previous version is kept — **History** restores one, and restoring is
+- **Open several at once.** Each file gets its own tab. A filled dot on the
+  tab means unsaved changes; an × means none. Click it and it saves first if
+  it needs to, then closes — a tab can never cost you work just by closing it.
+- **⌘S saves** the tab you're in. Previewing, compiling or exporting also
+  saves first, so what you act on is always what's on screen.
+- Every earlier version is kept. **History** restores one, and restoring is
   itself undoable.
-- When the assistant proposes a change you get **a diff with a checkbox per
-  hunk**. Accept some, reject others; only what you tick is written. A ✎ on a
-  tab means a suggestion is still waiting there; reopening the file brings it
-  back. ⋮ → **Discard pending suggestions…** clears the lot, and they go on
-  their own when you restart the app.
-- Drafts **expire** after 30 days untouched. `uv run kb drafts` shows how long
-  each has left, and **Keep** exempts one. `[drafts] retention_days = 0` turns the
-  sweep off.
+- When the assistant proposes a change, you get a diff with a checkbox per
+  hunk — accept some, reject others, and only what you tick gets written. A ✎
+  on a tab means a suggestion is still waiting there; open the file and it
+  comes back. ⋮ → **Discard pending suggestions…** clears the lot at once, and
+  they clear themselves whenever you restart the app.
+- Drafts expire after 30 days untouched. `uv run kb drafts` shows how long
+  each has left; **Keep** exempts one for good. Set
+  `[drafts] retention_days = 0` to turn the sweep off entirely.
 
 ### Getting a document out
 
-Right-click it → **Show in Finder**, then copy it wherever you want.
+Right-click it, choose **Show in Finder**, then copy it wherever you like.
 
-That is deliberately all there is. Jarvis has no route into your vault at all —
-there is no password to set, and nothing to get past, because moving a file is
-something you do in your own file manager.
+That's the whole mechanism, on purpose. Jarvis has no route into your vault at
+all — no password to set, nothing to get past — because moving a file is
+something you do yourself, in your own file manager.
 
-**First PDF on a new machine may be slow.** Markdown export runs through
-xelatex and fontspec, which builds a system font cache on its first run —
-minutes, sometimes past the compile timeout. It only happens once. Get it over
-with before you need it:
+The first PDF you export on a new machine can be slow: Markdown export runs
+through xelatex and fontspec, and fontspec builds a system font cache the
+first time it runs — sometimes past the compile timeout. It's a one-time cost.
+Get it over with before you need it:
 
 ```bash
 printf '\\documentclass{article}\\usepackage{fontspec}\\begin{document}x\\end{document}' > /tmp/warm.tex
 xelatex -output-directory=/tmp /tmp/warm.tex
 ```
 
-(A `.tex` document compiles via latexmk/pdflatex and skips all of this, so
-compiling working while exporting hangs is expected rather than odd.)
+(`.tex` documents compile through latexmk/pdflatex instead and skip all of
+this, which is why compiling can work fine while exporting hangs.)
 
-**Preview and export need:** nothing for Markdown preview; a LaTeX
-distribution (MacTeX, TeX Live) to compile `.tex`; `pandoc` as well to export
-Markdown as PDF. Buttons for a missing tool are hidden rather than broken.
+Preview needs nothing extra. Compiling `.tex` needs a LaTeX distribution
+(MacTeX, TeX Live). Exporting Markdown as PDF needs `pandoc` on top of that.
+Buttons for a missing tool stay hidden rather than sitting there broken.
 
 ### Skills — teaching it how you like things done
 
-A **skill** is a set of instructions you write once, in plain English, that the
-assistant follows whenever a matching task comes up. It saves you re-explaining
-your own process every time.
+A skill is a set of instructions you write once, in plain English, that the
+assistant follows whenever a matching task comes up — so you stop
+re-explaining your own process every time.
 
 Say your methods sections always need to cite the pipeline version and name
 which dataset each figure came from. Write that down once as a skill, and you
-stop having to say it.
+never have to say it again.
 
 A skill is just a folder with a `SKILL.md` in it:
 
@@ -266,29 +266,30 @@ description: Draft a methods section the way I write them.
 4. Past tense, no first person, no hedging about future work.
 ```
 
-The folder name is the skill's name, and the `description` is all the assistant
-sees up front — it loads the full instructions only when a task actually
-matches, so having twenty skills costs nothing until one is used. Delete the
-folder to switch it off.
+The folder name is the skill's name. The `description` is all the assistant
+sees up front; it only loads the full instructions once a task actually
+matches, so having twenty skills sitting around costs nothing until one gets
+used. Delete the folder and the skill is gone.
 
-Skills are your own files. They're never indexed and never sent anywhere the
-rest of a conversation wouldn't go.
+These are your own files. Nothing about them gets indexed, and nothing leaves
+your machine any more than the rest of a conversation already would.
 
-Two worked examples are in [`examples/skills/`](examples/skills/) — copy a
+Two worked examples live in [`examples/skills/`](examples/skills/) — copy a
 folder into `~/.jarvis/skills/` to try them:
 
-- **`draft-from-notes`** — write a paper or report section from your notes and
-  indexed papers, showing you the gaps rather than papering over them.
-- **`tailor-document`** — reshape an existing document for a specific target,
-  using evidence from your own records.
+- **`draft-from-notes`** — writes a paper or report section from your notes
+  and indexed papers, and tells you where the gaps are rather than papering
+  over them.
+- **`tailor-document`** — reshapes an existing document for a specific
+  target, using evidence pulled from your own records.
 
 ---
 
 ## Keep records, not just notes
 
-Any note can carry YAML frontmatter, and jarvis turns it into something you can
-filter on. Useful for anything you have a lot of and need to track the state of
-— manuscripts, grants, experiments, meetings.
+Any note can carry YAML frontmatter, and jarvis turns that into something you
+can filter on — useful for anything you accumulate a lot of and need to track
+the state of: manuscripts, grants, experiments, meetings.
 
 ```markdown
 ---
@@ -305,7 +306,7 @@ coauthors: Ada Lovelace       # jarvis has never seen this key; still filterable
 Submitted 18 April. Reviewer 2 wants the ablation on the spillover step.
 ```
 
-Then ask questions by record rather than by wording:
+Then ask questions by record instead of by wording:
 
 ```
 which manuscripts are under review, and what are reviewers asking for?
@@ -313,16 +314,18 @@ what have I got in drafting for Nature Methods?
 show me everything I submitted this year
 ```
 
-The vocabulary is yours: `type`, `status`, `entity`, `date` and `tags` get
-first-class filters, and every other key is kept too — jarvis has no idea what
-a "manuscript" is, it just indexes what you wrote. Run `uv run kb schema` to
-see which keys and values actually exist; that is how you catch a typo like
-`stauts:` that would otherwise silently never match.
+The vocabulary is yours. `type`, `status`, `entity`, `date` and `tags` get
+first-class filters, and every other key still gets kept — jarvis has no idea
+what a "manuscript" actually is, it just indexes what you wrote. Run
+`uv run kb schema` to see which keys and values actually exist. That's how
+you catch a typo like `stauts:` that would otherwise silently never match
+anything.
 
-The same shape works for anything else you want to keep track of — job
-applications with outcomes, experiments with conditions, reading with verdicts.
+The same shape works for whatever else you want to track — job applications
+with outcomes, experiments with conditions, reading with verdicts.
 
-You edit records in Obsidian as usual. Jarvis indexes them; it doesn't own them.
+You still edit records in Obsidian, same as always. Jarvis indexes them; it
+doesn't own them.
 
 ---
 
@@ -337,31 +340,31 @@ uv run kb add paper.pdf --authors "Ada Lovelace"      # or set them yourself
 
 Or just ask in chat: *"add ~/Downloads/paper.pdf, full text"*.
 
-**Drop PDFs in a folder** and they index themselves. Set
+Drop PDFs in a folder and they index themselves. Set
 `[sync] pdf_watch_dir = "~/Documents/papers/inbox"` and the background daemon
 sweeps it every half hour.
 
-**Your highlights come along.** Highlights and typed notes made in macOS
+Your highlights come along too. Highlights and typed notes made in macOS
 Preview or Foxit Reader become searchable, so *"what did I highlight in that
-paper?"* works. Re-save a PDF with new annotations and it re-indexes itself.
-(Freehand pen scribbles aren't text, so they can't be extracted.)
+paper?"* actually works. Re-save a PDF with new annotations and it re-indexes
+itself. (Freehand pen scribbles aren't text, so those can't be pulled out.)
 
-**Figures** can be captioned by a vision model and made searchable — off by
-default since each figure costs a call. Add `--figures`, or ask for a paper
-"with figures".
+Figures can be captioned by a vision model and made searchable — off by
+default, since every figure costs a call. Add `--figures`, or just ask for a
+paper "with figures."
 
 ---
 
 ## Choose a model
 
 Switch mid-conversation without losing the thread: **⋮ → Switch model…**. It
-applies from your next message, per conversation — two sessions can run
+applies from your next message, per conversation, so two sessions can run
 different models at once. The header shows the active model and what the
-session has cost.
+session has cost so far.
 
-**You do not have to configure a catalogue.** Whatever you set as
-`openrouter_model` (or `ollama_model`) already appears in the picker. `[models]`
-just adds more to choose from:
+You don't have to configure a catalogue. Whatever you set as
+`openrouter_model` (or `ollama_model`) already shows up in the picker.
+`[models]` just adds more to choose from:
 
 ```toml
 [models]
@@ -373,32 +376,32 @@ uv run kb models              # what's on offer right now (no network)
 uv run kb models --refresh    # pull OpenRouter's full catalogue into [models]
 ```
 
-`--refresh` is optional and only for browsing — it writes OpenRouter's model
-ids into your config so you can pick from a list instead of typing one. It is
-the only place jarvis fetches a model list; the picker itself never touches the
-network. Consider writing two or three by hand instead: a picker with three
-hundred rows is worse than one with the models you actually use.
+`--refresh` is optional and only for browsing. It writes OpenRouter's model
+ids into your config so you can click one instead of typing it — the only
+place jarvis ever fetches a model list, and the picker itself never touches
+the network. Write two or three in by hand instead if you'd rather; a picker
+with three hundred rows is worse than one with the handful you actually use.
 
-**Editing the config needs a webapp restart** before the picker sees the change
-— switching between models already listed does not.
+Editing the config needs a webapp restart before the picker sees the change.
+Switching between models already listed doesn't.
 
-The list is a convenience, not a restriction — the picker also has a box to
-type any model id OpenRouter accepts, listed or not, which is applied to the
-current conversation without touching your config.
+The list is a convenience, not a restriction — the picker also has a box for
+typing any model id OpenRouter accepts, listed or not, applied to the current
+conversation without touching your config at all.
 
-**Automatic routing.** OpenRouter's auto router is just a model id, so set
-`openrouter_model = "openrouter/auto"` (or add it to `[models]`) and it picks a
-model per request. Jarvis sends `allow_fallbacks = false` by default, which is
-untested against the auto router — loosen it under `[openrouter]` if requests
-start failing.
+OpenRouter's auto router is just a model id, so automatic routing needs
+nothing built for it: set `openrouter_model = "openrouter/auto"` (or add it
+to `[models]`) and it picks a model per request. Jarvis sends
+`allow_fallbacks = false` by default, which hasn't been tested against the
+auto router — loosen it under `[openrouter]` if requests start failing.
 
-**Cost** is shown only for OpenRouter, which reports what each request actually
-cost, shown in the header. A local model costs
-nothing, and jarvis won't invent a figure for anything else.
+Cost is shown only for OpenRouter, which reports what each request actually
+cost — you'll see it in the header. A local model costs nothing, and jarvis
+won't invent a figure for anything else.
 
-**If you use OpenRouter**, know that it is a broker — it routes your request to
-somebody else's hardware. Jarvis sends the strict settings by default
-(`data_collection = "deny"`, no silent fallbacks); you can loosen them under
+If you use OpenRouter, know that it's a broker: your request routes to
+somebody else's hardware. Jarvis sends strict settings by default
+(`data_collection = "deny"`, no silent fallbacks); loosen them under
 `[openrouter]` if you want to.
 
 ---
@@ -414,13 +417,14 @@ vault/
 └── research/   ← any model
 ```
 
-A conversation that touches private content is marked private for good, and
-can't be switched to a cloud model afterwards. Papers are always public, so put
-anything sensitive in a note.
+Once a conversation touches private content it's marked private for good, and
+can't switch to a cloud model afterwards. Papers are always public, so keep
+anything sensitive in a note instead.
 
-Two things jarvis will never do: **delete a file** (removing a document removes
-its database entry only — the file stays), and **write to your vault** (there
-is no code path that can — you copy drafts across yourself, in Finder).
+Two things jarvis will never do: delete a file (removing a document only
+removes its database entry — the file stays put), and write to your vault
+(there's no code path that could — you copy drafts across yourself, in
+Finder).
 
 ---
 
@@ -430,10 +434,10 @@ is no code path that can — you copy drafts across yourself, in Finder).
 uv run jarvis-sync
 ```
 
-**Entirely optional.** It is a scheduler and nothing more — it runs the same
-vault sync, PDF sweep and draft cleanup you can run yourself, on a timer. Skip
-it and nothing breaks; you just index by hand when you have edited your notes.
-It stays in the foreground, so run it under `tmux`/`screen` if you want it to
+Entirely optional. It's a scheduler and nothing more, running the same vault
+sync, PDF sweep and draft cleanup you can run by hand — just on a timer. Skip
+it and nothing breaks; you just index manually after editing your notes. It
+stays in the foreground, so run it under `tmux` or `screen` if you want it to
 survive closing the terminal. Check on it any time:
 
 ```bash
@@ -446,12 +450,12 @@ uv run kb sync-status
 uv run kb index-vault     # pick up notes you added, edited or deleted
 ```
 
-That is the one to use. It is exactly what the daemon runs on its timer:
+That's the one you want — it's exactly what the daemon runs on its own timer,
 incremental, so unchanged notes cost nothing.
 
-**`kb reindex` is a different thing and is usually not what you want.** It
-re-embeds text already in the database and never looks at your vault, so it
-will not notice a single note you changed. It is for two situations only: you
+`kb reindex` is a different tool and usually isn't what you want. It re-embeds
+text already in the database and never looks at your vault, so it won't
+notice a single note you changed. It exists for two situations only: you
 changed `embed_model`, or `kb doctor` told you the index is damaged.
 
 | You did this | Run this |
@@ -465,7 +469,7 @@ changed `embed_model`, or `kb doctor` told you the index is damaged.
 
 ## Weekly paper digest (optional, off)
 
-If you want automated arXiv/bioRxiv discovery, switch it on:
+Want automated arXiv/bioRxiv discovery? Switch it on:
 
 ```toml
 [digest]
@@ -474,8 +478,8 @@ arxiv_categories = [["cs.LG", 150], ["cs.AI", 80]]
 ```
 
 It fetches weekly, scores everything against your relevance prompt, writes a
-tiered Markdown digest, and indexes the best papers. Catch-up is automatic if
-your machine was asleep. Run one by hand any time with
+tiered Markdown digest, and indexes the best papers. If your machine was
+asleep, catch-up runs automatically. Run one by hand any time with
 `uv run run-digest --force`.
 
 ---
@@ -506,9 +510,9 @@ uv run kb drafts --prune --dry-run
 uv run kb models [--refresh]
 ```
 
-Everything lives in `~/.jarvis/`: `config.toml`, your index, sessions, drafts
-and logs. Keep the config private (`chmod 600 ~/.jarvis/config.toml`) — it can
-hold an API key, and jarvis warns you at startup if it's readable by others.
+Everything lives under `~/.jarvis/`: `config.toml`, your index, sessions,
+drafts, logs. Keep the config private (`chmod 600 ~/.jarvis/config.toml`) — it
+can hold an API key, and jarvis warns you at startup if others can read it.
 
 The full configuration reference is in
 [`docs/DESIGN.md`](docs/DESIGN.md#configuration--jarviscoreconfigpy).
@@ -518,32 +522,33 @@ The full configuration reference is in
 ## If something goes wrong
 
 **"No model configured for provider 'openrouter'".** You set `provider` but
-not `openrouter_model`. Both are needed — see [Get started](#get-started).
+not `openrouter_model`. You need both — see [Get started](#get-started).
 
 **"No OpenRouter credentials found".** No key in `[auth] openrouter_api_key`
-and none in `OPENROUTER_API_KEY`. The client is built lazily, so this appears
-at the first message rather than at startup. `uv run kb models` shows which
-providers have a key without sending a request.
+and none in `OPENROUTER_API_KEY` either. The client is built lazily, so this
+only shows up at your first message, not at startup. `uv run kb models` shows
+which providers have a key without sending anything.
 
-**Nothing you configured seems to apply.** Jarvis reads
-`~/.jarvis/config.toml` and nothing else — not a file in the repo, and not the
-working directory. `uv run kb models` reflects what was actually loaded.
+**Nothing you configured seems to apply.** Jarvis only reads
+`~/.jarvis/config.toml` — never a file in the repo, never the working
+directory. `uv run kb models` shows what was actually loaded.
 
-**Searches fail with a database error.** Run `uv run kb doctor`. It will tell
-you whether to `uv run kb reindex` or just restart the process.
+**Searches fail with a database error.** Run `uv run kb doctor`. It tells you
+whether to run `uv run kb reindex` or just restart the process.
 
 **"Embedding model mismatch".** You changed `embed_model`. Run
 `uv run kb reindex` once — it re-embeds stored text, makes no LLM calls, and
 downloads nothing.
 
 **The webapp behaves oddly after an upgrade.** Hard-reload the tab
-(Cmd+Shift+R); an old tab can send request shapes the new server rejects.
+(Cmd+Shift+R). An old tab can send request shapes the new server doesn't
+recognize.
 
-**Upgrading from an older jarvis.** Run `uv run kb reindex` once. If your config
-still has `provider = "llamacpp"`, switch it to `"ollama"`; if it has
+**Upgrading from an older jarvis.** Run `uv run kb reindex` once. If your
+config still has `provider = "llamacpp"`, switch it to `"ollama"`; if it has
 `rag_dir = "~/.seshat/rag"`, change it to `~/.jarvis/rag`; and move
-`anthropic_model` from `[digest]` to `[chat]`. Jarvis warns rather than
-rewriting your file.
+`anthropic_model` from `[digest]` to `[chat]`. Jarvis warns about these
+instead of rewriting your file for you.
 
 ---
 
