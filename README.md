@@ -1,5 +1,7 @@
 # jarvis
 
+[![Tests](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml)
+
 A personal assistant that knows your own notes, documents and papers, runs on
 your machine, and can write documents with you.
 

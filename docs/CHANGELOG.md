@@ -585,6 +585,18 @@ message to the wrong session entirely, because `/chat` never said which
 session it meant — it just mutated whatever the shared dict currently
 pointed at.
 
+### Added
+
+- **CI runs the unit suite on main.** `.github/workflows/tests.yml` runs
+  `uv run pytest -m "not integration"` on `ubuntu-latest` / Python 3.12 for
+  pushes to `main` and PRs targeting `main` — nothing else, since feature
+  branches here are local until they aim at `main`. uv's dependency cache
+  (keyed off `uv.lock`) and a `~/.cache/huggingface` cache holding the
+  embedding model and reranker keep a warm run short; the cache key names both
+  models, so changing either in the config means changing the key. No secrets
+  are declared: the unit suite touches neither the network nor a live LLM.
+  README carries the status badge.
+
 ### Changed
 
 - **`/chat` is now session-addressed.** `ChatRequest` gains a required
