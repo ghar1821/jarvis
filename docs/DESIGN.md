@@ -209,6 +209,7 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `drafts_retention_days` | `30` | — | `[drafts] retention_days` — a draft untouched this long is swept by the daemon's `draft_gc` job. `0` disables the sweep entirely; a `keep` draft is exempt regardless |
 | `drafts_gc_hour` | `4` | — | `[drafts] gc_hour` — hour of day (0–23) for the retention sweep |
 | `latex_engine` | `latexmk` | — | `[drafts] latex_engine` — used to compile `.tex`. `""` disables compilation and hides the button rather than failing on click |
+| `pdf_engine` | `xelatex` | — | `[drafts] pdf_engine` — the engine pandoc drives for Markdown → PDF. Separate from `latex_engine` because they are different jobs: latexmk is a build wrapper that reruns until references settle, while pandoc needs an actual engine. xelatex rather than pandoc's default pdflatex because notes carry Greek letters and accented names, which pdflatex fails outright on; the cost is that xelatex loads fontspec, whose first run builds a system font cache and can take minutes — which is why a `.tex` can compile fine on a new machine while a `.md` export times out |
 | `compile_timeout_seconds` | `60` | — | `[drafts] compile_timeout_seconds` — hard ceiling on a LaTeX run, so a `\loop` bomb in a model-written document dies instead of pinning a core |
 | `pdf_margin` | `2cm` | — | `[drafts] pdf_margin` — page margin for Markdown → PDF export via pandoc |
 

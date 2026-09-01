@@ -217,6 +217,19 @@ That is deliberately all there is. Jarvis has no route into your vault at all �
 there is no password to set, and nothing to get past, because moving a file is
 something you do in your own file manager.
 
+**First PDF on a new machine may be slow.** Markdown export runs through
+xelatex and fontspec, which builds a system font cache on its first run —
+minutes, sometimes past the compile timeout. It only happens once. Get it over
+with before you need it:
+
+```bash
+printf '\\documentclass{article}\\usepackage{fontspec}\\begin{document}x\\end{document}' > /tmp/warm.tex
+xelatex -output-directory=/tmp /tmp/warm.tex
+```
+
+(A `.tex` document compiles via latexmk/pdflatex and skips all of this, so
+compiling working while exporting hangs is expected rather than odd.)
+
 **Preview and export need:** nothing for Markdown preview; a LaTeX
 distribution (MacTeX, TeX Live) to compile `.tex`; `pandoc` as well to export
 Markdown as PDF. Buttons for a missing tool are hidden rather than broken.
@@ -417,13 +430,36 @@ is no code path that can — you copy drafts across yourself, in Finder).
 uv run jarvis-sync
 ```
 
-Keeps everything current: re-indexes your vault, sweeps the PDF inbox, clears
-expired drafts. It stays in the foreground, so run it under `tmux`/`screen` if
-you want it to survive closing the terminal. Check on it any time:
+**Entirely optional.** It is a scheduler and nothing more — it runs the same
+vault sync, PDF sweep and draft cleanup you can run yourself, on a timer. Skip
+it and nothing breaks; you just index by hand when you have edited your notes.
+It stays in the foreground, so run it under `tmux`/`screen` if you want it to
+survive closing the terminal. Check on it any time:
 
 ```bash
 uv run kb sync-status
 ```
+
+### Updating the index by hand
+
+```bash
+uv run kb index-vault     # pick up notes you added, edited or deleted
+```
+
+That is the one to use. It is exactly what the daemon runs on its timer:
+incremental, so unchanged notes cost nothing.
+
+**`kb reindex` is a different thing and is usually not what you want.** It
+re-embeds text already in the database and never looks at your vault, so it
+will not notice a single note you changed. It is for two situations only: you
+changed `embed_model`, or `kb doctor` told you the index is damaged.
+
+| You did this | Run this |
+|---|---|
+| Edited, added or deleted notes | `kb index-vault` |
+| Want a clean rebuild of the note index | `kb index-vault --force` |
+| Changed `embed_model` in the config | `kb reindex` |
+| `kb doctor` reported a corrupt index | `kb reindex` (or `--from-storage`) |
 
 ---
 

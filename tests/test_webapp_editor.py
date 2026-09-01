@@ -500,3 +500,53 @@ def test_the_compile_directory_excludes_the_sandbox_bookkeeping(sandbox, client,
     client.post("/compile", json={"draft_id": draft["id"], "file": "main.tex"})
 
     assert "draft.json" not in seeded
+
+
+def test_pdf_export_is_gated_on_the_engine_it_actually_runs(sandbox, monkeypatch):
+    """
+    The export button was gated on `latexmk` while export invoked `xelatex`, so
+    a machine with one and not the other showed a button that could only fail.
+    """
+    from jarvis.drafts import render
+
+    present = set()
+    monkeypatch.setattr(render, "_tool_available", lambda name: name in present)
+
+    present = {"pandoc", "latexmk"}          # the old check would say yes
+    assert render.pdf_export_available() is False
+
+    present = {"pandoc", "xelatex"}          # the engine export really uses
+    assert render.pdf_export_available() is True
+
+    present = {"xelatex"}                    # pandoc drives it; both are needed
+    assert render.pdf_export_available() is False
+
+
+def test_a_compile_timeout_says_a_first_run_may_just_be_slow(sandbox, monkeypatch):
+    """
+    A fresh TeX install builds font caches and format files on its first run,
+    which can exceed the timeout for reasons that have nothing to do with the
+    document. The message has to say so, or the only reading left is "my
+    document is broken".
+    """
+    import subprocess
+
+    from jarvis.drafts import render
+    from jarvis.drafts.render import RenderError
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["xelatex"], timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with pytest.raises(RenderError) as caught:
+        render._run(["xelatex", "x.tex"], cwd=sandbox.drafts_dir, timeout=60)
+
+    message = str(caught.value)
+    assert "first" in message.lower()
+    assert "compile_timeout_seconds" in message, "the way out has to be named"
+    # The warm-up must exercise fontspec. A plain article compiles without ever
+    # touching the font cache, so suggesting one would warm the wrong thing and
+    # leave the user exactly where they started.
+    assert "fontspec" in message
+    assert "xelatex" in message

@@ -402,7 +402,7 @@ def _draft_error(exc: Exception) -> HTTPException:
 
 @app.get("/drafts")
 async def drafts_index() -> dict:
-    from jarvis.drafts import latex_available, list_drafts, pandoc_available
+    from jarvis.drafts import latex_available, list_drafts, pdf_export_available
 
     return {
         "drafts": list_drafts(),
@@ -410,7 +410,7 @@ async def drafts_index() -> dict:
         # The UI hides the compile and export buttons rather than offering
         # something that can only fail on a machine without the toolchain.
         "latex": latex_available(),
-        "pandoc": pandoc_available(),
+        "pandoc": pdf_export_available(),
     }
 
 

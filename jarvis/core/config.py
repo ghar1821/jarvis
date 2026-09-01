@@ -73,7 +73,8 @@ Example ~/.jarvis/config.toml:
     max_file_bytes = 2000000
     retention_days = 30          # 0 disables the sweep entirely
     gc_hour = 4                  # daily sweep slot
-    latex_engine = "latexmk"     # "" disables .tex compilation and PDF export
+    latex_engine = "latexmk"     # "" disables .tex compilation
+    pdf_engine = "xelatex"       # engine pandoc drives for Markdown -> PDF
     compile_timeout_seconds = 60
     pdf_margin = "2cm"           # margin for Markdown -> PDF export
 
@@ -199,6 +200,7 @@ class Config:
     # Compilation and PDF export run locally with no model in the loop, which
     # is why they are allowed on a private draft. "" hides the compile button.
     latex_engine: str = "latexmk"
+    pdf_engine: str = "xelatex"
     compile_timeout_seconds: int = 60
     # Margin for Markdown -> PDF export. pandoc's default leaves an inch and a
     # half of white space on every side, which wastes most of the page.
@@ -339,6 +341,8 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             cfg.drafts_gc_hour = int(dr["gc_hour"])
         if "latex_engine" in dr:
             cfg.latex_engine = str(dr["latex_engine"])
+        if "pdf_engine" in dr:
+            cfg.pdf_engine = str(dr["pdf_engine"])
         if "compile_timeout_seconds" in dr:
             cfg.compile_timeout_seconds = int(dr["compile_timeout_seconds"])
         if "pdf_margin" in dr:

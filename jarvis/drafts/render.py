@@ -102,6 +102,30 @@ def latex_available() -> bool:
     return _tool_available(get_config().latex_engine)
 
 
+def export_engine(cfg) -> str:
+    """
+    The engine pandoc drives for Markdown -> PDF: `[drafts] pdf_engine`.
+
+    Separate from `latex_engine` because they are not the same job. Compiling a
+    .tex wants latexmk, a build wrapper that reruns until references settle;
+    pandoc needs an actual engine. This used to be derived by replacing
+    "latexmk" with "xelatex" in the compile setting, which meant the export
+    button was gated on latexmk while export ran xelatex.
+
+    The default is xelatex rather than pandoc's own pdflatex because notes
+    contain Greek letters and accented names, and pdflatex fails outright on
+    them ("Package inputenc Error") rather than degrading. The cost is that
+    xelatex loads fontspec, whose first run on a new machine builds a font
+    cache that can take minutes — see the timeout message in _run.
+    """
+    return cfg.pdf_engine
+
+
+def pdf_export_available() -> bool:
+    """Both halves of the Markdown -> PDF path, checking the engine that runs."""
+    return _tool_available("pandoc") and _tool_available(export_engine(get_config()))
+
+
 def pandoc_available() -> bool:
     return _tool_available("pandoc")
 
@@ -122,8 +146,19 @@ def _run(command: list[str], cwd: Path, timeout: int) -> subprocess.CompletedPro
         )
     except subprocess.TimeoutExpired as exc:
         raise RenderError(
-            f"Timed out after {timeout}s. A document that never finishes compiling is "
-            "usually an unterminated environment or an accidental infinite loop."
+            f"Timed out after {timeout}s.\n\n"
+            "If this is the first PDF you have made on this machine, the document is "
+            "probably not the problem. Markdown export runs through fontspec, which "
+            "enumerates your system fonts on its first run and builds a cache — that "
+            "alone can take several minutes, and it is why a .tex can compile fine "
+            "while a .md export times out. Get it over with once:\n\n"
+            "  printf '\\\\documentclass{article}\\\\usepackage{fontspec}"
+            "\\\\begin{document}x\\\\end{document}' > /tmp/warm.tex\n"
+            f"  {command[0]} -output-directory=/tmp /tmp/warm.tex\n\n"
+            "Then try the export again.\n\n"
+            "Otherwise a document that never finishes compiling is usually an "
+            "unterminated environment or an accidental infinite loop. "
+            "[drafts] compile_timeout_seconds raises the limit."
         ) from exc
 
 
@@ -205,9 +240,10 @@ def markdown_to_pdf(draft_id: str, filename: str) -> bytes:
             "pandoc is not installed, so Markdown cannot be exported as PDF. "
             "Install pandoc, or export the preview as HTML instead."
         )
-    if not latex_available():
+    engine = export_engine(cfg)
+    if not _tool_available(engine):
         raise RenderError(
-            "PDF export needs a LaTeX engine as well as pandoc, and none is installed. "
+            f"PDF export needs {engine!r} as well as pandoc, and it is not installed. "
             "Install a TeX distribution, or export the preview as HTML instead."
         )
 
@@ -225,7 +261,7 @@ def markdown_to_pdf(draft_id: str, filename: str) -> bytes:
                 f"./{source.name}",
                 "-o",
                 f"./{output.name}",
-                f"--pdf-engine={cfg.latex_engine.replace('latexmk', 'xelatex')}",
+                f"--pdf-engine={export_engine(cfg)}",
                 # pandoc's default page geometry leaves about an inch and a
                 # half on every side, which wastes most of the page.
                 "-V", f"geometry:margin={cfg.pdf_margin}",

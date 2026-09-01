@@ -24,10 +24,12 @@ password on it.
 from .render import (
     RenderError,
     compile_latex,
+    export_engine,
     latex_available,
     markdown_to_html,
     markdown_to_pdf,
     pandoc_available,
+    pdf_export_available,
 )
 from .workspace import (
     DraftError,
@@ -51,10 +53,12 @@ __all__ = [
     "DraftError",
     "RenderError",
     "compile_latex",
+    "export_engine",
     "latex_available",
     "markdown_to_html",
     "markdown_to_pdf",
     "pandoc_available",
+    "pdf_export_available",
     "add_draft_file",
     "apply_hunks",
     "create_draft",

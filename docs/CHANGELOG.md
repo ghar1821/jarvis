@@ -76,6 +76,34 @@ Found by running the thing against a real, genuinely broken store.
   (`_live_config`), falling back to the startup config if the file is
   malformed so a typo empties nothing rather than the picker.
 
+### Fixed
+
+- **PDF export was gated on a binary it does not run.** `latex_available()`
+  probes `[drafts] latex_engine` (default `latexmk`), but Markdown export
+  invokes **xelatex** — latexmk is a build wrapper, not an engine pandoc can
+  drive. A machine with latexmk and no xelatex showed an export button that
+  could only fail. The engine choice now lives in one function
+  (`export_engine`), and the button is gated on `pdf_export_available()`, which
+  checks pandoc *and* the engine that actually runs.
+
+- **Markdown export timed out on a new machine while `.tex` compiled fine.**
+  Not a coincidence, and the asymmetry is the diagnosis: pandoc's xelatex
+  template loads `unicode-math` → `fontspec`, which enumerates system fonts and
+  builds a cache on first run — minutes on a fresh install. A `.tex` compiles
+  through `latexmk`, which defaults to pdflatex and touches none of that.
+
+  pdflatex is not the fix: measured against the same document it is five times
+  faster and **fails outright on Greek characters**, where xelatex renders the
+  file. So the engine stays, and the timeout message now explains the first-run
+  cost, says why `.tex` is unaffected, and gives a warm-up command that
+  actually loads fontspec — an earlier draft suggested a plain `article`, which
+  compiles without ever touching the font cache and would have warmed nothing.
+
+- **`[drafts] pdf_engine`** replaces deriving the export engine by string
+  substitution on `latex_engine`. They are different jobs — latexmk is a build
+  wrapper, pandoc needs a real engine — and conflating them is what produced
+  the gating bug above.
+
 ### Documentation
 
 - **`docs/` audited against the code, mechanically rather than by reading.**
