@@ -24,6 +24,32 @@ uv run pytest tests/test_store.py::test_add_paper_is_idempotent
 
 ---
 
+## Continuous integration
+
+[`.github/workflows/tests.yml`](../.github/workflows/tests.yml) runs the unit
+suite on GitHub Actions — `uv run pytest -m "not integration"` on
+`ubuntu-latest` with Python 3.12, exactly the command you'd run locally.
+
+It fires on pushes to `main` and on pull requests targeting `main`, and nothing
+else. Feature branches stay unwatched until they open a PR at `main`, which
+matches the git workflow here: work happens on a local branch, and `main` is
+the thing worth guarding.
+
+Two caches keep a run to a couple of minutes:
+
+- **uv's dependency cache**, keyed off `uv.lock`, so the torch download that
+  comes with `sentence-transformers` happens once per lockfile change.
+- **`~/.cache/huggingface`**, holding the embedding model and the reranker
+  (~220 MB together). The cache key names both models, so swapping either one
+  in the config means changing the key to match, otherwise CI keeps restoring
+  the old pair and re-downloading the new one every run.
+
+Integration tests never run in CI — they need an Anthropic API key and a live
+Ollama server, and `-m "not integration"` deselects them. Nothing in the unit
+suite reaches the network or needs a secret, so the workflow declares none.
+
+---
+
 ## Test infrastructure
 
 ### Dedicated ChromaDB store

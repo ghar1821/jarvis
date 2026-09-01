@@ -1,5 +1,7 @@
 # jarvis
 
+[![Tests](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml)
+
 A personal research knowledge base for a computational biologist who monitors AI/ML literature. Jarvis combines automated arXiv paper discovery with a persistent, locally-run vector database and a conversational agent — so you can query your reading history, add papers on demand, and manage your Obsidian notes, all through natural language.
 
 Named after Iron Man's J.A.R.V.I.S. — Just A Rather Very Intelligent System.
