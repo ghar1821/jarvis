@@ -138,7 +138,68 @@ header {
   color: var(--text-dim);
   flex-shrink: 0;
 }
-#header-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The status line was one dim 0.82rem string of everything joined by dots,
+   which made the model — the part that changes per turn under a router — as
+   hard to pick out as the vault path that never changes. It is now three
+   pieces with a deliberate hierarchy, and only the vault path is allowed to
+   truncate. */
+#header-text {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The model, at full contrast — the thing you actually look up here. */
+#header-model {
+  flex: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+/* What a router picked for the last turn, rendered as an arrow off the model
+   so it reads as "asked for X, got Y" rather than a second model. */
+#header-served {
+  flex: none;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+#header-served::before {
+  content: '→ ';
+  color: var(--text-dim);
+}
+#header-served.hidden { display: none; }
+
+/* Spend, as a chip — present only once it is non-zero, so an Ollama session
+   shows nothing rather than a fabricated $0.0000. */
+#header-cost {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: default;
+}
+#header-cost.hidden { display: none; }
+
+/* The vault path is context, not status: dimmest, and the only piece that
+   gives up space when the header is tight. */
+#header-vault {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
 
 /* ── Header ⋮ menu ── */
 /* The model picker button sits beside it and shares its styling. */

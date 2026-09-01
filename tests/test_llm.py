@@ -365,10 +365,15 @@ def _openai_tool_call(call_id: str, name: str, arguments: str):
     )
 
 
-def _openai_response(content=None, tool_calls=None, cost=None):
+def _openai_response(content=None, tool_calls=None, cost=None, model=None):
+    """`model` is what OpenRouter says answered — the interesting half of a
+    router response, where it is not the model that was asked for."""
     message = SimpleNamespace(content=content, tool_calls=tool_calls)
     usage = SimpleNamespace(cost=cost) if cost is not None else None
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+    if model is not None:
+        response.model = model
+    return response
 
 
 class _FakeOpenAIClient:
@@ -512,3 +517,37 @@ def test_local_and_anthropic_providers_report_no_cost():
     """
     assert OllamaProvider(model="m").pop_usage() is None
     assert AnthropicProvider(model="m").pop_usage() is None
+
+
+def test_openrouter_reports_which_model_actually_answered():
+    """
+    `openrouter/auto` is a router: the request names it, the response names
+    the model that really ran. Without carrying that back, a session on auto
+    can only ever report "openrouter/auto" and the spend piles up under a
+    name that never served a token.
+    """
+    provider = OpenRouterProvider(model="openrouter/auto")
+    provider._client = _FakeOpenAIClient([
+        _openai_response(content="hi", cost=0.002, model="anthropic/claude-sonnet-4.6"),
+    ])
+
+    provider.agentic_turn([user_message("go")], TOOLS, lambda n, a: "result")
+
+    usage = provider.pop_usage()
+    assert usage["model"] == "openrouter:anthropic/claude-sonnet-4.6"
+    assert usage["usd"] == 0.002
+    # The request still asked for the router — only the reporting resolves.
+    assert provider._client.calls[0]["model"] == "openrouter/auto"
+
+
+def test_openrouter_usage_names_no_model_when_the_response_does_not():
+    """
+    A response with no model field must not invent one; the caller then keys
+    the spend by whatever was requested, exactly as before.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([_openai_response(content="hi", cost=0.001)])
+
+    provider.agentic_turn([user_message("go")], TOOLS, lambda n, a: "result")
+
+    assert "model" not in provider.pop_usage()

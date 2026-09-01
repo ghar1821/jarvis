@@ -30,7 +30,16 @@
   </aside>
   <main id="main">
     <header id="header">
-      <span id="header-text">Jarvis</span>
+      <!-- Status, in descending order of how often you need it: which model
+           is answering, what the session has cost, and where the vault is.
+           The model is the prominent one — with a router it changes per turn,
+           so it is the thing worth being able to read at a glance. -->
+      <span id="header-text">
+        <span id="header-model">Jarvis</span>
+        <span id="header-served" class="hidden"></span>
+        <span id="header-cost" class="hidden"></span>
+        <span id="header-vault"></span>
+      </span>
       <button id="view-btn" title="Show or hide the editor panel">Editor</button>
       <button id="menu-btn" title="Menu" aria-label="Menu">⋮</button>
       <div id="header-menu" class="hidden">

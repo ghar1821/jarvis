@@ -8,6 +8,39 @@ Prototype stage — no deployments. Changes documented for development reference
 
 Found by running the thing against a real, genuinely broken store.
 
+### Added
+
+- **A router's actual model is now visible.** `openrouter/auto` picks a model
+  per request and names it in the response, but jarvis threw that away — the
+  header reported "openrouter/auto" forever and the spend piled up under a
+  name that never served a token. `OpenRouterProvider` now reads
+  `response.model`, `pop_usage()` carries it back as
+  `openrouter:<served>`, and `record_usage` keys the session's cost by the
+  model that **answered** rather than the one that was asked for. The header
+  shows both halves (`openrouter/auto → claude-sonnet-4.6`) and hovering the
+  cost gives the per-model breakdown, which is the only thing that answers
+  "what did auto actually use, and what did each one cost".
+
+  `served_model` is stored on the session, so it is still right after a page
+  refresh or a resume, and stays empty for an ordinary model where it would
+  only repeat the name already on screen.
+
+### Fixed
+
+- **The status bar was hard to read, and could be wrong.** It was one dim
+  0.82rem string with everything joined by dots, which made the model — the
+  part that changes per turn under a router — exactly as hard to pick out as
+  the vault path that never changes. It is now three pieces with a deliberate
+  hierarchy: the model at full contrast, spend as a chip that appears only
+  once it is non-zero, and the vault path dimmest and the only piece allowed
+  to truncate.
+
+  It could also be stale. `/info` reports the *active session's* model and
+  spend, but the frontend only ever fetched it at page load, so resuming a
+  session left the previous session's model and cost on screen. Now
+  `refreshHeader()` re-reads it on every session switch — a more prominent
+  header showing the wrong model would have been worse than a dim one.
+
 ### Fixed
 
 - **`kb reindex` could not run when it was most needed.** It reads chunks via

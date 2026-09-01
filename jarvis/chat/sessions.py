@@ -60,6 +60,15 @@ class Session:
     # Real spend per "provider:model", for the providers that report it.
     # {"openrouter:openai/gpt-5": {"usd": 0.0123, "requests": 4}}
     cost: dict = field(default_factory=dict)
+    # The model that actually answered most recently, when it isn't the one
+    # named in model_spec. Only a router (`openrouter/auto`) makes those
+    # differ, and without this the UI can only report what was requested.
+    served_model: str = ""
+
+    @property
+    def served_spec(self) -> str:
+        """What actually ran: the router's pick if there was one, else the request."""
+        return self.served_model or self.model_spec
 
     @property
     def model_spec(self) -> str:
@@ -97,7 +106,8 @@ def new_session(provider: str, kb_only: bool = True) -> Session:
 
 def record_usage(session: Session, spec: str, usage: "dict | None") -> None:
     """
-    Add one turn's reported spend to the session total, keyed by model.
+    Add one turn's reported spend to the session total, keyed by the model
+    that actually served it.
 
     Providers that report no cost (a local model, or one whose price jarvis
     would have to guess) pass None and nothing is recorded — a session with no
@@ -105,7 +115,12 @@ def record_usage(session: Session, spec: str, usage: "dict | None") -> None:
     """
     if not usage:
         return
-    entry = session.cost.setdefault(spec, {"usd": 0.0, "requests": 0})
+    # Key on what actually ran, so a router's spend breaks down by the models
+    # it picked rather than piling up under the router's own name.
+    served = str(usage.get("model") or "")
+    if served and served != spec:
+        session.served_model = served
+    entry = session.cost.setdefault(served or spec, {"usd": 0.0, "requests": 0})
     entry["usd"] = round(entry["usd"] + float(usage.get("usd", 0.0)), 6)
     entry["requests"] += int(usage.get("requests", 0))
 

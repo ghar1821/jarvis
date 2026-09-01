@@ -391,13 +391,17 @@ conversation without touching your config at all.
 
 OpenRouter's auto router is just a model id, so automatic routing needs
 nothing built for it: set `openrouter_model = "openrouter/auto"` (or add it
-to `[models]`) and it picks a model per request. Jarvis sends
-`allow_fallbacks = false` by default, which hasn't been tested against the
-auto router — loosen it under `[openrouter]` if requests start failing.
+to `[models]`) and it picks a model per request. The header then shows both
+halves — `openrouter/auto → claude-sonnet-4.6` — so you can see what actually
+answered, and hovering the cost shows what each model it picked has cost you.
+Jarvis sends `allow_fallbacks = false` by default, which hasn't been tested
+against the auto router — loosen it under `[openrouter]` if requests start
+failing.
 
 Cost is shown only for OpenRouter, which reports what each request actually
-cost — you'll see it in the header. A local model costs nothing, and jarvis
-won't invent a figure for anything else.
+cost — you'll see it in the header, and hovering it breaks the total down by
+model. A local model costs nothing, and jarvis won't invent a figure for
+anything else.
 
 If you use OpenRouter, know that it's a broker: your request routes to
 somebody else's hardware. Jarvis sends strict settings by default

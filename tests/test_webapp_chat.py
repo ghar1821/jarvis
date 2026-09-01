@@ -654,3 +654,32 @@ def test_the_picker_reflects_a_config_edit_without_a_restart(wired_session, monk
 
     after = {entry["spec"] for entry in client.get("/models").json()["models"]}
     assert "ollama:added-later" in after
+
+
+def test_info_reports_the_routed_model_and_the_per_model_breakdown(wired_session):
+    """
+    The header reads /info on load and after every session switch, so the
+    routed pick and the spend breakdown have to be there — not only on the
+    reply event, which a page refresh never sees.
+    """
+    from jarvis.chat.sessions import record_usage
+
+    record_usage(wired_session, wired_session.model_spec, {
+        "usd": 0.004, "requests": 2, "model": "openrouter:anthropic/claude-sonnet-4.6",
+    })
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    info = client.get("/info").json()
+
+    assert info["served"] == "openrouter:anthropic/claude-sonnet-4.6"
+    assert info["cost_usd"] == 0.004
+    assert info["cost_by_model"]["openrouter:anthropic/claude-sonnet-4.6"]["requests"] == 2
+    # The requested spec is still reported separately — the header shows both.
+    assert info["provider"] == wired_session.model_spec
+
+
+def test_info_leaves_served_empty_for_an_ordinary_model(wired_session):
+    """Nothing to disambiguate means nothing shown, not a repeated name."""
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    assert client.get("/info").json()["served"] == ""

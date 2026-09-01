@@ -312,7 +312,12 @@ async def info() -> dict:
     return {
         "provider": session.model_spec if session else cfg.provider,
         "provider_kind": session.provider if session else cfg.provider,
+        # What actually answered, when a router picked something else. Empty
+        # for an ordinary model, where it would only repeat `provider`.
+        "served": session.served_model if session else "",
         "cost_usd": session_cost_usd(session) if session else 0.0,
+        # Per-model spend, so a router session can show which models it used.
+        "cost_by_model": dict(session.cost) if session else {},
         "vault": str(_vault),
     }
 
@@ -1139,7 +1144,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                 "tool_calls": tool_calls_log,
                 "private": session.private,
                 "model": session.model_spec,
+                "served": session.served_model,
                 "cost_usd": session_cost_usd(session),
+                "cost_by_model": dict(session.cost),
             })
             event_queue.put(None)  # sentinel — tells the stream generator to stop
             _session["running"].pop(session.id, None)

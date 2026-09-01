@@ -1162,8 +1162,9 @@ One JSON file per session in `~/.jarvis/sessions/<id>.json` (dir 0700, files
 `display` list (what the human sees). The two can't be rebuilt from each
 other, and compaction deliberately shrinks only `messages`. Also stored:
 `pinned`, `private`, `provider`, `model`, `kb_only`, `format_version`,
-`cost`, `turn_starts` (the `messages` index where each user turn began), and
-`indexed_exchanges` (how many exchange pairs are already in Chroma).
+`cost`, `served_model`, `turn_starts` (the `messages` index where each user
+turn began), and `indexed_exchanges` (how many exchange pairs are already in
+Chroma).
 
 `provider` and `model` are stored separately, recombined by the `model_spec`
 property, because the privacy rules key on the provider alone while
@@ -1184,7 +1185,15 @@ costing only the next compaction's cut precision.
 `cost` maps `"provider:model"` → `{"usd", "requests"}`, accumulated by
 `record_usage()` from each turn's `provider.pop_usage()`. Only OpenRouter
 reports a figure, so a session that never used it holds an empty dict and
-the UI shows no cost rather than a fabricated zero. Recorded in a `finally`
+the UI shows no cost rather than a fabricated zero.
+
+The key is the model that **actually answered**, not the one that was asked
+for. Those are the same thing until you use a router: `openrouter/auto` names
+a router in the request and the model that ran in the response, so keying by
+the request would pile a whole session's spend under a name that never served
+a token. `record_usage` also records that model as `served_model` when it
+differs from `model_spec`, which is what lets the header say *what* auto
+picked instead of only reporting "auto". Recorded in a `finally`
 block, so a turn that failed part-way still counts the requests it made.
 Sessions are saved after every completed turn — crash-safe — and empty
 sessions are never written.
@@ -1302,7 +1311,7 @@ never interrupts a turn running against another.
 | Route | Purpose |
 |---|---|
 | `GET /` | Serves `index.html` |
-| `GET /info` | `{provider, provider_kind, cost_usd, vault}` for the header — the **active session's** model and spend, not a process-wide one |
+| `GET /info` | `{provider, provider_kind, served, cost_usd, cost_by_model, vault}` for the header — the **active session's** model and spend, not a process-wide one. `served` is the model that actually answered when a router picked something other than what was requested, and is empty otherwise; `cost_by_model` is the per-model breakdown behind `cost_usd`. Re-read by the frontend on every session switch, since all of it is per-session |
 | `GET /models` | The switchable catalogue for the picker, `{current, private, models}`. Reads config only; opening the UI makes no outbound request |
 | `POST /model` | `{session_id, spec}` — switch one session's model from the next turn. The spec need not be in the catalogue (the picker has a text box for exactly this); config is re-read per call so a `kb models --refresh` needs no restart. 409 while that session has a turn in flight, 409 for a private session moving to a cloud model, 400 for an unknown provider or missing credentials |
 | `GET /history` | The active session's display list for page-refresh restore |
@@ -1413,7 +1422,8 @@ a `.busy` class — a pulsing dot.
 description + token), `edit_proposal` (draft id, file, rationale, and the
 hunks to review — pushed by `request_edit_review`, which then returns None
 so the tool defers to the human exactly as deletions do), `reply` (final
-text, tool-call log, session `private` flag, model, and spend). The
+text, tool-call log, session `private` flag, the requested model, the model
+that actually served the turn, and spend with its per-model breakdown). The
 tool-call arg summary elides overly long values with a shared
 middle-ellipsis helper (`truncate_middle` in `chat.py`) so a `file:///`
 URI's filename stays visible.

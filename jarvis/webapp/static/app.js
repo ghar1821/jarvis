@@ -67,24 +67,65 @@ function switchDraft(newId) {
 
 // ── Startup ──────────────────────────────────────────────────────────────
 
-// Show the active session's model, spend, and the vault path in the header
+// The active session's model, spend, and vault path.
 let vaultPath = '';
+let servedModel = '';      // what a router actually picked, when it differs
+let costByModel = {};      // per-model spend, shown as the cost tooltip
 
-function renderHeader() {
-  const cost = currentCost > 0 ? `  ·  $${currentCost.toFixed(4)}` : '';
-  document.getElementById('header-text').textContent =
-    `Jarvis  ·  ${currentModel}${cost}  ·  ${vaultPath}`;
+// A spec is "provider:model"; the provider half is noise once you are looking
+// at a session that is already on it.
+function shortModel(spec) {
+  return String(spec || '').replace(/^[a-z]+:/, '');
 }
 
-fetch('/info')
-  .then(r => r.json())
-  .then(({ provider, cost_usd, vault }) => {
-    currentModel = provider;
-    currentCost = cost_usd || 0;
-    vaultPath = vault;
-    renderHeader();
-    loadSessions();
-  });
+function renderHeader() {
+  const model = document.getElementById('header-model');
+  model.textContent = shortModel(currentModel) || 'Jarvis';
+  model.title = currentModel || '';
+
+  // With openrouter/auto the configured name is a request, not an answer —
+  // show which model actually replied, or the header names a router forever.
+  const served = document.getElementById('header-served');
+  const isRouted = servedModel && servedModel !== currentModel;
+  served.classList.toggle('hidden', !isRouted);
+  if (isRouted) {
+    served.textContent = shortModel(servedModel);
+    served.title = `${currentModel} routed this turn to ${servedModel}`;
+  }
+
+  const cost = document.getElementById('header-cost');
+  cost.classList.toggle('hidden', !(currentCost > 0));
+  if (currentCost > 0) {
+    cost.textContent = `$${currentCost.toFixed(4)}`;
+    // Which models the money actually went to — the useful breakdown when a
+    // router has been picking a different one each turn.
+    const lines = Object.entries(costByModel)
+      .sort((a, b) => (b[1].usd || 0) - (a[1].usd || 0))
+      .map(([spec, e]) => `${shortModel(spec)}  $${(e.usd || 0).toFixed(4)}  (${e.requests || 0} req)`);
+    cost.title = lines.length ? `Spend this session\n\n${lines.join('\n')}` : '';
+  }
+
+  const vault = document.getElementById('header-vault');
+  vault.textContent = vaultPath;
+  vault.title = vaultPath;
+}
+
+// /info reports the ACTIVE session's model and spend, so this has to run
+// again whenever which session is active changes — otherwise the header keeps
+// describing the session you just navigated away from.
+async function refreshHeader() {
+  const response = await fetch('/info');
+  if (!response.ok) return;
+  const { provider, served, cost_usd, cost_by_model, vault } = await response.json();
+  currentModel = provider;
+  servedModel = served || '';
+  currentCost = cost_usd || 0;
+  costByModel = cost_by_model || {};
+  vaultPath = vault;
+  renderHeader();
+}
+
+refreshHeader().then(loadSessions);
 
 // Restore conversation history so a page refresh doesn't lose context
 fetch('/history')
@@ -530,6 +571,7 @@ async function resumeSession(id) {
   }
 
   scrollToBottom();
+  refreshHeader();   // this session may be on a different model, with its own spend
   loadSessions();
 }
 
@@ -570,6 +612,7 @@ document.getElementById('new-chat-btn').addEventListener('click', async () => {
   const { id } = await (await fetch('/sessions/new', { method: 'POST' })).json();
   switchDraft(id);
   msgContainer.replaceChildren();
+  refreshHeader();   // a fresh session starts on the default model, at zero spend
   loadSessions();
   inputEl.focus();
 });
@@ -703,6 +746,7 @@ async function switchModel(spec) {
   }
   const { spec: applied } = await response.json();
   currentModel = applied;
+  servedModel = '';   // whatever a router last picked was for the old model
   renderHeader();
   closeModelModal();
   loadSessions();  // resumability depends on the model, so redraw the sidebar
@@ -1134,7 +1178,9 @@ async function sendMessage() {
           // background turn in another session must not relabel this one.
           if (stillViewing() && event.model) {
             currentModel = event.model;
+            servedModel = event.served || '';
             currentCost = event.cost_usd || 0;
+            costByModel = event.cost_by_model || {};
             renderHeader();
           }
           loadSessions(); // title/privacy badge may have just changed

@@ -492,3 +492,65 @@ def test_cost_survives_a_save_load_roundtrip(tmp_path):
 
     reloaded = load_session(session.id, sessions_dir=tmp_path)
     assert reloaded.cost == {"openrouter:openai/gpt-5": {"usd": 0.01, "requests": 1}}
+
+
+def test_a_router_attributes_spend_to_the_model_that_answered():
+    """
+    On `openrouter/auto` every turn can land on a different model. Keying the
+    cost by the request would pile the whole session under "auto" and lose the
+    only breakdown that answers "what did it actually use, and what did each
+    cost".
+    """
+    session = new_session("openrouter:openrouter/auto")
+
+    record_usage(session, session.model_spec, {
+        "usd": 0.002, "requests": 1, "model": "openrouter:anthropic/claude-sonnet-4.6",
+    })
+    record_usage(session, session.model_spec, {
+        "usd": 0.001, "requests": 1, "model": "openrouter:openai/gpt-5",
+    })
+    record_usage(session, session.model_spec, {
+        "usd": 0.003, "requests": 2, "model": "openrouter:anthropic/claude-sonnet-4.6",
+    })
+
+    assert session.cost == {
+        "openrouter:anthropic/claude-sonnet-4.6": {"usd": 0.005, "requests": 3},
+        "openrouter:openai/gpt-5": {"usd": 0.001, "requests": 1},
+    }
+    assert "openrouter:openrouter/auto" not in session.cost
+    assert session_cost_usd(session) == 0.006
+    # The most recent pick is what the header reports.
+    assert session.served_model == "openrouter:anthropic/claude-sonnet-4.6"
+    assert session.served_spec == "openrouter:anthropic/claude-sonnet-4.6"
+
+
+def test_an_ordinary_model_records_no_routing_detour():
+    """
+    When the model that answered is the one that was asked for, there is
+    nothing to report — `served_model` stays empty so the UI shows one name
+    rather than the same name twice with an arrow between them.
+    """
+    session = new_session("openrouter:openai/gpt-5")
+
+    record_usage(session, session.model_spec, {
+        "usd": 0.001, "requests": 1, "model": "openrouter:openai/gpt-5",
+    })
+
+    assert session.served_model == ""
+    assert session.served_spec == "openrouter:openai/gpt-5"
+    assert session.cost == {"openrouter:openai/gpt-5": {"usd": 0.001, "requests": 1}}
+
+
+def test_the_routed_model_survives_a_save_and_load(tmp_path):
+    """The header has to still be right after a page refresh or a resume."""
+    session = new_session("openrouter:openrouter/auto")
+    session.display = [{"role": "user", "content": "hi"}]
+    record_usage(session, session.model_spec, {
+        "usd": 0.002, "requests": 1, "model": "openrouter:anthropic/claude-sonnet-4.6",
+    })
+
+    save_session(session, sessions_dir=tmp_path)
+    reloaded = load_session(session.id, sessions_dir=tmp_path)
+
+    assert reloaded.served_model == "openrouter:anthropic/claude-sonnet-4.6"
+    assert reloaded.model_spec == "openrouter:openrouter/auto"

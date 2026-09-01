@@ -501,6 +501,10 @@ class OpenRouterProvider:
         self._client = None
         self._usd = 0.0
         self._requests = 0
+        # What OpenRouter actually served. Only interesting for a router model
+        # like `openrouter/auto`, where the configured name is a request and
+        # the response names the model that answered it.
+        self._served = ""
 
     def _get_client(self):
         if self._client is not None:
@@ -536,18 +540,31 @@ class OpenRouterProvider:
         return response
 
     def _record_usage(self, response) -> None:
-        """Accumulate the credits OpenRouter reports for this request."""
+        """Accumulate the credits OpenRouter reports, and note who answered."""
         self._requests += 1
         usage = getattr(response, "usage", None)
         cost = getattr(usage, "cost", None) if usage is not None else None
         if cost is not None:
             self._usd += float(cost)
+        served = getattr(response, "model", "") or ""
+        if served:
+            self._served = served
 
     def pop_usage(self) -> "dict | None":
-        """Spend since the last call, then reset."""
+        """
+        Spend since the last call, then reset.
+
+        `model` is the spec that actually ran, which is the same thing you
+        asked for unless you asked for a router. With `openrouter/auto` the
+        request names the router and the response names the model, so keying
+        cost by this is what makes a session's spend break down by the models
+        that really answered.
+        """
         if not self._requests:
             return None
         usage = {"usd": round(self._usd, 6), "requests": self._requests}
+        if self._served:
+            usage["model"] = f"openrouter:{self._served}"
         self._usd = 0.0
         self._requests = 0
         return usage
