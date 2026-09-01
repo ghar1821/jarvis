@@ -31,11 +31,11 @@ Named after Iron Man's J.A.R.V.I.S. — Just A Rather Very Intelligent System.
 ### 1. Install
 
 ```bash
-git clone <your-repo-url> jarvis && cd jarvis
+git clone <repo-url> jarvis && cd jarvis
 uv sync
 ```
 
-### 2. Write the config
+### 2. Setup the config
 
 Jarvis won't create this file for you. Skip it and you get the defaults —
 local Ollama, and a vault at `~/vault` that probably doesn't exist.
@@ -45,7 +45,7 @@ mkdir -p ~/.jarvis
 $EDITOR ~/.jarvis/config.toml
 ```
 
-A complete working OpenRouter config, copy-pasteable:
+An example of working OpenRouter config:
 
 ```toml
 [chat]
@@ -62,34 +62,36 @@ openrouter_api_key = "sk-or-..."             # or the OPENROUTER_API_KEY env var
 openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
 ```
 
+After writing the config file, remember to update its permission so it is only readable by you the user.
+Why? It may hold an API key if it is specified there instead of your env var. 
+
 ```bash
 chmod 600 ~/.jarvis/config.toml    # it holds an API key; jarvis warns if it's readable
 ```
 
-You need both `provider` and `openrouter_model`. Set `provider` alone and it
-fails with *"No model configured for provider 'openrouter'"*. Leave the key
-out and nothing complains until your first message, when it fails with *"No
-OpenRouter credentials found"* — the client is built lazily, so there's
-nothing to check at startup.
+You need both `provider` and `openrouter_model`. 
+If you set `provider` only, Jarvis will complain with *"No model configured for provider 'openrouter'"*.
+If you leave out the API key, it won't complain until you send the first message.
+Then it will say *"No OpenRouter credentials found"*.
 
-OpenRouter is a broker: it routes your request to somebody else's hardware.
+OpenRouter is a broker: it routes your request to a server somewhere in the world hosting the LLM.
 Jarvis sends strict settings by default (`data_collection = "deny"`, no
-silent fallbacks) — see [Choose a model](#choose-a-model) if you want to
-loosen them.
+silent fallbacks) — see [Choose a model](#choose-a-model) if you want to change them.
 
 ### 3. Index your notes
+
+Jarvis need to setup the RAG database.
 
 ```bash
 uv run kb index-vault
 ```
 
-The first run downloads the embedding model (`BAAI/bge-small-en-v1.5`, about
-130 MB from HuggingFace) and caches it. That's the only model jarvis ever
-downloads, it runs locally, and it's why indexing needs no API calls. Get the
-vault path wrong and you'll know immediately — `Error: vault path does not
-exist: ...` — before anything downloads at all.
+It will first download `BAAI/bge-small-en-v1.5` embedding model and cache it. 
+Make sure the vault path you specified in the config exists or else you will get `Error: vault path does not
+exist: ...` error before anything downloads at all.
 
-No notes yet? Skip this step. Chat and the editor both work without a vault.
+If you don't have any notes in the vault yet, you don't need to run the indexing.
+Feel free to skip it for now and move on to step 4.
 
 ### 4. Check it worked
 
@@ -111,30 +113,16 @@ openrouter:anthropic/claude-sonnet-4.6  [cloud]
 `(no API key)` means configured but unusable. No `openrouter:` line at all
 means `openrouter_model` was never set.
 
+The last two commands check whether your notes have been indexed.
+If you did not run step 3, then don't bother running them.
+
 ### 5. Run it
+
+Run the webapp interface and start chatting.
 
 ```bash
 uv run webapp        # browser at http://127.0.0.1:8080 (localhost only)
 ```
-
-`webapp --reload` restarts the server on a Python edit. `static/app.js` and
-`index.html` are different: those need a **browser** hard-reload (⇧⌘R), not a
-server restart. Each half of the app needs the opposite kind of refresh.
-
-### Working on jarvis
-
-```bash
-uv sync --group dev                  # once, to get pytest
-uv run pytest -m "not integration"   # the suite that must pass before any change
-uv run pytest -m integration         # needs live services (API key, running Ollama)
-uv run pytest tests/test_drafts.py   # one file
-```
-
-Everything jarvis owns lives under `~/.jarvis/`: `config.toml`, the index
-(`rag/`), sessions, drafts, logs. Delete that directory and you're back to a
-fresh install — your vault is untouched. Architecture, data flows and the
-privacy guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what the tests
-cover and why is in [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
@@ -553,6 +541,23 @@ config still has `provider = "llamacpp"`, switch it to `"ollama"`; if it has
 `rag_dir = "~/.seshat/rag"`, change it to `~/.jarvis/rag`; and move
 `anthropic_model` from `[digest]` to `[chat]`. Jarvis warns about these
 instead of rewriting your file for you.
+
+---
+
+### Working on jarvis
+
+```bash
+uv sync --group dev                  # once, to get pytest
+uv run pytest -m "not integration"   # the suite that must pass before any change
+uv run pytest -m integration         # needs live services (API key, running Ollama)
+uv run pytest tests/test_drafts.py   # one file
+```
+
+Everything jarvis owns lives under `~/.jarvis/`: `config.toml`, the index
+(`rag/`), sessions, drafts, logs. Delete that directory and you're back to a
+fresh install — your vault is untouched. Architecture, data flows and the
+privacy guarantees are in [`docs/DESIGN.md`](docs/DESIGN.md); what the tests
+cover and why is in [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
