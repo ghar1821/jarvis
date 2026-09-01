@@ -312,7 +312,7 @@ uv run kb index-vault --vault-path ~/path/to/vault --force
 uv run kb reindex
 
 # Diagnose knowledge base health (embed model mismatch, index corruption);
-# also finds and offers to migrate any legacy PDF notes to papers (see CHANGELOG)
+# also finds and offers to migrate any legacy PDF notes to public papers
 uv run kb doctor
 
 # Add a paper by arXiv URL
