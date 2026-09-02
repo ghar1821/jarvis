@@ -47,8 +47,6 @@ Example ~/.jarvis/config.toml:
     # Ollama model tag (must support tool calling; vision for figure captioning)
     ollama_model = "qwen3-vl:30b"
     vault_path = "~/vault"
-    # Folder of user-written skill files (*.md); missing folder = feature off
-    skills_dir = "~/.jarvis/skills"
     # Natural-language instruction for how the assistant should write replies
     response_style = ""
     # Long sessions get their LLM context compacted (old exchanges summarised)
@@ -88,7 +86,6 @@ Example ~/.jarvis/config.toml:
     [models]
     # The switchable catalogue shown by /model and the webapp picker. Entirely
     # user-maintained — jarvis ships no vendor model list. Populate the
-    # OpenRouter entry automatically with: uv run kb models --refresh
     openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
     ollama = ["qwen3-vl:30b"]
 
@@ -176,8 +173,6 @@ class Config:
     vault_path: Path = field(default_factory=lambda: Path("~/vault").expanduser())
     # Vault folders whose contents are treated as private (local model only)
     private_vault_dirs: list[str] = field(default_factory=lambda: ["private"])
-    # User-written skill files the agent can load on demand
-    skills_dir: Path = field(default_factory=lambda: Path("~/.jarvis/skills").expanduser())
     # Free-text style instruction appended to the system prompt ("" = none)
     response_style: str = ""
     # Session compaction: summarise old exchanges once the estimated context
@@ -307,8 +302,6 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             cfg.vault_path = Path(str(c["vault_path"])).expanduser()
         if "private_vault_dirs" in c:
             cfg.private_vault_dirs = [str(d) for d in c["private_vault_dirs"]]
-        if "skills_dir" in c:
-            cfg.skills_dir = Path(str(c["skills_dir"])).expanduser()
         if "response_style" in c:
             cfg.response_style = str(c["response_style"])
         if "compact_after_tokens" in c:
@@ -451,3 +444,149 @@ def set_config_value(section: str, key: str, value, config_file: Path = CONFIG_F
     tmp_file.write_text(tomlkit.dumps(document), encoding="utf-8")
     os.chmod(tmp_file, 0o600)
     os.replace(tmp_file, config_file)
+
+
+# ── Describing the loaded config ──────────────────────────────────────────────
+#
+# One description, rendered two ways: printed when the webapp starts, and shown
+# in the UI. Sharing it means the terminal and the browser can never disagree
+# about what jarvis actually loaded, which is the whole point of showing it.
+
+def _secret_values(cfg) -> list[str]:
+    """The actual secrets, so nothing can render one by accident."""
+    import os
+
+    values = [cfg.anthropic_api_key, cfg.openrouter_api_key]
+    # Env vars too: a key supplied that way never reaches Config, but it is
+    # just as capable of turning up in an SDK error message.
+    values += [os.environ.get("ANTHROPIC_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", "")]
+    # A short value would match far too much text to blank out safely.
+    return [v for v in values if v and len(v) >= 12]
+
+
+def redact_secrets(text: str, cfg: "Config | None" = None) -> str:
+    """
+    Blank any configured API key out of arbitrary text.
+
+    Error messages are the leak that matters. An SDK exception can quote the
+    credential it just failed with, and jarvis puts that text in three durable
+    places at once: the reply shown to the user, ~/.jarvis/logs/chat.log, and
+    the saved session — which is then indexed into the vector store as a chat
+    chunk. A key reaching any of those outlives the request that produced it.
+    """
+    if not text:
+        return text
+    try:
+        secrets = _secret_values(cfg or get_config())
+    except Exception:
+        return text          # never let redaction itself break error reporting
+    for secret in secrets:
+        text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def _render(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value) if value else "—"
+    if isinstance(value, dict):
+        return ", ".join(f"{k}: {', '.join(v)}" for k, v in value.items()) if value else "—"
+    return str(value)
+
+
+def describe(cfg: "Config | None" = None) -> list[dict]:
+    """
+    The loaded configuration, grouped for display, with secrets redacted.
+
+    Values are the *resolved* ones — after the TOML file and any environment
+    variables have been applied — so this answers "what is jarvis actually
+    using", not "what does my file say". Those differ often enough to be the
+    usual source of confusion.
+    """
+    cfg = cfg or get_config()
+
+    def secret(value) -> str:
+        return "set" if value else "not set"
+
+    groups = [
+        ("Source", [
+            ("config file", str(CONFIG_FILE)),
+            ("exists", CONFIG_FILE.exists()),
+        ]),
+        ("Chat", [
+            ("provider", cfg.provider),
+            ("ollama_model", cfg.ollama_model),
+            ("anthropic_model", cfg.anthropic_model),
+            ("openrouter_model", cfg.openrouter_model),
+            ("response_style", cfg.response_style),
+        ]),
+        ("Models offered in the picker", [
+            (provider, models) for provider, models in (cfg.models or {}).items()
+        ] or [("[models]", "not set — the picker offers each provider's default")]),
+        ("Credentials", [
+            ("anthropic_api_key", secret(cfg.anthropic_api_key)),
+            ("openrouter_api_key", secret(cfg.openrouter_api_key)),
+        ]),
+        ("OpenRouter routing", [
+            ("data_collection", cfg.openrouter_data_collection),
+            ("allow_fallbacks", cfg.openrouter_allow_fallbacks),
+            ("only", cfg.openrouter_only),
+        ]),
+        ("Knowledge base", [
+            ("vault_path", cfg.vault_path),
+            ("private_vault_dirs", cfg.private_vault_dirs),
+            ("rag_dir", cfg.rag_dir),
+            ("embed_model", cfg.embed_model),
+            ("rerank_model", cfg.rerank_model),
+            ("hybrid", cfg.hybrid),
+            ("chunk_size", cfg.chunk_size),
+            ("figure_captions", cfg.figure_captions),
+        ]),
+        ("Drafts", [
+            ("drafts_dir", cfg.drafts_dir),
+            ("retention_days", cfg.drafts_retention_days),
+            ("latex_engine", cfg.latex_engine),
+            ("pdf_engine", cfg.pdf_engine),
+        ]),
+        ("Sync daemon", [
+            ("vault_refresh_minutes", cfg.vault_refresh_minutes),
+            ("pdf_watch_dir", cfg.pdf_watch_dir),
+            ("pdf_watch_minutes", cfg.pdf_watch_minutes),
+        ]),
+        ("Paper digest", [
+            ("enabled", cfg.digest_enabled),
+            ("day / hour", f"{cfg.digest_day} {cfg.digest_hour:02d}:00"),
+            ("output_dir", cfg.output_dir),
+            ("max_results", cfg.max_results),
+        ]),
+    ]
+
+    # Credentials are already reduced to "set"/"not set" above. This is the
+    # backstop: if a field is ever added to a group raw, it still cannot reach
+    # a terminal or a browser tab as its actual value.
+    secrets = _secret_values(cfg)
+
+    def safe(value: str) -> str:
+        return "set" if any(s and s in value for s in secrets) else value
+
+    return [
+        {
+            "section": name,
+            "values": [{"key": key, "value": safe(_render(value))} for key, value in rows],
+        }
+        for name, rows in groups
+    ]
+
+
+def format_describe(cfg: "Config | None" = None) -> str:
+    """The same description as plain text, for printing at startup."""
+    lines = []
+    for group in describe(cfg):
+        lines.append(f"\n  {group['section']}")
+        width = max((len(v["key"]) for v in group["values"]), default=0)
+        for value in group["values"]:
+            lines.append(f"    {value['key']:<{width}}  {value['value']}")
+    return "\n".join(lines)

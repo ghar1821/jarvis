@@ -9,7 +9,7 @@ A personal knowledge base and assistant that:
 1. Optionally fetches papers from arXiv weekly and scores them with an LLM
 2. Writes a tiered Markdown digest (Must-Read / Worth Reading / Skim)
 3. Indexes papers, vault notes, PDF annotations, and past chat exchanges into a local knowledge base
-4. Provides a conversational agent for querying and managing the knowledge base, with persistent sessions and user-defined skills
+4. Provides a conversational agent for querying and managing the knowledge base, with persistent sessions
 5. Runs the recurring work (digest, PDF inbox, vault refresh) in one supervised background daemon (`jarvis-sync`)
 
 ---
@@ -22,6 +22,8 @@ A personal knowledge base and assistant that:
 │   │   ├── config.py                # Central configuration (incl. tomlkit write-back)
 │   │   ├── errors.py                # Domain exceptions + retry decorator
 │   │   ├── llm.py                   # LLM provider abstraction
+│   │   ├── logs.py                  # Shared logger, so no module has to swallow an error
+│   │   ├── prompts.py               # Shipped prompt defaults + the user's editable copies
 │   │   └── transcript.py            # Provider-neutral message format (enables model switching)
 │   │
 │   ├── digest/                      # Automated weekly digest
@@ -33,9 +35,7 @@ A personal knowledge base and assistant that:
 │   │   ├── pipeline/
 │   │   │   ├── run.py               # Entry point: orchestrates full digest run
 │   │   │   ├── score.py             # LLM-based paper scoring
-│   │   │   ├── format.py            # Markdown digest renderer
-│   │   │   └── prompts/
-│   │   │       └── prompt_filter_score.md
+│   │   │   └── format.py            # Markdown digest renderer
 │   │   └── import_digest.py         # `kb add-digest` implementation
 │   │
 │   ├── kb/                          # Knowledge base management
@@ -45,9 +45,7 @@ A personal knowledge base and assistant that:
 │   │   ├── annotations.py           # PDF highlight/typed-note extraction (PyMuPDF)
 │   │   ├── images.py                # PDF figure extraction (PyMuPDF)
 │   │   ├── metadata.py              # Title/authors/DOI inference for local PDFs
-│   │   ├── frontmatter.py           # YAML frontmatter -> flat record metadata
-│   │   └── prompts/
-│   │       └── paper_summary.md
+│   │   └── frontmatter.py           # YAML frontmatter -> flat record metadata
 │   │
 │   ├── sync/                        # Background sync daemon
 │   │   ├── daemon.py                # `jarvis-sync` entry point
@@ -56,8 +54,12 @@ A personal knowledge base and assistant that:
 │   ├── chat/
 │   │   ├── chat.py                  # chat tools + the agentic loop (driven by the webapp)
 │   │   ├── models.py                # Switchable model catalogue + switch validation
-│   │   ├── sessions.py              # Persistent sessions: save/resume/pin/prune/compact
-│   │   └── skills.py                # User-defined skills (list + read)
+│   │   └── sessions.py              # Persistent sessions: save/resume/pin/prune/compact
+│   │
+│   ├── prompts/                     # Shipped defaults, copied into ~/.jarvis on first use
+│   │   ├── system_prompt.md
+│   │   ├── paper_summary.md
+│   │   └── digest_scoring.md
 │   │
 │   ├── drafts/                      # The agent-writable sandbox
 │   │   ├── workspace.py             # Containment policy, drafts, proposals, versions, retention
@@ -69,8 +71,6 @@ A personal knowledge base and assistant that:
 │       ├── run.py                   # `webapp` entry point (uvicorn launcher)
 │       └── static/                  # style.css + app.js (vanilla JS, no build step)
 │           └── vendor/              # Vendored CodeMirror 5 — see static/vendor/VENDOR.md
-│
-├── examples/skills/                 # Copy a folder into ~/.jarvis/skills to try it
 │
 ├── tests/                           # See docs/TESTING.md
 │
@@ -95,14 +95,15 @@ A personal knowledge base and assistant that:
 | `jarvis/chat/chat.py` | The agent's tools and the agentic loop; the model's entire surface |
 | `jarvis/chat/models.py` | Switchable model catalogue and switch validation (incl. the privacy rule) |
 | `jarvis/chat/sessions.py` | Persistent chat sessions: persistence, privacy flag, retention, compaction, rename |
-| `jarvis/chat/skills.py` | User-defined skills: discovery and on-demand loading |
 | `jarvis/drafts/workspace.py` | The sandbox: one containment policy for every read and write, drafts, proposals, `.versions/`, retention |
 | `jarvis/drafts/render.py` | Markdown preview, sandboxed LaTeX compilation, PDF export |
 | `jarvis/webapp/` | The UI: FastAPI routes, SSE stream, session state, editor, frontend |
 | `jarvis/core/llm.py` | Shared: LLM provider abstraction (Ollama, Anthropic, OpenRouter) |
 | `jarvis/core/transcript.py` | Shared: the provider-neutral message format that makes mid-conversation model switching possible |
 | `jarvis/core/config.py` | Shared: central configuration |
+| `jarvis/core/prompts.py` | Shared: the three prompts, their shipped defaults, and the user's editable copies |
 | `jarvis/core/errors.py` | Shared: domain exceptions and retry decorator |
+| `jarvis/core/logs.py` | Shared: the logger every module reports failures to |
 
 ---
 
@@ -137,7 +138,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 |---|---|---|
 | `uv run run-digest [--force]` | `jarvis.digest.pipeline.run:main` | Run the weekly digest pipeline once. Prints how to enable it and exits without fetching when `[digest] enabled` is false; `--force` runs anyway (typing the command is itself the human request) |
 | `uv run jarvis-sync` | `jarvis.sync.daemon:main` | Start the background sync daemon (foreground; run directly, no service manager) |
-| `uv run kb` | `jarvis.kb.cli:main` | Manage the knowledge base (CLI), including `kb models [--refresh]` |
+| `uv run kb` | `jarvis.kb.cli:main` | Manage the knowledge base (CLI), including `kb models` |
 | `uv run convert-pdf` | `jarvis.kb.convert:main` | Convert a PDF to Markdown (standalone) |
 | `uv run webapp` | `jarvis.webapp.run:main` | Start the web UI at `http://127.0.0.1:8080` |
 
@@ -151,7 +152,8 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | `~/.jarvis/rag/` | ChromaDB persistent store (+ `.write.lock` for cross-process writes) |
 | `~/.jarvis/state/sync_status.json` | `jarvis-sync` daemon/job status (read by `kb sync-status`) |
 | `~/.jarvis/sessions/` | Persistent chat sessions, one JSON file each (dir 0700, files 0600) |
-| `~/.jarvis/skills/` | User-defined skill folders, `<name>/SKILL.md` + supporting files (configurable via `skills_dir`) |
+| `~/.jarvis/prompts/` | The user's editable copies of the three prompts, seeded from the shipped defaults on first use (files 0600 not enforced — they hold no secrets) |
+| `~/.jarvis/logs/jarvis.log` | Library-level warnings — the vector store, session loading, metadata inference, config re-reads. These modules had no logger at all before, which is why they used to swallow their exceptions: a caught error with nowhere to go is indistinguishable from no error |
 | `~/.jarvis/logs/sync.log` | `jarvis-sync` daemon log (written directly by the daemon; also echoed to stderr) |
 | `~/.jarvis/logs/chat.log` | Chat-tool failures — full exception + traceback for every caught tool error, written by the webapp's agent (file only, never shown in the UI) |
 | `~/Documents/papers/digest/` | Weekly digest `.md` output files (configurable) |
@@ -187,12 +189,11 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `openrouter_data_collection` | `"deny"` | — | `[openrouter] data_collection` — exclude upstream providers that train on prompts |
 | `openrouter_allow_fallbacks` | `False` | — | `[openrouter] allow_fallbacks` — never silently reroute to an unvetted upstream provider |
 | `openrouter_only` | `[]` | — | `[openrouter] only` — optional allowlist of upstream provider slugs |
-| `models` | `{}` | — | `[models]` — the user-maintained switchable catalogue, `{provider: [model, ...]}`. jarvis never hardcodes a vendor model list; `kb models --refresh` fills in the OpenRouter half |
+| `models` | `{}` | — | `[models]` — the user-maintained switchable catalogue, `{provider: [model, ...]}`. jarvis never hardcodes a vendor model list. Optional: a provider's configured default already appears in the picker, and the picker's text box reaches anything else |
 | `anthropic_model` | `claude-sonnet-4-6` | `ANTHROPIC_MODEL` | Anthropic model, used both for chat and the digest pipeline. Canonical home is `[chat]`; a legacy `[digest] anthropic_model` still works as a fallback but prints a one-line warning to move it (no auto-rewrite). Precedence: env > `[chat]` > `[digest]` |
 | `ollama_model` | `qwen3-vl:30b` | `OLLAMA_MODEL` | Ollama model tag (needs tool calling + vision for full functionality) |
 | `vault_path` | `~/vault` | `VAULT_PATH` | Obsidian vault root |
 | `private_vault_dirs` | `["private"]` | — | Top-level vault folders treated as private |
-| `skills_dir` | `~/.jarvis/skills` | — | User-defined skill folders (`<name>/SKILL.md`); missing folder = feature off |
 | `response_style` | `""` | — | Free-text style instruction appended to the system prompt |
 | `compact_after_tokens` | `12000` | — | Session compaction threshold (estimated context tokens) |
 | `compact_keep_exchanges` | `6` | — | Recent turns kept verbatim when compacting |
@@ -519,6 +520,41 @@ deletes and re-ingests sweep figures along too. A few things worth knowing:
 
 A query flows through four stages, all local — no data leaves the machine.
 
+```
+INDEXING (§1-2)
+  file, or an LLM-written summary
+        │
+        ├─ chunk ──────────────────► chroma.sqlite3   text + metadata
+        │                                             (the data)
+        └─ embed_model (BAAI) ─────► HNSW *.bin       the vectors
+                                                      (derived — rebuildable)
+
+RETRIEVAL (§2-3)
+  query
+    │
+    ├─ embed_model embeds it ─► HNSW nearest neighbours ─► ranking A  semantic
+    │
+    └─ BM25, built in memory over the same
+       visibility-filtered pool ───────────────────────► ranking B  keyword
+                                       │
+                    reciprocal rank fusion of A and B
+                                       │
+                            rerank_top_n candidates (25)
+                                       │
+              rerank_model (cross-encoder) reads (query, chunk TEXT)
+                                       │
+                                 top n_results
+```
+
+Two things that are easy to get backwards:
+
+- **BM25 is retrieval, not re-ranking.** It is the keyword half of stage 2,
+  fused with the dense half. Re-ranking is a separate, later stage.
+- **The cross-encoder never touches the index or the vectors.** It reads the
+  raw text of the candidates: `reranker.predict([(query, doc.page_content)
+  ...])`. That is what makes it accurate and why it cannot replace stage 2 —
+  see stage 3.
+
 **1. Chunking, at index time.** `add_texts` splits content on markdown
 headers (`MarkdownHeaderTextSplitter`) and then by size
 (`RecursiveCharacterTextSplitter`). Each chunk stores its `chunk_index` and a
@@ -535,7 +571,11 @@ enabled, `_hybrid_search` fetches the ChromaDB candidate pool filtered by
 `visibility`/`doc_type` first, then ranks it two ways over that same filtered
 pool: dense (the query embedded with a BGE-style model, `embed_model`,
 prefixed by `query_prefix` on the query side only) and sparse (a BM25 index
-rebuilt fresh per query, via `rank-bm25`). The two rankings are fused by
+rebuilt fresh per query, via `rank-bm25` — held in memory only, so unlike the
+HNSW index there is nothing here to persist or corrupt). The sparse half
+earns its place on exact tokens: a query like `LoRA` or `Dr. Tanaka` is
+where a vector model drifts to topically similar text that never contains
+the string, and BM25 catches the literal match. The two rankings are fused by
 reciprocal rank fusion (`_reciprocal_rank_fusion`, `c=60`, identity by chunk
 id): an id's score is the sum of `1/(c+rank)` across whichever ranking(s) it
 appears in. Because the sparse index and the dense query both operate on the
@@ -546,10 +586,23 @@ byte-for-byte.
 
 **3. Re-ranking.** A cross-encoder (`rerank_model`) scores each `(query,
 chunk)` pair jointly and reorders the dense or fused candidates, returning
-the top `n_results`. This is far more accurate than the bi-encoder's
-independent embeddings at deciding which chunk is actually most relevant. It
-runs **after** the visibility filter, so it never widens what a cloud
-provider can see; set `rerank_model = ""` to disable it.
+the top `n_results`. It runs **after** the visibility filter, so it never
+widens what a cloud provider can see; set `rerank_model = ""` to disable it.
+
+The two-stage shape is forced by the difference between the models.
+`embed_model` is a **bi-encoder**: query and document are embedded
+*separately* into fixed vectors and compared by distance, so every document
+can be embedded once, ahead of time, and the comparison is arithmetic — but
+the model never sees a query and a document together. The cross-encoder reads
+them **jointly**, as one text input, and returns a relevance score. That is
+far more accurate, because it can weigh how the query relates to that
+specific passage, and it is also why nothing can be precomputed: the score
+exists only for the pair. Running it over the whole store per query would
+mean thousands of forward passes. So the cheap index narrows the corpus to
+`rerank_top_n` candidates and the expensive model reads only those.
+
+This is also why the cross-encoder is unaffected by a damaged vector index —
+it consumes `page_content`, the chunk text, and never reads a vector.
 
 **4. Stale views, then corruption.** `"Error finding id"` — a reference to a
 chunk id that's no longer there — has two very different causes, and they
@@ -1004,9 +1057,11 @@ Used by the webapp picker to validate a switch identically every time.
   annotated `{spec, provider, model, local, available, current}`. Built from
   `[models]` in config plus each provider's configured default, so a user who
   never wrote a catalogue still sees the model they're on. Jarvis ships no
-  vendor model list; `kb models --refresh` populates the OpenRouter half from
-  OpenRouter's own index and writes it into `config.toml`. The picker itself
-  reads config only — opening the UI makes no outbound request.
+  vendor model list, and the picker reads config only — opening the UI makes
+  no outbound request. There was a `kb models --refresh` that pulled
+  OpenRouter's index into `config.toml`; it wrote three hundred entries to
+  populate a list better kept to three, and the picker's free-text box already
+  reaches anything not listed.
 - `validate_switch` / `apply_switch` reject an unknown provider, a provider
   with no credentials, and — the one that matters most — a private session
   moving to a cloud model. Once private content is in the transcript, the
@@ -1042,11 +1097,10 @@ reach models the picker couldn't, and that asymmetry was a live source of
 confusion about how models are configured. The picker gained a free-text box
 in the same change, so no capability moved with it.
 
-`build_system_prompt(kb_only=True, response_style="", skills=None)` loads
-the base prompt from `~/.jarvis/system_prompt.md` if present, otherwise uses
-the built-in default, then appends: a knowledge-source instruction based on
-`kb_only`; the list of available skills as `name: description` lines when
-`skills` is non-empty; and the user's `response_style` preference when set.
+`build_system_prompt(kb_only=True, response_style="")` loads the base prompt
+from `~/.jarvis/system_prompt.md` if present, otherwise uses the built-in
+default, then appends a knowledge-source instruction based on `kb_only` and
+the user's `response_style` preference when set.
 
 **Retrieved-data wrapping.** Results from the retrieval tools (`search_kb`,
 `get_document`, `read_file`, `search_chat_history`) are wrapped in
@@ -1084,7 +1138,6 @@ cues, not answer material.
 | `search_chat_history` | Search past conversations (`doc_type="chat"`), excluding the running session | Public sessions only; `PrivacyError` if query only matches private sessions |
 | `get_document` | Read one document's stored chunks in full, paginated (15/page) — works for anything indexed, including PDFs | `PrivacyError` if any chunk of the document is private |
 | `read_file` | Read one vault Markdown file in full (after `search_kb` identifies it); cannot open PDFs — use `get_document` for those | `PrivacyError` for files whose resolved path is in `private_vault_dirs` |
-| `read_skill` | Load a user-defined skill's full instructions (or one named supporting file); only in the tools list when skills exist | Any (skills are the user's own trusted files) |
 | `add_document` | Add a paper — arXiv URL or local PDF, always public; two storage modes (see below); title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry (old chunks deleted first), which is the reingest-with-figures path | Any |
 | `update_file_path` | Update stored path for a local document without re-embedding | Any |
 | `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only | Any |
@@ -1242,39 +1295,43 @@ indexing is display-driven, so search is unaffected.
 
 ---
 
-## Skills — `jarvis/chat/skills.py`
+## Prompts — `jarvis/core/prompts.py`
 
-A skill is a folder `skills_dir/<name>/` (default `~/.jarvis/skills/<name>/`)
-containing `SKILL.md` plus any supporting files the instructions reference,
-at any depth. The folder name is the skill name. The description is parsed
-from a `description:` key in SKILL.md's `---` frontmatter (a small
-hand-rolled single-line-value parser, no YAML dependency); with no
-frontmatter or no description key, it falls back to the first non-empty body
-line, leading `#` stripped. A missing or empty `skills_dir` means the
-feature is off — the `read_skill` tool isn't even advertised.
+Three prompts drive everything jarvis asks a model to do: the chat agent's
+standing instructions, the paper-summary prompt, and the digest scoring
+rubric. All three are things a user will eventually want to reword.
 
-There's no dual format: a stray flat `*.md` file, or a folder missing
-`SKILL.md`, no longer loads — `list_skills` prints a one-line warning naming
-the fix and skips it, rather than failing silently.
+The repo ships a **generic default** for each in `jarvis/prompts/`. The copy
+that actually runs lives beside `config.toml` in `~/.jarvis/prompts/`, created
+from the default the first time anything needs it. Editing writes to the copy;
+Revert overwrites it from the default again. **The repo file is never written
+to**, which is what makes Revert always safe.
 
-The design is progressive disclosure. The system prompt carries only `name:
-description` lines; the model calls `read_skill(name)` to pull in SKILL.md
-plus a "Supporting files:" listing (sorted relative paths, omitted when
-there are none) when a task matches, then `read_skill(name, file=<path>)` to
-load one specific supporting file — so full skill text never occupies
-context until it's actually needed. Both `name` and `file` come from the LLM
-and are treated as untrusted: separator or traversal sequences are rejected
-outright, and `resolve()` + `relative_to()` confirm the path stays inside
-the skill folder, which also defeats a supporting file that's a symlink
-pointing outside it. Supporting-file reads are capped at 64 KB. Skills are
-the user's own local files, trusted content, never indexed into the vector
-store, outside the visibility model entirely.
+Seeding is lazy — `load(name)` creates the copy if it is missing — so it does
+not matter which entry point runs first. The webapp additionally seeds all
+three at startup, so the files are visible under `~/.jarvis/prompts/` before
+anyone goes looking for them.
 
-**Response style.** The related `[chat] response_style` free-text
-instruction is appended to the system prompt by `build_system_prompt()`. The
-webapp edits it live via the header ⋮ menu → modal, prefilled from `GET
-/settings`, and persists it via `set_config_value()` (tomlkit write-back,
-comments preserved, atomic, mode 0600).
+**Nothing caches a prompt across calls.** The system prompt is rebuilt per
+turn, and the other two are read per call. An edit therefore applies to the
+next message rather than after a restart — `_get_summary_prompt()` used to
+memoise into a module global, which would have meant exactly that restart.
+
+**The scoring prompt is why this exists.** It was committed to the repo with
+one researcher's active topics in it — cytometry, single-cell foundation
+models, their two tracks. That is configuration, not code: it decides what
+*that person* finds worth reading, and no shipped default can be right for
+everyone. It now ships generic, with a research-context section the user fills
+in, and the personal version lives in their own directory.
+
+**No chat tool can edit a prompt.** Editing the instructions that govern the
+agent is a human action; a tool for it would let an injected instruction
+rewrite its own constraints. The routes are human-only by construction, the
+same reasoning as `/documents/remove`.
+
+A legacy `~/.jarvis/system_prompt.md` — the old override location — is carried
+across into the new one on first seed rather than being ignored, so nobody's
+existing wording is silently replaced by the default.
 
 ---
 
@@ -1312,8 +1369,13 @@ never interrupts a turn running against another.
 |---|---|
 | `GET /` | Serves `index.html` |
 | `GET /info` | `{provider, provider_kind, served, cost_usd, cost_by_model, vault}` for the header — the **active session's** model and spend, not a process-wide one. `served` is the model that actually answered when a router picked something other than what was requested, and is empty otherwise; `cost_by_model` is the per-model breakdown behind `cost_usd`. Re-read by the frontend on every session switch, since all of it is per-session |
+| `GET /config/summary` | The loaded configuration, grouped for display, with API keys reduced to set/not set. Read fresh per call, so an edited file shows up without a restart. Reports **resolved** values — after the file and any env vars — since the usual confusion is an env var winning over the file |
+| `GET /prompts` | Every editable prompt with its title, description, and whether it differs from the shipped default |
+| `GET /prompts/{name}` | One prompt's current text, seeding the user's copy if this is the first look. 404 on an unknown name |
+| `POST /prompts/{name}` | `{text}` — replace the user's copy. Takes effect on the next turn: the system prompt is rebuilt per turn and the others are read per call, so nothing caches a stale version |
+| `POST /prompts/{name}/reset` | Restore the shipped default and return it. The repo file is never written to, so this always has a clean copy to go back to |
 | `GET /models` | The switchable catalogue for the picker, `{current, private, models}`. Reads config only; opening the UI makes no outbound request |
-| `POST /model` | `{session_id, spec}` — switch one session's model from the next turn. The spec need not be in the catalogue (the picker has a text box for exactly this); config is re-read per call so a `kb models --refresh` needs no restart. 409 while that session has a turn in flight, 409 for a private session moving to a cloud model, 400 for an unknown provider or missing credentials |
+| `POST /model` | `{session_id, spec}` — switch one session's model from the next turn. The spec need not be in the catalogue (the picker has a text box for exactly this); config is re-read per call so a hand-edit needs no restart. 409 while that session has a turn in flight, 409 for a private session moving to a cloud model, 400 for an unknown provider or missing credentials |
 | `GET /history` | The active session's display list for page-refresh restore |
 | `GET /sessions` | `{active, busy, sessions}` — stored session metadata for the sidebar (pinned first, newest first); `busy` is the **list** of session ids currently mid-turn |
 | `POST /sessions/new` | Swap in a fresh session (the outgoing one is already persisted per turn); does **not** touch `pending_actions` — a fresh id owns no tokens, and any other session's dialogs (including the outgoing one's) must keep working |
@@ -1337,7 +1399,7 @@ never interrupts a turn running against another.
 | `POST /discard-edit` | Drop a rejected proposal |
 | `GET /proposals` | Every suggestion still awaiting a decision, in the same shape the SSE event carries — so a proposal re-opened later renders through the browser's one code path. `new_text` is deliberately withheld: the browser needs the hunks, not the whole proposed file |
 | `POST /proposals/discard-all` | Drop every pending suggestion. Touches no file — clearing a suggestion is neither applying nor reverting it |
-| `POST /reveal` | `{draft_id, file}` — show a draft file in the OS file manager. Path goes through `resolve_in_draft`, fixed argv, no shell. Human-only by construction; replaced the archive route |
+| `POST /reveal` | `{draft_id, file}` — show a draft file in the OS file manager. Path goes through `resolve_in_draft`, fixed argv, no shell. Human-only by construction; replaced the archive route. The argv comes from `_file_manager_command(path, platform)`: macOS and Windows reveal the file itself (`open -R`, `explorer /select,<path>` — one argument, not two), Linux has no portable reveal so it opens the containing folder rather than handing a model-written `.tex` to whatever application claims the extension |
 | `POST /drafts/new` | `{filename, title?, draft_id?}` — start a document, or with `draft_id` add a file to an existing one. The latter is how a LaTeX project grows a chapter or a `.bib` instead of scattering its parts across folders |
 | `DELETE /drafts/{draft_id}` | Delete a draft and everything in it. Human-only by construction: no chat tool is named for deleting a draft, the same reasoning that lets `/documents/remove` skip the token flow. Drops the draft's pending proposals too; a copy the user already made elsewhere is untouched |
 | `POST /chat` | Accepts `{message, session_id}`, streams SSE events; 409 if `session_id` is already in `running`; 404 if `session_id` isn't the active session and has no file on disk; 409 if it's a stored session `check_resume` refuses |
@@ -1696,11 +1758,6 @@ re-propose or claim the edit landed.
 so one built from private notes is private, and `read_draft` hard-stops for
 a cloud provider — the transcript rule extended to the artefact.
 
-**Workflows are skills, not code.** `examples/skills/tailor-document/` and
-`examples/skills/draft-from-notes/` compose the tools above — search the KB
-for evidence, create a draft, iterate via proposals — and are copied into
-`~/.jarvis/skills/` by the user. New document types are new skills.
-
 ---
 
 ## Security
@@ -1787,10 +1844,24 @@ deletion gate and `PrivacyError` stops don't rely on the model behaving.
 **Network hardening.** `TrustedHostMiddleware` rejects non-localhost Host
 headers, a DNS-rebinding defence, and the server binds to 127.0.0.1 only.
 Session ids from the network are validated (`[0-9a-z-]{1,64}`) before any
-file path construction, blocking traversal. Skill names and supporting-file
-paths from the LLM get the same treatment — separator/traversal rejection
-plus resolved-path containment, which also defeats a supporting file that's
-a symlink escaping the skill folder.
+file path construction, blocking traversal. Draft ids and filenames from the
+LLM get the same treatment — separator/traversal rejection plus resolved-path
+containment, which also defeats a symlink planted inside a draft.
+
+**API keys never reach anything durable.** An SDK can quote the credential it
+just failed with, and jarvis writes error text to three durable places at
+once: the reply on screen, `~/.jarvis/logs/chat.log`, and the saved session —
+which is then indexed into the vector store as a chat chunk. A key reaching
+any of those outlives the request that produced it. `redact_secrets()` blanks
+every configured key out of a message, applied at two boundaries: each of the
+eight places a provider turns an SDK exception into an `LLMError`, and again
+where the webapp builds the reply it saves. It consults the **environment as
+well as the Config**, because `ANTHROPIC_API_KEY` is read straight from the
+environment at client construction and never lands in a `Config` field — a
+Config-only scrub would miss it entirely. Short values are ignored, so a
+one-character key cannot blank out whole messages, and a failure inside
+redaction returns the text unchanged rather than turning every error into a
+different error.
 
 **File permissions.** Config write-back and session files are 0600; the
 sessions directory is 0700. `jarvis-sync` and the webapp warn at startup
@@ -1815,6 +1886,33 @@ PaperDigestError
 └── PrivacyError        Cloud provider attempted to access private content
                         (caught by agentic_turn() for an immediate hard stop)
 ```
+
+**Nothing is caught silently.** An `except` that neither logs nor re-raises
+makes a real failure look like a normal outcome, which is precisely what
+`~/.jarvis/logs/` exists to prevent. Every handler either surfaces the error
+or is narrow, expected control flow — `relative_to` raising `ValueError` for a
+path outside the vault, `queue.Empty` on a poll, `KeyboardInterrupt` on
+shutdown. The ones that changed behaviour invisibly were the dangerous kind
+and are now loud:
+
+- `refresh_vault` reading the indexed-note map **raises** rather than falling
+  back to an empty map, which would have looked like "nothing is indexed" and
+  re-indexed the whole vault while mishandling deletions.
+- `kb index-vault --force` **exits non-zero** if it cannot clear the existing
+  index, rather than rebuilding on top of the stale chunks the user asked to
+  be rid of.
+- `_source_exists` / `_title_exists` log before returning `False`, since that
+  value means "not a duplicate" and would quietly add a second copy.
+- `count_unique_documents` logs before returning `0`, which otherwise reads as
+  "your knowledge base is empty".
+- Metadata inference, session listing, compaction, the startup vault refresh
+  and config re-reads all log the real exception before degrading.
+
+Note that the `kb doctor` and `kb reindex` failures were **not** this: a
+corrupt HNSW header made hnswlib map an absurd allocation and the kernel
+killed the process with SIGBUS. No Python exception is raised for a signal,
+so there was nothing to catch or log — which is exactly why doctor probes in a
+subprocess and reports the child's exit status instead.
 
 `@with_retries(max_attempts, backoff, exceptions)` — exponential backoff
 (`backoff * 2**(attempt-1)`) with up to 25% random jitter; used in
@@ -1860,7 +1958,6 @@ User message → maybe_compact() → provider.agentic_turn() → tool loop → r
   get_document                    → get_document_chunks() → privacy check (any private chunk → PrivacyError) → paginate 15/page → wrap
   search_chat_history             → search_with_privacy_check(doc_type="chat") → wrap
   read_file                       → resolved-path privacy check → filesystem read → wrap
-  read_skill                      → validated name (+ optional validated file) → SKILL.md + supporting-files listing, or one supporting file
   add_document (summary mode)     → resolve_pdf_metadata() (local PDFs, always paper/public) → provider.summarize() → add_texts() (+ annotations)
   add_document (full_text mode)   → download PDF → pdf_to_markdown() → chunk → add_texts() + add_annotations()
   update_file_path                → update file_path + source URI in all matching chunks; no re-embedding

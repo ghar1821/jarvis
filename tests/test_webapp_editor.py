@@ -11,6 +11,7 @@ so the security properties are verified on a machine with no TeX installed.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -306,7 +307,15 @@ def test_pdf_export_uses_the_configured_margin(sandbox, monkeypatch):
 
 
 def test_reveal_runs_a_file_manager_on_the_draft_file(sandbox, client, monkeypatch):
-    """The happy path: a fixed argv, no shell, pointing at the real file."""
+    """
+    The happy path, asserted in terms that hold on every platform: a fixed
+    argv, no shell, aimed inside the sandbox.
+
+    The exact target differs by OS — macOS and Windows reveal the file itself,
+    Linux opens its folder — so pinning the file path here is what made this
+    pass on a laptop and fail in CI. The per-platform shapes are checked
+    against _file_manager_command below instead.
+    """
     draft = workspace.create_draft("Paper", "paper.tex", "\\documentclass{article}\n")
     calls = []
     monkeypatch.setattr(appmod.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw)))
@@ -317,8 +326,45 @@ def test_reveal_runs_a_file_manager_on_the_draft_file(sandbox, client, monkeypat
     command, kwargs = calls[0]
     assert isinstance(command, list), "a string command would go through a shell"
     assert kwargs.get("shell") is not True
-    assert str(workspace.resolve_in_draft(draft["id"], "paper.tex")) in command
+
+    target = Path(command[-1])
+    resolved = workspace.resolve_in_draft(draft["id"], "paper.tex")
+    assert target in (resolved, resolved.parent), "must point at the file or its folder"
+    assert sandbox.drafts_dir.resolve() in target.resolve().parents or \
+        target.resolve() == sandbox.drafts_dir.resolve(), "must stay inside the sandbox"
     assert response.json()["path"].endswith("paper.tex")
+
+
+@pytest.mark.parametrize(
+    "platform, expected",
+    [
+        # -R reveals without opening: a .tex the model wrote must not be handed
+        # to whatever application claims the extension.
+        ("darwin", ["open", "-R", "/drafts/d/paper.tex"]),
+        # One argument, not two. Split as ["explorer", "/select,", path],
+        # explorer gets a /select, naming nothing and silently fails to select.
+        ("win32", ["explorer", "/select,/drafts/d/paper.tex"]),
+        # No portable reveal on Linux, so open the folder rather than the file.
+        ("linux", ["xdg-open", "/drafts/d"]),
+        ("freebsd13", ["xdg-open", "/drafts/d"]),
+    ],
+)
+def test_file_manager_command_per_platform(platform, expected):
+    """
+    A pure mapping, so all three platforms are covered from any machine. This
+    lived inline in the route, which meant it could only ever be tested on
+    whichever OS happened to be running the suite.
+    """
+    assert appmod._file_manager_command(Path("/drafts/d/paper.tex"), platform) == expected
+
+
+def test_no_file_manager_command_goes_through_a_shell():
+    """argv as a list on every platform — a string would be shell-interpreted."""
+    weird = Path("/drafts/d/a b; rm -rf ~.tex")
+    for platform in ("darwin", "win32", "linux"):
+        command = appmod._file_manager_command(weird, platform)
+        assert isinstance(command, list)
+        assert all(isinstance(part, str) for part in command)
 
 
 @pytest.mark.parametrize(

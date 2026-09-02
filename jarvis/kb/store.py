@@ -58,6 +58,10 @@ from pathlib import Path
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+
+from jarvis.core.logs import get_logger
+
+log = get_logger(__name__)
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
@@ -513,7 +517,11 @@ def _source_exists(source: str, store: Chroma) -> bool:
     try:
         result = store._collection.get(where={"source": {"$eq": source}}, include=[])
         return len(result["ids"]) > 0
-    except Exception:
+    except Exception as exc:
+        # False means "not a duplicate", so the caller goes ahead and adds.
+        # On a broken store that quietly produces a second copy of a paper
+        # you already have.
+        log.warning("duplicate check by source failed, treating as new: %s", exc)
         return False
 
 
@@ -535,7 +543,8 @@ def _title_exists(title: str, store: Chroma) -> bool:
     try:
         result = store._collection.get(where={"doc_type": {"$eq": "paper"}}, include=["metadatas"])
         return any(_normalise_title(m.get("title", "")) == target for m in result["metadatas"])
-    except Exception:
+    except Exception as exc:
+        log.warning("duplicate check by title failed, treating as new: %s", exc)
         return False
 
 
@@ -943,7 +952,11 @@ def search_with_privacy_check(
             private_check = search(query, n_results=1, visibility="private",
                                    doc_type=doc_type, store=s, rerank=False, **filters)
             has_private = len(private_check) > 0
-        except RAGError:
+        except RAGError as exc:
+            # The public results above are already correctly filtered, so no
+            # private content leaks — but the "some matches were excluded"
+            # caveat is silently dropped, which is worth knowing about.
+            log.warning("private-content probe failed, caveat suppressed: %s", exc)
             has_private = False
         return results, has_private
     else:
@@ -1008,7 +1021,10 @@ def count_unique_documents(
             include=["metadatas"],
         )
         return len({m.get(id_key) for m in result["metadatas"] if m.get(id_key)})
-    except Exception:
+    except Exception as exc:
+        # 0 reads as "your knowledge base is empty", which is alarming and
+        # wrong when the real answer is "the count could not be read".
+        log.warning("could not count %s documents: %s", doc_type, exc)
         return 0
 
 
@@ -1302,8 +1318,13 @@ def refresh_vault(
                     meta.get("visibility", "public"),
                     int(meta.get("meta_schema", 0)),
                 )
-    except Exception:
-        indexed = {}
+    except Exception as exc:
+        # Falling back to an empty map would look like "nothing is indexed":
+        # refresh_vault would re-index the entire vault and treat every
+        # existing note as new. A read failure here is a real fault, so it
+        # surfaces instead of quietly changing what the sync does.
+        log.error("refresh_vault: could not read the indexed note map: %s", exc)
+        raise _diagnose_kb_error(exc, f"Failed to read the vault index: {exc}") from exc
 
     # Scan current vault files
     current: dict[str, tuple[Path, str]] = {}

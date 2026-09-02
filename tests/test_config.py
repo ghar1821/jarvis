@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.core.config import load_config
+from jarvis.core.config import Config, load_config
 
 
 def test_defaults_when_no_config_file(tmp_path):
@@ -379,3 +379,93 @@ def test_the_readme_names_commands_that_exist():
 
     named = set(re.findall(r"uv run ([a-z][a-z-]+)", readme)) - {"pytest", "python"}
     assert named <= scripts, f"README names commands that do not exist: {sorted(named - scripts)}"
+
+
+# ── describe(): the config as shown at startup and in the UI ─────────────────
+
+
+def test_describe_never_renders_an_api_key(tmp_path):
+    """
+    The one property that matters here. This is printed to a terminal someone
+    may be screen-sharing and rendered into a browser tab, so the key itself
+    must not appear anywhere in the output.
+    """
+    from jarvis.core.config import describe
+
+    secret = "sk-or-v1-9f3c2a-DO-NOT-LEAK"
+    cfg = Config(anthropic_api_key=secret, openrouter_api_key=secret)
+
+    rendered = describe(cfg)
+    flat = " ".join(
+        f"{value['key']} {value['value']}"
+        for section in rendered
+        for value in section["values"]
+    )
+
+    assert secret not in flat
+    assert "DO-NOT-LEAK" not in flat
+
+
+def test_describe_says_whether_each_key_is_set(tmp_path):
+    """Redacted, but still answering the question you came to ask."""
+    from jarvis.core.config import describe
+
+    cfg = Config(anthropic_api_key="something", openrouter_api_key="")
+    creds = {
+        value["key"]: value["value"]
+        for section in describe(cfg)
+        if section["section"] == "Credentials"
+        for value in section["values"]
+    }
+
+    assert creds["anthropic_api_key"] == "set"
+    assert creds["openrouter_api_key"] == "not set"
+
+
+def test_describe_redacts_a_secret_that_leaks_into_another_field(tmp_path):
+    """
+    The backstop. If a field is ever added to a group raw, or a key ends up
+    pasted into some other setting, it still must not render.
+    """
+    from jarvis.core.config import describe
+
+    secret = "sk-or-v1-abcdef123456"
+    cfg = Config(openrouter_api_key=secret, response_style=f"use {secret} please")
+
+    flat = " ".join(
+        value["value"] for section in describe(cfg) for value in section["values"]
+    )
+
+    assert secret not in flat
+
+
+def test_describe_reports_resolved_values_not_the_file(tmp_path, monkeypatch):
+    """
+    "Why isn't my setting working" is usually an env var winning over the
+    file, so this has to show what is in effect, not what the file says.
+    """
+    from jarvis.core.config import describe, load_config
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[chat]\nprovider = "ollama"\n')
+    monkeypatch.setenv("CHAT_PROVIDER", "anthropic")
+
+    cfg = load_config(config_file)
+    chat = {
+        value["key"]: value["value"]
+        for section in describe(cfg)
+        if section["section"] == "Chat"
+        for value in section["values"]
+    }
+
+    assert chat["provider"] == "anthropic", "the env var is what is in effect"
+
+
+def test_format_describe_is_printable_text(tmp_path):
+    """What the webapp prints at startup."""
+    from jarvis.core.config import format_describe
+
+    text = format_describe(Config(anthropic_api_key="secret-value"))
+
+    assert "Chat" in text and "provider" in text
+    assert "secret-value" not in text

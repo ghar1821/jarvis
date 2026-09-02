@@ -1,97 +1,111 @@
-# Changelog
-
-## 2026-09-02 — where the project stands
-
-This file was reset on 2026-09-02. The entry below is a snapshot of what jarvis
-does today rather than a retelling of how it got here — the commit-by-commit
-detail is in `git log`.
+# Jarvis
 
 
-### Paper discovery
 
-- Weekly digest pulls from arXiv (per-category limits) and bioRxiv (real
-  categories server-side, free-text keywords for topics with no category), with
-  the same paper arriving twice deduplicated by title.
-- Papers are scored against a custom relevance prompt by the configured LLM and
-  written as a tiered Markdown digest to `[digest] output_dir`.
-- Indexing follows the tier: score ≥ 9 is stored full text (PDF downloaded and
-  chunked), 8–8.9 reuses the digest's own summary text, and the digest file
-  itself is indexed so papers below the threshold are still findable.
-- `jarvis-sync` schedules the run (default Monday 05:00). A run missed while the
-  Mac slept fires on wake; one missed while it was off is caught by an overdue
-  re-check at start and every 6 hours. `kb sync-status` reports daemon health
-  and recent job outcomes.
-- A PDF dropped into `[sync] pdf_watch_dir` is indexed within `pdf_watch_minutes`
-  (default 30). Re-saving a PDF with new annotations re-indexes it via byte-hash
-  detection; the folder is an inbox, not a mirror, so removing a file never
-  deletes its knowledge base entry.
+## PR #1 — general assistant: OpenRouter, records, a draft sandbox, an editor
 
-### Knowledge base
+Turns jarvis from a research-paper tool into a general assistant that can also
+produce documents, not just retrieve them. The paper digest stays, but as a
+feature you switch on rather than the thing the daemon is built around.
 
-- One local ChromaDB collection holds papers, Obsidian vault notes, indexed past
-  conversations, and digest files. Embedding runs on the machine — no external
-  calls.
-- Papers are stored either as an LLM summary (~1000 words) or as fully chunked
-  text for paragraph-level querying.
-- Retrieval fuses BGE dense embeddings with BM25 keyword ranking by reciprocal
-  rank fusion, over section-aware chunks, then re-ranks with a cross-encoder.
-  `[rag] hybrid = false` takes the dense-only path.
-- Highlights and typed notes in an annotated PDF become their own searchable
-  chunks (`[HIGHLIGHT p.N]`, `[USER NOTE p.N]`). Freehand ink is stroke
-  geometry, not text, and is not extracted.
-- Figure captioning by a vision model produces `[FIGURE p.N]` chunks. Off by
-  default since every figure costs a call — opt in per document with
-  `kb add --figures` or by asking the agent to add it "with figures".
-- Title, authors, and DOI are inferred for local PDFs; `kb set-meta` or the
-  agent's `update_document_metadata` corrects whatever the inference got wrong.
-- `kb doctor` diagnoses index health, `kb reindex` re-embeds every chunk without
-  any LLM calls.
+**Run `uv sync` after merging** — new dependencies (`openai`, `pyyaml`,
+`markdown-it-py`, `mdit-py-plugins`, `latex2mathml`).
 
-### Chat agent
+### NEW FUNCTIONALITY
 
-- Terminal (`vault-chat`) and browser (`webapp`, localhost only) run the same
-  agent and the same tools.
-- Provider is Ollama locally or Anthropic Claude, switchable per session.
-- Tools cover retrieval across papers, notes, and past chats; reading a stored
-  document or vault file in full; adding papers by arXiv URL or local PDF;
-  metadata corrections; vault indexing; stats; and requesting removals.
-- DB-only is on by default. Switching it off lets the model fall back to its
-  training knowledge, and it calls `use_own_knowledge` first so the fallback is
-  visible rather than silent.
-- Sessions persist to `~/.jarvis/sessions/` and can be resumed, renamed, pinned,
-  deleted, and searched. The 50 most recent unpinned are kept; pinned ones are
-  exempt. Long sessions compact themselves, keeping recent turns verbatim.
-- The webapp runs sessions genuinely in parallel — each turn has its own thread
-  and event stream, and a message is addressed to the session it was typed into
-  even if you switch away mid-send.
-- A papers manager in the header menu lists every indexed paper, narrows as you
-  type, and allows in-place metadata edits and removals.
-- Replies copy out as raw Markdown, so pasting into Obsidian keeps its
-  formatting. Skills under `~/.jarvis/skills/<name>/SKILL.md` are advertised by
-  name and description and loaded on demand.
+- Update Jarvis into a general assistant and introduced OpenRouter (PR #1):
+  - Added support to use OpenRouter instead of just Anthropic or Ollama.
+    Model can be switched mid conversation and a real time cost is shown.
+    The model picker reads the list of models from the config file.
+    Thus, new models can be added without restarting the webapp (PR #1).
+  - Added support to store schema for vault notes.
+  - Added support for agent to write documents into a folder outside of
+    the vault, and ui to reveal the location for user to manually copy to their
+    vault or wherever they want. 
+    Agents can suggest changes to the document which must be approved or rejected
+    by the user ala git diff style.
+  - Added a document (latex, md, txt, csv) editor to the webapp. Editor is
+    provided by CodeMirror API. Documents can be previewed in the webapp and 
+    exported into PDF file when needed.
+  - Added version history for documents. Every earlier version is kept and can
+    be restored from the editor. Restoring is itself undoable.
+  - Added automatic clean up of the draft folder. Documents untouched for 30
+    days are swept, unless marked to keep.
+    
 
-### Privacy and safety
+- Added new CLI commands to inspect what is indexed and what is available
+  (PR #1): `kb schema`, `kb list --notes`, `kb models`, `kb drafts`.
 
-- Vault folders listed in `[chat] private_vault_dirs` are visible to the local
-  model only. The check resolves symlinks, so a link in a public folder cannot
-  reach into a private one.
-- A cloud provider that touches private content stops the turn with a
-  `PrivacyError` instead of working around it — private notes never reach a
-  cloud model, even indirectly.
-- Papers are always public. Only vault notes can be private, which is what makes
-  the cloud summary path safe.
-- A session that ever touches private content is flagged private permanently and
-  cannot be resumed under Anthropic.
-- Deletion always needs a human. The agent can only request one; confirmation
-  happens out of band (terminal y/N or a webapp dialog), and only database
-  entries are ever removed. There is no code path in jarvis that deletes a file
-  on disk.
+- Webapp prints its configuration on startup, and ⋮ → Show config… shows the
+  same thing in the UI. API keys show as set or not set, not their value (PR #1). 
 
-### Project infrastructure
+- Prompts used to instruct agent on how to behave and how to summarise and select
+  papers for paper digest are now editable from the UI. 
+  Default prompts now exist in the repo and are copied to
+  `~/.jarvis/prompts/` on first run. 
+  In the UI, ⋮ → Edit prompts… edits the copy, and a
+  revert button puts the default back (PR #1).
 
-- The Markdown in `docs/` is published to <https://ghar1821.github.io/jarvis/>
-  on every push to `main`, with the README itself as the home page so the site
-  and the repository cannot disagree. The build is `--strict`, so a broken link
-  fails CI.
-- CI runs the unit suite (`pytest -m "not integration"`) on pushes to `main` and
-  on pull requests targeting it.
+### BREAKING CHANGES
+
+- Remove vault chat access via terminal to simplify codebase and deprecate 
+    features that are hardly used (PR #1).
+
+- Chat tools renamed to make naming reflect more of a general assistant (PR #1):
+  - `retrieve_papers` + `search_notes` became one `search_kb`
+  - `list_papers` became `list_documents`. 
+  - Update `~/.jarvis/system_prompt.md` if you have one naming the old tools.
+    The built in prompt was rewritten but an override is left alone.
+
+- Webapp routes renamed (PR #1):
+  - `/papers`, `/papers/meta`, `/papers/remove` became 
+    `/documents*`, with `?kind=notes`. This will break any bookmarks if any.
+
+- Removed skills as nothing was using it (PR #1). 
+
+### MAJOR CHANGES
+
+- Paper digest are turned off by default in a switch to make Jarvis more general
+  assistant. Feature can be turned back on through config file (PR #1).
+
+- Sessions store conversation transcript in a model agnostic format (PR #1).
+  This enable model switching within each session without losing context.
+  When switching model within a session, the existing one is converted to
+  the format accepted by the model before loaded. 
+
+- Functions that do privacy checks now no longer checking whether provider is
+  Anthropic. A new generic `is_cloud_provider` function replaces it. 
+  An unknown provider is by default treated as a cloud provider (PR #1). 
+
+- Introduced new config to support changes introduced for making Jarvis more of
+  a general assistant (PR #1): `[drafts]`, `[openrouter]`, 
+  `[models]`, `[chat]`, `[auth]`.
+
+- Simplify changelog (PR #2).
+
+### MINOR CHANGES
+
+- Change the header bar on the UI so it is more readable (PR #1).
+  The header now shows which model is currently used by the session.
+  If `openrouter/auto` model is used, then the model name that is handling
+  the prompt is showed (PR #1).
+
+### BUG FIXES
+
+- Fix errors being silently swallowed in thirteen places. Exceptions were
+  caught but not logged, making troubleshooting almost impossible.
+  Introduced a logger in `~/.jarvis/logs/jarvis.log` and printing errors out
+  now to help troubleshooting (PR #1).
+
+- Fix a stale database index reported as index corruption. This used to tell 
+  the user to rebuild the whole database when in actual fact an `index-vault`
+  to update it is all that is needed (PR #1). 
+
+- Fix `kb reindex` could not run on a database store that is too corrupt to 
+  read. New `kb reindex --from-storage` was introduced to fix corrupt HNSW index
+  by using the chunked text (either full doc or LLM summary) stored in sqlite.
+  That way, the rechunking or the expensive LLM summary doesn't need to be
+  repeated when reindexing (PR #1).
+
+- Fix `kb doctor` died without output instead of diagnosing when the index was badly
+  corrupt (PR #1). 

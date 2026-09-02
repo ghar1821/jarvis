@@ -10,8 +10,8 @@ Two rules worth stating plainly:
   switching models is a human action with no chat tool behind it, so an
   injected instruction has no way to reach it.
 - **jarvis ships no vendor model list.** The catalogue is whatever the user put
-  in their config, optionally populated from OpenRouter's own index with
-  `kb models --refresh`. Hardcoding model names would age silently.
+  in their config. Hardcoding model names would age silently, and the picker's
+  free-text box already reaches anything the provider accepts.
 """
 
 from jarvis.core.errors import PrivacyError
@@ -123,34 +123,3 @@ def apply_switch(session, spec: str, cfg) -> str:
     normalised = validate_switch(spec, session, cfg)
     session.provider, session.model = split_spec(normalised)
     return normalised
-
-
-def refresh_openrouter_catalogue(cfg) -> list[str]:
-    """
-    Fetch OpenRouter's model index and return the ids, newest listing order.
-
-    This is the only place jarvis reaches out for a model list, and it happens
-    only when the user runs `kb models --refresh` — never on a UI load, so the
-    picker itself stays offline.
-    """
-    import os
-
-    import requests
-
-    from jarvis.core.errors import AuthenticationError
-
-    api_key = os.environ.get("OPENROUTER_API_KEY") or cfg.openrouter_api_key
-    if not api_key:
-        raise AuthenticationError(
-            "No OpenRouter credentials found.\n"
-            "  Set OPENROUTER_API_KEY env var or add openrouter_api_key to "
-            "[auth] in ~/.jarvis/config.toml"
-        )
-
-    response = requests.get(
-        "https://openrouter.ai/api/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return [entry["id"] for entry in response.json().get("data", []) if entry.get("id")]

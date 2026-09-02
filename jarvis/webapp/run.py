@@ -19,15 +19,6 @@ def main() -> None:
             "Each session can then switch model from the picker."
         ),
     )
-    parser.add_argument(
-        "--reload",
-        action="store_true",
-        help=(
-            "Restart the server automatically when the Python changes. "
-            "Static files (HTML/CSS/JS) are already re-read per request, so "
-            "this is only needed while editing the backend."
-        ),
-    )
     args = parser.parse_args()
 
     # Set the env var before uvicorn imports jarvis.webapp.app, so get_config()
@@ -36,14 +27,15 @@ def main() -> None:
     if args.provider:
         os.environ["CHAT_PROVIDER"] = args.provider
 
-    # Without --reload a backend change is invisible until you restart, which
-    # shows up as a 404 on a route that plainly exists in the source. Static
+    # Print what was actually loaded before serving anything. Almost every
+    # setup problem is "jarvis is not reading the config I think it is", and
+    # the resolved values answer that in one glance. Secrets are reduced to
+    # set/not set by describe().
+    from jarvis.core.config import format_describe
+
+    print("Jarvis configuration" + format_describe() + "\n")
+
+    # A backend change needs the process restarted to be picked up. Static
     # files are served from disk on every request, so those only ever need a
     # browser reload.
-    uvicorn.run(
-        "jarvis.webapp.app:app",
-        host="127.0.0.1",
-        port=8080,
-        reload=args.reload,
-        reload_dirs=["jarvis"] if args.reload else None,
-    )
+    uvicorn.run("jarvis.webapp.app:app", host="127.0.0.1", port=8080)

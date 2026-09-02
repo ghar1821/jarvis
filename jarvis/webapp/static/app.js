@@ -763,6 +763,159 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !modelModal.classList.contains('hidden')) closeModelModal();
 });
 
+// ── Config viewer ────────────────────────────────────────────────────────
+//
+// Read-only on purpose. Editing config from a browser would mean writing the
+// file back, and the one thing you most want to see here — whether an env var
+// is overriding your file — is exactly what a UI editor would obscure.
+
+const configModal = document.getElementById('config-modal');
+
+async function openConfigModal() {
+  headerMenu.classList.add('hidden');
+  const body = document.getElementById('config-body');
+  body.replaceChildren();
+
+  const response = await fetch('/config/summary');
+  if (!response.ok) {
+    alert('Could not read the configuration');
+    return;
+  }
+  const { sections } = await response.json();
+
+  for (const section of sections) {
+    const heading = document.createElement('div');
+    heading.className = 'config-section';
+    heading.textContent = section.section;
+    body.appendChild(heading);
+
+    const table = document.createElement('div');
+    table.className = 'config-table';
+    for (const { key, value } of section.values) {
+      const k = document.createElement('div');
+      k.className = 'config-key';
+      k.textContent = key;
+      const v = document.createElement('div');
+      v.className = 'config-value';
+      v.textContent = value;
+      table.append(k, v);
+    }
+    body.appendChild(table);
+  }
+
+  configModal.classList.remove('hidden');
+}
+
+function closeConfigModal() {
+  configModal.classList.add('hidden');
+}
+
+document.getElementById('config-menu-item').addEventListener('click', openConfigModal);
+document.getElementById('config-close').addEventListener('click', closeConfigModal);
+configModal.querySelector('.modal-backdrop').addEventListener('click', closeConfigModal);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !configModal.classList.contains('hidden')) closeConfigModal();
+});
+
+
+// ── Prompt editor ────────────────────────────────────────────────────────
+//
+// The three prompts jarvis sends to a model. Editing writes to the copy under
+// ~/.jarvis/prompts/; the shipped default is never touched, which is what
+// makes Revert always safe.
+
+const promptModal  = document.getElementById('prompt-modal');
+const promptPicker = document.getElementById('prompt-picker');
+const promptText   = document.getElementById('prompt-text');
+const promptNote   = document.getElementById('prompt-note');
+const promptStatus = document.getElementById('prompt-status');
+
+let promptMeta = [];   // [{name, title, description, customised}]
+
+async function openPromptModal() {
+  headerMenu.classList.add('hidden');
+  const { prompts } = await (await fetch('/prompts')).json();
+  promptMeta = prompts;
+
+  promptPicker.replaceChildren();
+  for (const entry of prompts) {
+    const option = document.createElement('option');
+    option.value = entry.name;
+    option.textContent = entry.title + (entry.customised ? ' (edited)' : '');
+    promptPicker.appendChild(option);
+  }
+
+  await showPrompt(prompts[0].name);
+  promptModal.classList.remove('hidden');
+}
+
+async function showPrompt(name) {
+  const response = await fetch(`/prompts/${name}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    alert(errorDetail(body, 'Could not load that prompt'));
+    return;
+  }
+  const { text, customised } = await response.json();
+  promptPicker.value = name;
+  promptText.value = text;
+  const entry = promptMeta.find(p => p.name === name);
+  promptNote.textContent = entry ? entry.description : '';
+  setPromptStatus(customised ? 'Edited — differs from the shipped default.' : 'Unchanged from the shipped default.');
+}
+
+function setPromptStatus(message) {
+  promptStatus.textContent = message;
+}
+
+promptPicker.addEventListener('change', () => showPrompt(promptPicker.value));
+
+document.getElementById('prompt-save').addEventListener('click', async () => {
+  const name = promptPicker.value;
+  const response = await fetch(`/prompts/${name}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: promptText.value }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    alert(errorDetail(body, 'Could not save that prompt'));
+    return;
+  }
+  // Takes effect on the next message — nothing caches a prompt across turns.
+  closePromptModal();
+});
+
+document.getElementById('prompt-reset').addEventListener('click', async () => {
+  const name = promptPicker.value;
+  const entry = promptMeta.find(p => p.name === name);
+  if (!confirm(`Revert "${entry ? entry.title : name}" to the shipped default?\n\nYour edits to this prompt are discarded.`)) return;
+
+  const response = await fetch(`/prompts/${name}/reset`, { method: 'POST' });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    alert(errorDetail(body, 'Could not revert that prompt'));
+    return;
+  }
+  const { text } = await response.json();
+  promptText.value = text;
+  if (entry) entry.customised = false;
+  promptPicker.selectedOptions[0].textContent = entry ? entry.title : name;
+  setPromptStatus('Reverted to the shipped default.');
+});
+
+function closePromptModal() {
+  promptModal.classList.add('hidden');
+}
+
+document.getElementById('prompts-menu-item').addEventListener('click', openPromptModal);
+document.getElementById('prompt-cancel').addEventListener('click', closePromptModal);
+promptModal.querySelector('.modal-backdrop').addEventListener('click', closePromptModal);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !promptModal.classList.contains('hidden')) closePromptModal();
+});
+
+
 // ── Library (papers + notes/records) ─────────────────────────────────────
 
 const papersMenuItem = document.getElementById('papers-menu-item');

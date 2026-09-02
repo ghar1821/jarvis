@@ -56,8 +56,9 @@ vault_path = "~/Documents/obsidian"          # your notes; must exist
 [auth]
 openrouter_api_key = "sk-or-..."             # or the OPENROUTER_API_KEY env var
 
-# Models offered in the picker. Jarvis ships no vendor list of its own —
-# `uv run kb models --refresh` fills this in from OpenRouter's own index.
+# Models offered in the picker. Optional — whatever you set as
+# openrouter_model already appears there, and the picker has a box for
+# typing any model id that is not listed.
 [models]
 openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
 ```
@@ -222,54 +223,33 @@ Preview needs nothing extra. Compiling `.tex` needs a LaTeX distribution
 (MacTeX, TeX Live). Exporting Markdown as PDF needs `pandoc` on top of that.
 Buttons for a missing tool stay hidden rather than sitting there broken.
 
-### Skills — teaching it how you like things done
+### Editing the prompts
 
-A skill is a set of instructions you write once, in plain English, that the
-assistant follows whenever a matching task comes up — so you stop
-re-explaining your own process every time.
+Everything jarvis asks a model to do comes from three prompts, and all three
+are yours to change: ⋮ → **Edit prompts…**
 
-Say your methods sections always need to cite the pipeline version and name
-which dataset each figure came from. Write that down once as a skill, and you
-never have to say it again.
+| Prompt | What it controls |
+|---|---|
+| Assistant instructions | How the chat agent behaves — when it searches, how it cites |
+| Paper summary | How a paper is summarised when you add one |
+| Digest scoring | Which papers the weekly digest thinks matter |
 
-A skill is just a folder with a `SKILL.md` in it:
+The repo ships a generic default for each. Your editable copy lives in
+`~/.jarvis/prompts/` and is created the first time jarvis runs, so the shipped
+default is never overwritten and **Revert to default** always has something
+clean to go back to. Edits apply to your next message — no restart.
 
-```
-~/.jarvis/skills/
-└── methods-section/
-    ├── SKILL.md          # the instructions
-    └── template.tex      # any file the instructions refer to
-```
+The scoring one is worth your time if you turn the digest on. It ships with a
+placeholder research-context section, and what you write there is what decides
+which papers score well. Be specific.
 
-```markdown
----
-description: Draft a methods section the way I write them.
----
+### Seeing what jarvis loaded
 
-# Methods sections
-
-1. Read the project note for the work being described.
-2. Cite the pipeline version from its frontmatter — never say "the latest".
-3. Name the dataset behind every figure.
-4. Past tense, no first person, no hedging about future work.
-```
-
-The folder name is the skill's name. The `description` is all the assistant
-sees up front; it only loads the full instructions once a task actually
-matches, so having twenty skills sitting around costs nothing until one gets
-used. Delete the folder and the skill is gone.
-
-These are your own files. Nothing about them gets indexed, and nothing leaves
-your machine any more than the rest of a conversation already would.
-
-Two worked examples live in [`examples/skills/`](examples/skills/) — copy a
-folder into `~/.jarvis/skills/` to try them:
-
-- **`draft-from-notes`** — writes a paper or report section from your notes
-  and indexed papers, and tells you where the gaps are rather than papering
-  over them.
-- **`tailor-document`** — reshapes an existing document for a specific
-  target, using evidence pulled from your own records.
+The webapp prints its configuration on startup, and ⋮ → **Show config…**
+shows the same thing in the browser. Both report the values actually in
+effect — after the file *and* any environment variables — which is usually
+what you want to know when a setting seems to be ignored. API keys show as
+`set` or `not set`, never their value.
 
 ---
 
@@ -361,21 +341,16 @@ openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5", "openrouter/auto"]
 
 ```bash
 uv run kb models              # what's on offer right now (no network)
-uv run kb models --refresh    # pull OpenRouter's full catalogue into [models]
 ```
 
-`--refresh` is optional and only for browsing. It writes OpenRouter's model
-ids into your config so you can click one instead of typing it — the only
-place jarvis ever fetches a model list, and the picker itself never touches
-the network. Write two or three in by hand instead if you'd rather; a picker
-with three hundred rows is worse than one with the handful you actually use.
+That makes no network call — it reads your config, so it doubles as the
+quickest check that the file is being picked up and which providers have a
+key.
 
-Editing the config needs a webapp restart before the picker sees the change.
-Switching between models already listed doesn't.
-
-The list is a convenience, not a restriction — the picker also has a box for
+The list is a convenience, not a restriction: the picker also has a box for
 typing any model id OpenRouter accepts, listed or not, applied to the current
-conversation without touching your config at all.
+conversation without touching your config. Keep `[models]` to the handful you
+actually switch between.
 
 OpenRouter's auto router is just a model id, so automatic routing needs
 nothing built for it: set `openrouter_model = "openrouter/auto"` (or add it
@@ -499,7 +474,7 @@ uv run kb drafts               # list, with expiry
 uv run kb drafts --prune --dry-run
 
 # Models
-uv run kb models [--refresh]
+uv run kb models
 ```
 
 Everything lives under `~/.jarvis/`: `config.toml`, your index, sessions,

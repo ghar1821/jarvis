@@ -45,6 +45,8 @@
       <div id="header-menu" class="hidden">
         <button id="model-menu-item">Switch model…</button>
         <button id="style-menu-item">Set response style…</button>
+        <button id="prompts-menu-item">Edit prompts…</button>
+        <button id="config-menu-item">Show config…</button>
         <button id="papers-menu-item">Library…</button>
         <button id="proposals-menu-item">Discard pending suggestions…</button>
       </div>
@@ -128,6 +130,46 @@
       <div class="modal-actions">
         <button id="style-cancel">Cancel</button>
         <button id="style-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- What jarvis actually loaded, not what the file says — the two differ
+       whenever an env var is in play, and that gap is the usual reason a
+       setting "does not work". Read-only: editing happens in the file. -->
+  <div id="config-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box modal-wide">
+      <label>Configuration</label>
+      <div class="modal-note">
+        The values in effect right now, after the config file and any
+        environment variables. Edit <code>~/.jarvis/config.toml</code> and
+        restart to change them.
+      </div>
+      <div id="config-body"></div>
+      <div class="modal-actions">
+        <span class="modal-spacer"></span>
+        <button id="config-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- The prompts jarvis sends to a model. Editing writes to the copy under
+       ~/.jarvis/prompts/, never to the repo, so Revert always has something
+       clean to go back to. -->
+  <div id="prompt-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box modal-wide">
+      <label for="prompt-picker">Prompts</label>
+      <select id="prompt-picker"></select>
+      <div id="prompt-note" class="modal-note"></div>
+      <textarea id="prompt-text" spellcheck="false"></textarea>
+      <div id="prompt-status" class="prompt-status"></div>
+      <div class="modal-actions">
+        <button id="prompt-reset">Revert to default</button>
+        <span class="modal-spacer"></span>
+        <button id="prompt-cancel">Cancel</button>
+        <button id="prompt-save">Save</button>
       </div>
     </div>
   </div>

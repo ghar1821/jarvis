@@ -933,6 +933,80 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .model-custom input[type="text"]:focus { outline: none; border-color: var(--accent); }
 
+/* ── Config viewer ───────────────────────────────────────────────────────
+   A key/value dump, so the values line up in a column you can scan down. */
+#config-body {
+  max-height: 58vh;
+  overflow-y: auto;
+  margin: 4px 0 2px;
+}
+
+.config-section {
+  margin: 14px 0 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.config-section:first-child { margin-top: 4px; }
+
+.config-table {
+  display: grid;
+  grid-template-columns: minmax(140px, max-content) 1fr;
+  gap: 3px 16px;
+  font-size: 0.8rem;
+}
+.config-key { color: var(--text-dim); }
+.config-value {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+/* ── Prompt editor ───────────────────────────────────────────────────────
+   A prompt is a page of text, not a sentence, so this modal is wider than the
+   others and the textarea gets real room. */
+.modal-wide { width: min(780px, 92vw); }
+.modal-spacer { flex: 1; }
+
+#prompt-picker {
+  width: 100%;
+  padding: 7px 9px;
+  margin-bottom: 8px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+#prompt-picker:focus { outline: none; border-color: var(--accent); }
+
+#prompt-text {
+  width: 100%;
+  min-height: 46vh;
+  padding: 10px 12px;
+  /* Monospace: these carry {placeholders} and JSON the model must copy
+     exactly, and proportional text hides a missing brace. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+}
+#prompt-text:focus { outline: none; border-color: var(--accent); }
+
+.prompt-status {
+  margin: 6px 0 2px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
 /* ── Modal notes ──────────────────────────────────────────────────────── */
 
 .modal-note {

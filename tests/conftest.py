@@ -69,6 +69,18 @@ def store(embeddings):
 
 
 @pytest.fixture(autouse=True)
+def _prompts_never_seed_into_the_real_home(tmp_path_factory, monkeypatch):
+    """
+    Building a system prompt seeds ~/.jarvis/prompts/ on first use, so a test
+    that does it without isolating CONFIG_FILE writes into the developer's own
+    home. Point every test at a throwaway directory; a test that wants to
+    assert on the copies overrides CONFIG_FILE itself and still lands in tmp.
+    """
+    home = tmp_path_factory.mktemp("jarvis-home")
+    monkeypatch.setattr("jarvis.core.config.CONFIG_FILE", home / "config.toml")
+
+
+@pytest.fixture(autouse=True)
 def _never_touch_the_real_jarvis_home():
     """
     Fail any test that writes into the developer's own ~/.jarvis.
@@ -85,6 +97,9 @@ def _never_touch_the_real_jarvis_home():
     """
     watched = [
         Path.home() / ".jarvis" / "drafts",
+        # Prompt copies are seeded on first use, so any test that builds a
+        # system prompt without isolating CONFIG_FILE writes here.
+        Path.home() / ".jarvis" / "prompts",
     ]
 
     def snapshot():

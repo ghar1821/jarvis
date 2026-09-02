@@ -16,7 +16,7 @@ Subcommands:
   index-vault       Incrementally update vault index; --force clears first
   reindex           Re-embed all chunks with the configured embed_model
   doctor            Diagnose knowledge base health (embed model, corruption)
-  models            List switchable models; --refresh pulls OpenRouter's index
+  models            List the switchable models your config offers
   schema            Show which metadata keys/values exist (your record ontology)
   drafts            List drafts; --prune removes stale ones
   sync-status       Show jarvis-sync daemon health and last job outcomes
@@ -40,7 +40,6 @@ Usage examples:
   uv run kb reindex
   uv run kb doctor
   uv run kb models
-  uv run kb models --refresh
 """
 
 import argparse
@@ -349,8 +348,11 @@ def cmd_stats() -> None:
             )
             for src in private_sources:
                 print(f"   - {src}")
-    except Exception:
-        pass
+    except Exception as exc:
+        # This check is advisory, so a failure should not take `kb stats`
+        # down — but it must say it did not run, or a silent skip reads as
+        # "you have no legacy private papers".
+        print(f"\n⚠️  Could not check for legacy private papers: {exc}", file=sys.stderr)
 
 
 def _resolve_local_file(source: str, meta: dict) -> "Path | None":
@@ -446,8 +448,14 @@ def cmd_index_vault(args: argparse.Namespace) -> None:
             if ids_to_delete:
                 store.delete(ids_to_delete)
                 print(f"  Cleared {len(ids_to_delete)} chunks", flush=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # --force promises a clean rebuild. Indexing on top of a store we
+            # failed to clear gives the opposite — the stale chunks the user
+            # asked to be rid of, silently kept. Stop instead.
+            print(f"\n✗ Could not clear the existing vault index: {exc}", file=sys.stderr)
+            print("  --force cannot rebuild cleanly on top of this. Run "
+                  "`uv run kb doctor` to diagnose the store first.", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Indexing vault: {vault}", flush=True)
     added, updated, deleted = refresh_vault(vault, store)
@@ -718,28 +726,18 @@ def cmd_schema(args: argparse.Namespace) -> None:
 
 def cmd_models(args: argparse.Namespace) -> None:
     """
-    Show the switchable model catalogue, or refresh the OpenRouter half of it.
+    Show the switchable model catalogue as the config defines it.
 
-    --refresh is the only place jarvis fetches a model list, and it writes the
-    result into [models] in config.toml so the picker itself never needs the
-    network. jarvis ships no vendor model list of its own.
+    Makes no network call, so it doubles as the quickest check that the config
+    file is being read at all, and which providers have credentials.
     """
-    from jarvis.chat.models import list_catalogue, refresh_openrouter_catalogue
-    from jarvis.core.config import get_config, set_config_value
+    from jarvis.chat.models import list_catalogue
+    from jarvis.core.config import get_config
 
     cfg = get_config()
-
-    if args.refresh:
-        ids = refresh_openrouter_catalogue(cfg)
-        set_config_value("models", "openrouter", ids)
-        print(f"Wrote {len(ids)} OpenRouter model(s) to [models] openrouter in config.toml.")
-        print("Restart the webapp to see them in the picker.")
-        return
-
     entries = list_catalogue(cfg)
     if not entries:
         print("No models configured. Add them under [models] in ~/.jarvis/config.toml,")
-        print("or populate the OpenRouter list with: uv run kb models --refresh")
         return
     for entry in entries:
         where = "local" if entry["local"] else "cloud"
@@ -1015,12 +1013,7 @@ def main() -> None:
     sub.add_parser("doctor", help="Diagnose knowledge base health (embed model, corruption)")
 
     # models
-    p_models = sub.add_parser("models", help="List switchable models; --refresh pulls OpenRouter's index")
-    p_models.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Fetch OpenRouter's model list and write it into [models] in config.toml",
-    )
+    p_models = sub.add_parser("models", help="List the switchable models your config offers")
 
     # drafts
     p_drafts = sub.add_parser("drafts", help="List drafts; --prune sweeps stale ones")

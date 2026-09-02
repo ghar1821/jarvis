@@ -30,10 +30,16 @@ from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from jarvis.core import transcript
-from jarvis.core.config import CONFIG_FILE, get_config, load_config, reset_config, set_config_value
+from jarvis.core.config import (
+    CONFIG_FILE,
+    get_config,
+    load_config,
+    redact_secrets,
+    reset_config,
+    set_config_value,
+)
 from jarvis.core.errors import AuthenticationError, LLMError, PrivacyError
 from jarvis.chat.chat import (
-    READ_SKILL_TOOL,
     TOOLS,
     USE_OWN_KNOWLEDGE_TOOL,
     _auto_refresh_vault,
@@ -57,7 +63,6 @@ from jarvis.chat.sessions import (
     session_cost_usd,
     set_pinned,
 )
-from jarvis.chat.skills import list_skills
 
 _ROOT = Path(__file__).parent
 cfg = get_config()
@@ -142,8 +147,6 @@ def _clear_pending_for(session_id: str) -> None:
 
 def _build_tools(kb_only: bool) -> list[dict]:
     tools = list(TOOLS)
-    if list_skills(cfg.skills_dir):
-        tools.append(READ_SKILL_TOOL)
     if not kb_only:
         tools.append(USE_OWN_KNOWLEDGE_TOOL)
     return tools
@@ -152,7 +155,7 @@ def _build_tools(kb_only: bool) -> list[dict]:
 def _live_config():
     """
     Config as the file says right now, not as it said when this process
-    started — so `kb models --refresh` or a hand-edit shows up on the next
+    started — so a hand-edit of the config shows up on the next
     picker open instead of needing a restart.
 
     Returned as a local rather than through the process-wide singleton:
@@ -162,7 +165,11 @@ def _live_config():
     """
     try:
         return load_config(CONFIG_FILE)
-    except Exception:
+    except Exception as exc:
+        # Falling back keeps the picker populated rather than emptying it over
+        # a typo — but a config being ignored is the single most confusing
+        # failure there is, so it says so.
+        log.warning("could not re-read %s, using the config from startup: %s", CONFIG_FILE, exc)
         return cfg
 
 
@@ -183,6 +190,13 @@ def _provider_for(spec: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Seed the editable prompt copies on first run, so they exist under
+    # ~/.jarvis/prompts/ before anyone opens the editor looking for them.
+    from jarvis.core.prompts import ensure_all
+
+    for name in ensure_all():
+        log.info("created %s from the shipped default", name)
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _auto_refresh_vault, _vault)
     _session["session"] = new_session(cfg.provider, kb_only=True)
@@ -254,6 +268,10 @@ class RevealRequest(BaseModel):
     file: str
 
 
+class PromptRequest(BaseModel):
+    text: str
+
+
 class RestoreVersionRequest(BaseModel):
     draft_id: str
     file: str
@@ -322,15 +340,73 @@ async def info() -> dict:
     }
 
 
+@app.get("/config/summary")
+async def config_summary() -> dict:
+    """
+    The loaded configuration, grouped for display, with secrets reduced to
+    set/not set. Read fresh so an edited file shows up without a restart, the
+    same as the model picker.
+    """
+    from jarvis.core.config import describe
+
+    return {"sections": describe(_live_config())}
+
+
+@app.get("/prompts")
+async def prompts_index() -> dict:
+    """Every editable prompt, with whether it has been changed from default."""
+    from jarvis.core.prompts import listing
+
+    return {"prompts": listing()}
+
+
+@app.get("/prompts/{name}")
+async def prompt_get(name: str) -> dict:
+    """One prompt's current text, creating the copy if this is the first look."""
+    from jarvis.core.prompts import PromptError, is_customised, load
+
+    try:
+        return {"name": name, "text": load(name), "customised": is_customised(name)}
+    except PromptError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/prompts/{name}")
+async def prompt_save(name: str, req: PromptRequest) -> dict:
+    """
+    Replace the user's copy. Takes effect on the next turn — the system prompt
+    is rebuilt per turn and the others are read per call, so nothing caches a
+    stale version until a restart.
+    """
+    from jarvis.core.prompts import PromptError, is_customised, save
+
+    try:
+        save(name, req.text)
+    except PromptError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"name": name, "customised": is_customised(name)}
+
+
+@app.post("/prompts/{name}/reset")
+async def prompt_reset(name: str) -> dict:
+    """Put the shipped default back, and hand back the text it restored."""
+    from jarvis.core.prompts import PromptError, reset
+
+    try:
+        return {"name": name, "text": reset(name), "customised": False}
+    except PromptError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @app.get("/models")
 async def models_index() -> dict:
     """
     The switchable catalogue for the picker, read from config only — this
     route never touches the network, so opening the UI makes no outbound
-    request. Refresh the OpenRouter half with `uv run kb models --refresh`.
+    request.
 
-    Config is re-read per call (see _live_config), so `kb models --refresh` or
-    a hand-edit shows up on the next open without a restart.
+    Config is re-read per call (see _live_config), so a hand-edit shows up on
+    the next open without a restart.
     """
     from jarvis.chat.models import list_catalogue
 
@@ -676,6 +752,30 @@ async def discard_edit(req: ApplyEditRequest) -> dict:
     return {"ok": True}
 
 
+def _file_manager_command(path: "Path", platform: str) -> list:
+    """
+    The argv that shows `path` in this platform's file manager.
+
+    Always a list, never a string, so nothing goes through a shell.
+
+    macOS and Windows can both *reveal* a file — highlight it in a window
+    without opening it. Linux has no portable equivalent: `xdg-open` on a file
+    hands it to whatever application claims the extension, and opening a `.tex`
+    the model wrote in an editor of the OS's choosing is not a decision this
+    should make. So Linux opens the containing folder instead, which is the
+    same intent minus the highlight.
+
+    Windows wants `/select,<path>` as ONE argument. Splitting it in two, which
+    this used to do, leaves explorer with a `/select,` naming nothing — it
+    opens the folder and silently fails to select.
+    """
+    if platform == "darwin":
+        return ["open", "-R", str(path)]
+    if platform == "win32":
+        return ["explorer", f"/select,{path}"]
+    return ["xdg-open", str(path.parent)]
+
+
 @app.post("/reveal")
 async def reveal(req: RevealRequest) -> dict:
     """
@@ -701,13 +801,7 @@ async def reveal(req: RevealRequest) -> dict:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"No file {req.file!r} in that draft")
 
-    # -R reveals the file in Finder rather than opening it in whatever
-    # application claims the extension. Opening a .tex the model wrote in an
-    # editor of the OS's choosing is not something this should decide to do.
-    command = {
-        "darwin": ["open", "-R", str(path)],
-        "win32": ["explorer", "/select,", str(path)],
-    }.get(sys.platform, ["xdg-open", str(path.parent)])
+    command = _file_manager_command(path, sys.platform)
 
     try:
         subprocess.run(command, check=False, timeout=10)
@@ -1018,7 +1112,6 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     system = build_system_prompt(
         kb_only=session.kb_only,
         response_style=_session["response_style"],
-        skills=list_skills(cfg.skills_dir),
     )
 
     # Dialogs left over from a previous turn on THIS session are no longer
@@ -1083,8 +1176,11 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
             try:
                 maybe_compact(session, provider, get_config())
-            except LLMError:
-                pass  # compaction is best-effort; the turn itself may still work
+            except LLMError as exc:
+                # Best-effort: the turn still works uncompacted. But if this
+                # keeps failing the context grows without bound and turns get
+                # slower and dearer for no visible reason.
+                log.warning("compaction failed, continuing uncompacted: %s", exc)
 
             session.turn_starts.append(len(session.messages))
             session.messages.append(transcript.user_message(req.message))
@@ -1110,7 +1206,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             save_session(session, store=get_store())
         except LLMError as exc:
             log.exception("chat turn failed with an LLM error")
-            reply = f"⚠️ {exc}"
+            # Second layer. The provider already scrubs its own messages, but
+            # this reply is written to the session file and indexed as a chat
+            # chunk, so anything reaching it gets checked again.
+            reply = redact_secrets(f"⚠️ {exc}")
             session.display.append({"role": "assistant", "content": reply, "tool_calls": tool_calls_log})
             save_session(session)
         except Exception as exc:
@@ -1119,7 +1218,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # losing it) and still hand the browser a usable reply instead of
             # leaving the "Working..." placeholder stuck forever.
             log.exception("chat turn crashed unexpectedly")
-            reply = f"⚠️ Internal error: {exc}"
+            reply = redact_secrets(f"⚠️ Internal error: {exc}")
             session.display.append({"role": "assistant", "content": reply, "tool_calls": tool_calls_log})
             save_session(session)
         finally:

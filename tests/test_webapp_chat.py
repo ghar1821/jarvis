@@ -683,3 +683,59 @@ def test_info_leaves_served_empty_for_an_ordinary_model(wired_session):
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
 
     assert client.get("/info").json()["served"] == ""
+
+
+def test_config_summary_route_reports_the_loaded_config(wired_session, monkeypatch):
+    """The ⋮ → Show config… view. Grouped, resolved, and never showing a key."""
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    secret = "sk-or-v1-NEVER-RENDER-THIS"
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(
+        provider="openrouter",
+        openrouter_model="anthropic/claude-sonnet-4.6",
+        openrouter_api_key=secret,
+    ))
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    sections = client.get("/config/summary").json()["sections"]
+    flat = " ".join(v["value"] for s in sections for v in s["values"])
+
+    assert secret not in flat, "the route must never serve an API key"
+    assert "set" in {v["value"] for s in sections
+                     if s["section"] == "Credentials" for v in s["values"]}
+    chat = {v["key"]: v["value"] for s in sections
+            if s["section"] == "Chat" for v in s["values"]}
+    assert chat["provider"] == "openrouter"
+    assert chat["openrouter_model"] == "anthropic/claude-sonnet-4.6"
+
+
+def test_config_summary_is_read_fresh(wired_session, monkeypatch):
+    """An edited config shows up without restarting, same as the picker."""
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(provider="ollama"))
+    before = client.get("/config/summary").json()
+
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(provider="anthropic"))
+    after = client.get("/config/summary").json()
+
+    provider = lambda body: next(
+        v["value"] for s in body["sections"] if s["section"] == "Chat"
+        for v in s["values"] if v["key"] == "provider"
+    )
+    assert provider(before) == "ollama"
+    assert provider(after) == "anthropic"
+
+
+def test_no_chat_tool_can_read_the_config():
+    """
+    The config names paths and, indirectly, whether keys exist. Reading it is
+    a human action; a tool for it is one more thing an injection could aim at.
+    """
+    from jarvis.chat.chat import TOOLS
+
+    names = {tool["function"]["name"] for tool in TOOLS}
+    assert not [n for n in names if "config" in n]

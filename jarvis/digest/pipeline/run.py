@@ -17,7 +17,14 @@ from ..biorxiv.fetch import fetch_biorxiv, fetch_biorxiv_keywords
 from .format import format_digest
 from .score import filter_and_score
 
-PROMPT_PATH = Path(__file__).parent / "prompts" / "prompt_filter_score.md"
+
+def scoring_prompt_path():
+    """The user's editable scoring prompt, created from the default if absent."""
+    from jarvis.core.prompts import load, user_path
+
+    load("digest_scoring")          # seeds the copy on first run
+    return user_path("digest_scoring")
+
 
 
 def _summary_fallback(paper: dict, selected: dict, store) -> str:
@@ -230,7 +237,7 @@ def main(argv: "list[str] | None" = None) -> None:
     print(f"  {len(all_papers)} unique papers", flush=True)
 
     print("Asking LLM to filter and score...", flush=True)
-    result = filter_and_score(all_papers, provider, cfg.max_results, PROMPT_PATH)
+    result = filter_and_score(all_papers, provider, cfg.max_results, scoring_prompt_path())
     selected = result["selected"]
     print(f"  {len(selected)} papers selected", flush=True)
 

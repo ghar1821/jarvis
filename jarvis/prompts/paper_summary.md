@@ -10,6 +10,6 @@ Use these sections:
 
 **Limitations**: What the paper does not address
 
-**Relevance to AI Research**: Connection to current AI/ML research directions
+**Relevance**: How this connects to the reader's own field and current work
 
 Paper title: {title}

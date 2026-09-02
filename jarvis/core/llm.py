@@ -117,7 +117,6 @@ class ChatProvider(Protocol):
 
 # ── Prompt loading ─────────────────────────────────────────────────────────────
 
-_SUMMARY_PROMPT: str | None = None
 
 # Shared by both providers' describe_image(), so figure captions read the same
 # regardless of which model produced them. {context} is the document title.
@@ -132,12 +131,11 @@ _FIGURE_CAPTION_PROMPT = (
 
 
 def _get_summary_prompt() -> str:
-    global _SUMMARY_PROMPT
-    if _SUMMARY_PROMPT is None:
-        _SUMMARY_PROMPT = (
-            Path(__file__).parent.parent / "kb" / "prompts" / "paper_summary.md"
-        ).read_text()
-    return _SUMMARY_PROMPT
+    # Not cached: the user can edit this from the UI mid-session, and a stale
+    # module global would keep sending the old wording until a restart.
+    from .prompts import load as _load_prompt
+
+    return _load_prompt("paper_summary")
 
 
 def _message_to_dict(message) -> dict:
@@ -184,7 +182,7 @@ class OllamaProvider:
             response = client.chat(model=self.model, messages=messages, options=options)
             return response["message"]["content"] or ""
         except Exception as exc:
-            raise LLMError(f"Ollama complete failed: {exc}") from exc
+            raise LLMError(_redact(f"Ollama complete failed: {exc}")) from exc
 
     def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
@@ -220,7 +218,7 @@ class OllamaProvider:
             try:
                 response = client.chat(model=self.model, messages=full, tools=tools)
             except Exception as exc:
-                raise LLMError(f"Ollama agentic turn failed: {exc}") from exc
+                raise LLMError(_redact(f"Ollama agentic turn failed: {exc}")) from exc
 
             message = response["message"]
             tool_calls = getattr(message, "tool_calls", None) or []
@@ -266,7 +264,7 @@ class OllamaProvider:
             )
             return response["message"]["content"] or ""
         except Exception as exc:
-            raise LLMError(f"Ollama describe_image failed: {exc}") from exc
+            raise LLMError(_redact(f"Ollama describe_image failed: {exc}")) from exc
 
     def pop_usage(self) -> "dict | None":
         """Nothing to report: the model runs on the user's own hardware."""
@@ -337,7 +335,7 @@ class AnthropicProvider:
             )
             return next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:
-            raise LLMError(f"Anthropic complete failed: {exc}") from exc
+            raise LLMError(_redact(f"Anthropic complete failed: {exc}")) from exc
 
     def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
@@ -365,7 +363,7 @@ class AnthropicProvider:
             )
             return next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:
-            raise LLMError(f"Anthropic summarize failed: {exc}") from exc
+            raise LLMError(_redact(f"Anthropic summarize failed: {exc}")) from exc
 
     def agentic_turn(
         self,
@@ -394,7 +392,7 @@ class AnthropicProvider:
                     tools=anthropic_tools,
                 )
             except Exception as exc:
-                raise LLMError(f"Anthropic agentic turn failed: {exc}") from exc
+                raise LLMError(_redact(f"Anthropic agentic turn failed: {exc}")) from exc
 
             if response.stop_reason == "end_turn":
                 reply = next((b.text for b in response.content if b.type == "text"), "")
@@ -448,7 +446,7 @@ class AnthropicProvider:
             )
             return next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:
-            raise LLMError(f"Anthropic describe_image failed: {exc}") from exc
+            raise LLMError(_redact(f"Anthropic describe_image failed: {exc}")) from exc
 
     def pop_usage(self) -> "dict | None":
         """
@@ -460,6 +458,20 @@ class AnthropicProvider:
 
 
 # ── OpenRouter adapter ─────────────────────────────────────────────────────────
+
+
+def _redact(text: str) -> str:
+    """
+    Strip any configured API key out of an error message.
+
+    An SDK can quote the credential it failed with, and the caller writes that
+    text to the user's screen, the chat log, and the saved session — so it has
+    to be scrubbed here, at the point the exception becomes a message, rather
+    than at each of the places it lands.
+    """
+    from .config import redact_secrets
+
+    return redact_secrets(text)
 
 
 def _openrouter_extra_body(cfg: "Config") -> dict:
@@ -535,7 +547,7 @@ class OpenRouterProvider:
                 model=self.model, extra_body=_openrouter_extra_body(get_config()), **kwargs
             )
         except Exception as exc:
-            raise LLMError(f"OpenRouter request failed: {exc}") from exc
+            raise LLMError(_redact(f"OpenRouter request failed: {exc}")) from exc
         self._record_usage(response)
         return response
 

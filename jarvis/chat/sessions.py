@@ -30,6 +30,10 @@ from pathlib import Path
 from jarvis.core import transcript as transcript_module
 from jarvis.core.errors import PrivacyError
 
+from jarvis.core.logs import get_logger
+
+log = get_logger(__name__)
+
 SESSIONS_DIR = Path.home() / ".jarvis" / "sessions"
 MAX_UNPINNED_SESSIONS = 50
 TITLE_MAX_CHARS = 60
@@ -235,7 +239,11 @@ def list_sessions(sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
     for session_file in sessions_dir.glob("*.json"):
         try:
             payload = json.loads(session_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            # Skipping keeps the sidebar working, but a session silently
+            # missing from the list is exactly the thing you would want a log
+            # line for when you go looking for a conversation.
+            log.warning("skipping unreadable session %s: %s", session_file.name, exc)
             continue
         entries.append({
             "id": payload.get("id", session_file.stem),
