@@ -1500,7 +1500,7 @@ to.
 
 **Theme and layout.** Dark theme only — a single palette via CSS custom
 properties, no toggle. Chat bubbles cap line length at `min(80ch, 100%)`.
-The header carries a ⋮ menu → "Set response style…" modal, prefilled from
+The header carries a ⋮ menu → "Set response style" modal, prefilled from
 `GET /settings`; Save posts, Cancel/Esc/backdrop closes. Each sidebar
 session row has a ✎ rename button (a `prompt()` → `POST
 /sessions/{id}/rename`) alongside pin and delete.
@@ -1510,7 +1510,7 @@ session row has a ✎ rename button (a `prompt()` → `POST
 to KB tools; off means `kb_only=False` and `USE_OWN_KNOWLEDGE_TOOL` is added
 to the tools list.
 
-**Library.** A ⋮ menu → "Library…" modal, with a Papers / Notes & records
+**Library.** A ⋮ menu → "Library" modal, with a Papers / Notes & records
 switch that re-fetches per kind, since the two carry different identifying
 fields and the table columns follow the kind rather than flattening both
 into one shape. Notes are **read-only here** — a note's KB entry is derived
@@ -1699,7 +1699,7 @@ Proposals live in `_proposals`, a dict in the webapp process, so they don't
 survive a restart — which is also the coarse way to clear them. Within one
 run, `GET /proposals` makes them findable again: opening a file restores a
 diff the user navigated away from, a ✎ marks the tab, and ⋮ → Discard
-pending suggestions… clears them all.
+pending suggestions clears them all.
 
 ### `workspace.py`
 

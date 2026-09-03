@@ -67,8 +67,7 @@ function switchDraft(newId) {
 
 // ── Startup ──────────────────────────────────────────────────────────────
 
-// The active session's model, spend, and vault path.
-let vaultPath = '';
+// The active session's model and spend.
 let servedModel = '';      // what a router actually picked, when it differs
 let costByModel = {};      // per-model spend, shown as the cost tooltip
 
@@ -96,18 +95,14 @@ function renderHeader() {
   const cost = document.getElementById('header-cost');
   cost.classList.toggle('hidden', !(currentCost > 0));
   if (currentCost > 0) {
-    cost.textContent = `$${currentCost.toFixed(4)}`;
+    cost.textContent = `$${currentCost.toFixed(4)} USD`;
     // Which models the money actually went to — the useful breakdown when a
     // router has been picking a different one each turn.
     const lines = Object.entries(costByModel)
       .sort((a, b) => (b[1].usd || 0) - (a[1].usd || 0))
-      .map(([spec, e]) => `${shortModel(spec)}  $${(e.usd || 0).toFixed(4)}  (${e.requests || 0} req)`);
-    cost.title = lines.length ? `Spend this session\n\n${lines.join('\n')}` : '';
+      .map(([spec, e]) => `${shortModel(spec)}  $${(e.usd || 0).toFixed(4)} USD  (${e.requests || 0} req)`);
+    cost.title = lines.length ? `Spend this session (USD)\n\n${lines.join('\n')}` : '';
   }
-
-  const vault = document.getElementById('header-vault');
-  vault.textContent = vaultPath;
-  vault.title = vaultPath;
 }
 
 // /info reports the ACTIVE session's model and spend, so this has to run
@@ -116,12 +111,11 @@ function renderHeader() {
 async function refreshHeader() {
   const response = await fetch('/info');
   if (!response.ok) return;
-  const { provider, served, cost_usd, cost_by_model, vault } = await response.json();
+  const { provider, served, cost_usd, cost_by_model } = await response.json();
   currentModel = provider;
   servedModel = served || '';
   currentCost = cost_usd || 0;
   costByModel = cost_by_model || {};
-  vaultPath = vault;
   renderHeader();
 }
 
@@ -624,7 +618,7 @@ const headerMenu   = document.getElementById('header-menu');
 const styleModal   = document.getElementById('style-modal');
 const styleTextarea = document.getElementById('style-textarea');
 
-// Open/close the ⋮ dropdown; a click anywhere else closes it.
+// Open/close the tools dropdown; a click anywhere else closes it.
 menuBtn.addEventListener('click', e => {
   e.stopPropagation();
   headerMenu.classList.toggle('hidden');
@@ -861,7 +855,7 @@ async function showPrompt(name) {
   promptText.value = text;
   const entry = promptMeta.find(p => p.name === name);
   promptNote.textContent = entry ? entry.description : '';
-  setPromptStatus(customised ? 'Edited — differs from the shipped default.' : 'Unchanged from the shipped default.');
+  setPromptStatus(customised ? 'Edited — differs from the default.' : '');
 }
 
 function setPromptStatus(message) {
@@ -889,7 +883,7 @@ document.getElementById('prompt-save').addEventListener('click', async () => {
 document.getElementById('prompt-reset').addEventListener('click', async () => {
   const name = promptPicker.value;
   const entry = promptMeta.find(p => p.name === name);
-  if (!confirm(`Revert "${entry ? entry.title : name}" to the shipped default?\n\nYour edits to this prompt are discarded.`)) return;
+  if (!confirm(`Revert "${entry ? entry.title : name}" to the default?\n\nYour edits to this prompt are discarded.`)) return;
 
   const response = await fetch(`/prompts/${name}/reset`, { method: 'POST' });
   if (!response.ok) {
@@ -901,7 +895,7 @@ document.getElementById('prompt-reset').addEventListener('click', async () => {
   promptText.value = text;
   if (entry) entry.customised = false;
   promptPicker.selectedOptions[0].textContent = entry ? entry.title : name;
-  setPromptStatus('Reverted to the shipped default.');
+  setPromptStatus('Reverted to the default.');
 });
 
 function closePromptModal() {
@@ -2483,7 +2477,7 @@ function setEditorOpen(open) {
   editorView.classList.toggle('hidden', !open);
   const button = document.getElementById('view-btn');
   button.classList.toggle('active', open);
-  button.textContent = open ? 'Hide editor' : 'Editor';
+  button.textContent = open ? 'Hide editor' : 'Show editor';
   if (open) {
     loadDrafts();
     // CodeMirror measures wrong if it was built while hidden.

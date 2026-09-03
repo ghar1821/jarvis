@@ -90,6 +90,16 @@ feature you switch on rather than the thing the daemon is built around.
   If `openrouter/auto` model is used, then the model name that is handling
   the prompt is showed (PR #1).
 
+- Further UI polish (PR #1):
+  - Dropped the vault path from the header.
+  - The header's ⋮ button is replaced with a plain wrench icon.
+  - Dropped the trailing "…" from every item in the ⋮ menu.
+  - The editor toggle button now reads "Show editor" / "Hide editor"
+    instead of "Editor" / "Hide editor".
+  - Remove some captions from the prompt editor page.
+  - Add icons to the UI header's next to cost and model name.
+  - Add explicit "USD" next to cost.
+
 ### BUG FIXES
 
 - Fix errors being silently swallowed in thirteen places. Exceptions were

@@ -192,7 +192,7 @@ log underneath when it fails); both export to PDF.
 - When the assistant proposes a change, you get a diff with a checkbox per
   hunk — accept some, reject others, and only what you tick gets written. A ✎
   on a tab means a suggestion is still waiting there; open the file and it
-  comes back. ⋮ → **Discard pending suggestions…** clears the lot at once, and
+  comes back. ⋮ → **Discard pending suggestions** clears the lot at once, and
   they clear themselves whenever you restart the app.
 - Drafts expire after 30 days untouched. `uv run kb drafts` shows how long
   each has left; **Keep** exempts one for good. Set
@@ -226,7 +226,7 @@ Buttons for a missing tool stay hidden rather than sitting there broken.
 ### Editing the prompts
 
 Everything jarvis asks a model to do comes from three prompts, and all three
-are yours to change: ⋮ → **Edit prompts…**
+are yours to change: ⋮ → **Edit prompts**
 
 | Prompt | What it controls |
 |---|---|
@@ -245,7 +245,7 @@ which papers score well. Be specific.
 
 ### Seeing what jarvis loaded
 
-The webapp prints its configuration on startup, and ⋮ → **Show config…**
+The webapp prints its configuration on startup, and ⋮ → **Show config**
 shows the same thing in the browser. Both report the values actually in
 effect — after the file *and* any environment variables — which is usually
 what you want to know when a setting seems to be ignored. API keys show as
@@ -325,7 +325,7 @@ paper "with figures."
 
 ## Choose a model
 
-Switch mid-conversation without losing the thread: **⋮ → Switch model…**. It
+Switch mid-conversation without losing the thread: **⋮ → Switch model**. It
 applies from your next message, per conversation, so two sessions can run
 different models at once. The header shows the active model and what the
 session has cost so far.

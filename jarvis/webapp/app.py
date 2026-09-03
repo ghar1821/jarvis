@@ -336,7 +336,6 @@ async def info() -> dict:
         "cost_usd": session_cost_usd(session) if session else 0.0,
         # Per-model spend, so a router session can show which models it used.
         "cost_by_model": dict(session.cost) if session else {},
-        "vault": str(_vault),
     }
 
 

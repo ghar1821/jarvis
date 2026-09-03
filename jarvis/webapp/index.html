@@ -31,24 +31,30 @@
   <main id="main">
     <header id="header">
       <!-- Status, in descending order of how often you need it: which model
-           is answering, what the session has cost, and where the vault is.
-           The model is the prominent one — with a router it changes per turn,
-           so it is the thing worth being able to read at a glance. -->
+           is answering and what the session has cost. The vault path used to
+           sit here too, but it's already in the config viewer (⋮ → Show
+           config), so showing it twice just repeated the same fact. The
+           model is the prominent one — with a router it changes per turn, so
+           it is the thing worth being able to read at a glance. -->
       <span id="header-text">
+        <span id="header-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3.5C6.8 3.5 5.5 4.8 5.3 6.4 3.8 6.9 3 8.3 3.4 9.7 2.3 10.6 2.2 12.2 3.2 13.2 2.8 14.6 3.6 15.9 5 16.3 5.1 17.7 6.3 18.8 7.7 18.7 8.3 19.6 9.5 20 10.5 19.5 11 19.8 11.5 19.9 12 19.9 12.5 19.9 13 19.8 13.5 19.5 14.5 20 15.7 19.6 16.3 18.7 17.7 18.8 18.9 17.7 19 16.3 20.4 15.9 21.2 14.6 20.8 13.2 21.8 12.2 21.7 10.6 20.6 9.7 21 8.3 20.2 6.9 18.7 6.4 18.5 4.8 17.2 3.5 15.5 3.5 14.3 3.5 13.3 4.1 12.7 5 12.5 4.9 12.2 4.9 12 4.9 11.8 4.9 11.5 4.9 11.3 5 10.7 4.1 9.7 3.5 8.5 3.5Z M12 4.9C12 8 11.8 11 12 19.9 M7 8.2C8 9 8 10 7 11 M17 8.2C16 9 16 10 17 11 M6 12.5C7 13 7 14 6.3 14.8 M18 12.5C17 13 17 14 17.7 14.8"/></svg>
+        </span>
         <span id="header-model">Jarvis</span>
         <span id="header-served" class="hidden"></span>
         <span id="header-cost" class="hidden"></span>
-        <span id="header-vault"></span>
       </span>
-      <button id="view-btn" title="Show or hide the editor panel">Editor</button>
-      <button id="menu-btn" title="Menu" aria-label="Menu">⋮</button>
+      <button id="view-btn" title="Show or hide the editor panel">Show editor</button>
+      <button id="menu-btn" title="Menu" aria-label="Menu">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
+      </button>
       <div id="header-menu" class="hidden">
-        <button id="model-menu-item">Switch model…</button>
-        <button id="style-menu-item">Set response style…</button>
-        <button id="prompts-menu-item">Edit prompts…</button>
-        <button id="config-menu-item">Show config…</button>
-        <button id="papers-menu-item">Library…</button>
-        <button id="proposals-menu-item">Discard pending suggestions…</button>
+        <button id="model-menu-item">Switch model</button>
+        <button id="style-menu-item">Set response style</button>
+        <button id="prompts-menu-item">Edit prompts</button>
+        <button id="config-menu-item">Show config</button>
+        <button id="papers-menu-item">Library</button>
+        <button id="proposals-menu-item">Discard pending suggestions</button>
       </div>
     </header>
     <!-- Editor above, chat below. The editor is a panel you open alongside
@@ -121,7 +127,7 @@
     </div>
   </main>
 
-  <!-- Response-style modal, hidden until opened from the ⋮ menu -->
+  <!-- Response-style modal, hidden until opened from the tools menu -->
   <div id="style-modal" class="modal hidden">
     <div class="modal-backdrop"></div>
     <div class="modal-box">
@@ -216,7 +222,7 @@
     </div>
   </div>
 
-  <!-- Library (papers + notes/records), hidden until opened from the ⋮ menu -->
+  <!-- Library (papers + notes/records), hidden until opened from the tools menu -->
   <div id="papers-modal" class="modal hidden">
     <div class="modal-backdrop"></div>
     <div class="modal-box papers-modal-box">

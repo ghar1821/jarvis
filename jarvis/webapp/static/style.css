@@ -139,10 +139,8 @@ header {
   flex-shrink: 0;
 }
 /* The status line was one dim 0.82rem string of everything joined by dots,
-   which made the model — the part that changes per turn under a router — as
-   hard to pick out as the vault path that never changes. It is now three
-   pieces with a deliberate hierarchy, and only the vault path is allowed to
-   truncate. */
+   which made the model — the part that changes per turn under a router — hard
+   to pick out. It is now two pieces with a deliberate hierarchy instead. */
 #header-text {
   display: flex;
   align-items: center;
@@ -150,6 +148,15 @@ header {
   flex: 1;
   min-width: 0;
   overflow: hidden;
+}
+
+/* A plain line-art brain — the generic "this is an AI model" mark, not tied
+   to any one provider's branding, since the session could be on Anthropic,
+   OpenAI, or a local Ollama model. */
+#header-icon {
+  flex: none;
+  display: flex;
+  color: var(--text-dim);
 }
 
 /* The model, at full contrast — the thing you actually look up here. */
@@ -189,19 +196,7 @@ header {
 }
 #header-cost.hidden { display: none; }
 
-/* The vault path is context, not status: dimmest, and the only piece that
-   gives up space when the header is tight. */
-#header-vault {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.78rem;
-  color: var(--text-dim);
-}
-
-/* ── Header ⋮ menu ── */
+/* ── Header tools menu ── */
 /* The model picker button sits beside it and shares its styling. */
 #menu-btn,
 #model-btn {
@@ -216,6 +211,10 @@ header {
 }
 #menu-btn:hover,
 #model-btn:hover { background: var(--surface-2); color: var(--text); }
+
+/* A plain line-art wrench, not a colour emoji, since this opens the tools
+   menu (switch model, edit prompts, show config, and so on). */
+#menu-btn { display: flex; align-items: center; }
 
 #header-menu {
   position: absolute;
