@@ -1,7 +1,9 @@
 """
-Tests for chunk-first retrieval in jarvis/chat/chat.py — the chat agent should
-be able to answer from search hits and the get_document tool without falling
-back to reading raw files.
+Tests for the chat agent's tools and terminal loop (jarvis/chat/chat.py).
+
+The bulk is chunk-first retrieval — the agent should be able to answer from
+search hits and the get_document tool without falling back to reading raw
+files.
 
 Covers:
 - _retrieve_papers / _search_notes now return the full chunk text (previously
@@ -11,6 +13,11 @@ Covers:
 - _dispatch_tool wraps get_document's output in the RETRIEVED DATA markers
   and flags the session private when the local provider returns private
   content, exactly like the other retrieval tools.
+- _add_document stages its whole document in memory and commits it in one
+  write, so a stopped ingest leaves the knowledge base untouched rather than
+  half-indexed.
+- run_session's Ctrl-C handling: an interrupt mid-turn drops the turn from the
+  session and exits, instead of dumping a traceback out of main().
 
 Privacy hard-stops for get_document are covered separately in
 test_privacy_guard.py.
@@ -18,11 +25,16 @@ test_privacy_guard.py.
 
 from pathlib import Path
 
+import pymupdf
 import pytest
 
-from jarvis.chat.chat import _dispatch_tool, _get_document, _retrieve_papers, _search_notes
+from jarvis.chat.chat import (
+    _add_document, _dispatch_tool, _get_document, _retrieve_papers, _search_notes,
+)
 from jarvis.chat.sessions import new_session
-from jarvis.kb.store import add_paper, add_texts
+from jarvis.core.cancel import CancelToken
+from jarvis.core.errors import TurnCancelled
+from jarvis.kb.store import add_paper, add_texts, count
 
 
 # ── Full-text hits (no more 300-char truncation) ────────────────────────────────
@@ -196,3 +208,207 @@ def test_dispatch_get_document_wraps_output_and_flags_private_session(store, mon
     assert result.rstrip().endswith("=== END RETRIEVED DATA ===")
     assert "Confidential lab notebook entry" in result
     assert session.private is True
+
+
+# ── Staged ingest: a stopped add leaves nothing behind ─────────────────────────
+
+
+class _StopOnSummarizeProvider:
+    """
+    Stands in for a provider whose summarize() the user stops part-way — the
+    realistic case, since summarising is where an ingest spends its time.
+    """
+
+    def __init__(self, cancel):
+        self._cancel = cancel
+
+    def complete(self, messages, max_tokens=300, context_length=None, cancel=None):
+        return "{}"  # metadata inference degrades to no fields
+
+    def summarize(self, title, source, max_tokens=2048, cancel=None):
+        self._cancel.stop()
+        (cancel or self._cancel).check()
+        raise AssertionError("summarize should have been cancelled")
+
+
+class _CannedSummaryProvider:
+    def complete(self, messages, max_tokens=300, context_length=None, cancel=None):
+        return "{}"
+
+    def summarize(self, title, source, max_tokens=2048, cancel=None):
+        return "A canned summary of the paper."
+
+
+def _one_page_pdf(path: Path, text: str) -> Path:
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), text, fontsize=12)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def test_add_document_stopped_mid_ingest_writes_nothing(store, tmp_path, monkeypatch):
+    """
+    An ingest stopped before its commit must leave the knowledge base exactly
+    as it was — this is the "nothing partial in the database" guarantee. The
+    stop propagates as TurnCancelled rather than being reported back to the
+    model as a tool error it would try to work around.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    pdf = _one_page_pdf(tmp_path / "stopped.pdf", "Body text of a paper being ingested.")
+    before = count(store)
+    cancel = CancelToken()
+
+    with pytest.raises(TurnCancelled):
+        _add_document(
+            {"source": str(pdf), "mode": "summary"},
+            _StopOnSummarizeProvider(cancel),
+            cancel=cancel,
+        )
+
+    assert count(store) == before, "a stopped ingest must not write any chunks"
+    assert store._collection.get(
+        where={"source": {"$eq": pdf.resolve().as_uri()}}, include=[]
+    )["ids"] == []
+
+
+def test_add_document_commits_body_and_annotations_together(store, tmp_path, monkeypatch):
+    """
+    The happy path still indexes everything, and does it in the single commit
+    the staging exists for — body chunks and annotation chunks share the
+    source, so one query sees the whole document.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    pdf = _one_page_pdf(tmp_path / "good.pdf", "Body text of a paper being ingested.")
+
+    result = _add_document(
+        {"source": str(pdf), "mode": "summary", "title": "Ingested Paper"},
+        _CannedSummaryProvider(),
+        cancel=CancelToken(),
+    )
+    assert result.startswith("Added paper ")
+
+    indexed = store._collection.get(
+        where={"source": {"$eq": pdf.resolve().as_uri()}}, include=["documents"]
+    )
+    assert indexed["ids"], "the paper should be indexed"
+    assert any("canned summary" in text.lower() for text in indexed["documents"])
+
+
+# ── Terminal loop: Ctrl-C mid-turn ─────────────────────────────────────────────
+
+
+def _drive_run_session(monkeypatch, session, agentic_turn):
+    """
+    Run one turn of the terminal loop with everything external stubbed: the
+    provider's agentic_turn is supplied by the caller, input() answers once,
+    and saves are recorded rather than written.
+    """
+    import jarvis.chat.chat as chat_module
+
+    class _Provider:
+        def __init__(self):
+            self.agentic_turn = agentic_turn
+
+        def complete(self, messages, max_tokens=2048, context_length=None, cancel=None):
+            return "unused"
+
+    saves = []
+    answers = iter(["a question"])
+
+    def one_question_then_eof(prompt=""):
+        # The second prompt raises EOFError — the Ctrl-D path — so a completed
+        # turn ends the loop instead of blocking on stdin.
+        try:
+            return next(answers)
+        except StopIteration:
+            raise EOFError
+
+    monkeypatch.setattr(chat_module, "make_provider", lambda spec: _Provider())
+    monkeypatch.setattr("builtins.input", one_question_then_eof)
+    monkeypatch.setattr("jarvis.chat.sessions.save_session", lambda s, store=None: saves.append(store))
+    monkeypatch.setattr("jarvis.chat.sessions.maybe_compact", lambda *a, **k: False)
+    monkeypatch.setattr("jarvis.chat.sessions.needs_compaction", lambda *a, **k: False)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: "the-store")
+    chat_module.run_session(Path("/tmp"), kb_only=True, session=session)
+    return saves
+
+
+def test_cli_ctrl_c_mid_turn_drops_the_turn_and_exits(monkeypatch, capsys):
+    """
+    Ctrl-C while the agent is working means quit — but the abandoned turn must
+    not be left in the saved session, and the exit must be a clean 130 rather
+    than a traceback escaping main(). Earlier completed turns survive.
+    """
+    session = new_session("ollama")
+    session.turn_starts.append(0)
+    session.messages.append({"role": "user", "content": "earlier question"})
+    session.messages.append({"role": "assistant", "content": "earlier answer"})
+    session.display.append({"role": "user", "content": "earlier question"})
+    session.display.append({"role": "assistant", "content": "earlier answer"})
+
+    def interrupted_turn(messages, tools, dispatch_fn, system, cancel=None):
+        raise KeyboardInterrupt
+
+    with pytest.raises(SystemExit) as exit_info:
+        _drive_run_session(monkeypatch, session, interrupted_turn)
+    assert exit_info.value.code == 130
+
+    # The stopped turn left no trace; the earlier exchange is intact.
+    assert [t["content"] for t in session.display] == ["earlier question", "earlier answer"]
+    assert [m["content"] for m in session.messages] == ["earlier question", "earlier answer"]
+    assert session.turn_starts == [0]
+    assert "Stopped" in capsys.readouterr().out
+
+
+def test_cli_completed_turn_commits_the_message_copy(monkeypatch, capsys):
+    """
+    The happy path still works with the working-copy commit: whatever the
+    provider appended to the copy lands in the session once a reply arrives.
+    """
+    session = new_session("ollama")
+
+    def working_turn(messages, tools, dispatch_fn, system, cancel=None):
+        messages.append({"role": "assistant", "content": "the answer"})
+        return "the answer"
+
+    saves = _drive_run_session(monkeypatch, session, working_turn)
+
+    assert [t["content"] for t in session.display] == ["a question", "the answer"]
+    assert [m["content"] for m in session.messages] == ["a question", "the answer"]
+    # One save per completed turn, and it indexes. (The extra store-free save
+    # before the LLM call is a webapp-only thing — there it protects the
+    # question from a session switch mid-turn, which the CLI cannot do.)
+    assert saves == ["the-store"]
+
+
+def test_add_document_arxiv_summary_mode_indexes_the_paper(store, monkeypatch):
+    """
+    The arXiv summary path — the one add_document branch no other test drove,
+    which is how a missing import survived in it. Fetch metadata, summarise,
+    stage, commit.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    paper = {
+        "link": "https://arxiv.org/abs/2401.00042",
+        "title": "A Paper About Soil",
+        "abstract": "An abstract about soil formation.",
+        "authors": "Ada Lovelace",
+        "doi": "",
+    }
+    monkeypatch.setattr("jarvis.digest.arxiv.fetch.fetch_arxiv_paper", lambda arxiv_id: paper)
+
+    result = _add_document(
+        {"source": paper["link"], "mode": "summary", "score": 7, "track": "soil"},
+        _CannedSummaryProvider(),
+        cancel=CancelToken(),
+    )
+    assert result.startswith("Added ")
+
+    indexed = store._collection.get(
+        where={"source": {"$eq": paper["link"]}}, include=["documents", "metadatas"]
+    )
+    assert indexed["ids"]
+    assert any("canned summary" in text.lower() for text in indexed["documents"])
+    assert indexed["metadatas"][0]["title"] == paper["title"]
+    assert indexed["metadatas"][0]["track"] == "soil"

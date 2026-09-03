@@ -48,7 +48,7 @@ class _FakeProvider:
         self._fail_on = set(fail_on or [])
         self.calls = 0
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
+    def describe_image(self, image_bytes: bytes, context: str, cancel=None) -> str:
         from jarvis.core.errors import LLMError
 
         current = self.calls

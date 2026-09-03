@@ -33,6 +33,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture documentation.
 - Add papers by arXiv URL or local PDF mid-conversation
 - Remove entries, trigger vault re-indexing, and check stats through the same chat interface — deletions always require a human confirmation, and jarvis can never delete a file on disk (database entries only)
 - Persistent chat sessions: resume, pin, delete, and search past conversations
+- Stop a reply mid-flight — the Stop button in the browser, `Ctrl-C` in the terminal — which cancels the request upstream and leaves no trace of the abandoned turn
 - User-defined skills and a configurable response style
 - Runs against a local model via Ollama or Anthropic Claude (switchable per session)
 - Terminal interface (`vault-chat`) or browser interface (`webapp`, localhost only)
@@ -193,6 +194,23 @@ uv run vault-chat --resume <SESSION_ID>     # resume a stored session
 
 By default (`--db-only` behaviour), the agent answers only from documents in the knowledge base. Pass `--no-db-only` to allow the LLM to fall back to its training knowledge when the database returns no relevant results — it will call `use_own_knowledge` first to make the fallback visible.
 
+`Ctrl-C` while the agent is working cancels the request and exits: the connection to Ollama or Anthropic is closed so the model stops generating, and the abandoned turn is dropped from the saved session rather than left half-finished. `Ctrl-D` at the prompt quits as usual.
+
+### Stopping a reply
+
+A reply you no longer want — the wrong question, a runaway tool loop, a huge paper being ingested by mistake — can be stopped at any point.
+
+- **Web UI:** while a reply is generating, the Send button becomes a red **Stop**. Clicking it returns control immediately.
+- **Terminal:** `Ctrl-C` (this also exits `vault-chat`).
+
+Either way the connection is closed so the model actually stops generating, and the stopped turn leaves **no trace**: your question comes back to the input box, nothing is written to the session history, and nothing is indexed. You can send the next message straight away — control comes back immediately, not when the model gets around to noticing.
+
+The one case where the model keeps working for a moment is a request that hasn't produced its first output yet — Ollama loading a large model for the first time, typically. The connection closes as soon as it does. Your side of it is over either way.
+
+If the agent was part-way through adding a document when you stopped it, nothing is written to the knowledge base at all — an ingest is staged in memory and committed in one go, so it either lands completely or not at all. The one thing a stop cannot interrupt is that final write itself (a few seconds at most), which is deliberate: a half-finished database write is exactly what this avoids.
+
+Note that a request already sent to Anthropic is billed for whatever it generated before you stopped it. Stopping is about getting your time back, not the tokens already produced.
+
 ### Chat sessions
 
 Every conversation is saved automatically to `~/.jarvis/sessions/` after each turn. Resume, pin, or delete sessions from the webapp sidebar, or from the terminal with `vault-chat --list-sessions` / `--resume <id>`.
@@ -200,7 +218,7 @@ Every conversation is saved automatically to `~/.jarvis/sessions/` after each tu
 - **Retention:** the 50 most recent unpinned sessions are kept; pinned sessions are exempt and never counted.
 - **Search:** past exchanges are indexed into the knowledge base, so the agent can recall earlier conversations via its `search_chat_history` tool ("that paper we discussed last week").
 - **Privacy:** a session that ever touches private content is flagged private permanently (shown with a lock badge in the webapp). Its history and indexed exchanges stay local-only, and resuming it under the Anthropic provider is refused.
-- **Compaction:** long sessions are compacted automatically — older exchanges are summarised by the session's own provider once the context passes `compact_after_tokens`, keeping the last `compact_keep_exchanges` turns verbatim. The visible history in the UI is never trimmed.
+- **Compaction:** long sessions are compacted automatically — older exchanges are summarised by the session's own provider once the context passes `compact_after_tokens`, keeping the last `compact_keep_exchanges` turns verbatim. The visible history in the UI is never trimmed. Because summarising is a whole extra model call, both interfaces say so while it runs ("Compacting conversation history...") instead of leaving you with an unexplained pause.
 
 ### Skills
 
@@ -220,7 +238,7 @@ uv run webapp --provider anthropic     # override provider for this session
 uv run webapp --provider ollama
 ```
 
-Same agent as `vault-chat`, in a dark theme. Tool calls appear live in a collapsible box while the agent is working. Localhost only — not accessible from other machines.
+Same agent as `vault-chat`, in a dark theme. Tool calls appear live in a collapsible box while the agent is working, and a red Stop button replaces Send until the reply lands (see [Stopping a reply](#stopping-a-reply)). Localhost only — not accessible from other machines.
 
 After upgrading jarvis, hard-reload any webapp tab that was already open (Cmd+Shift+R) — a tab still running the previous JavaScript can send request shapes the new server rejects.
 

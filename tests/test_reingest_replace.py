@@ -53,10 +53,10 @@ class _StubProvider:
     """Stands in for make_provider(): metadata inference degrades to {} (no
     fields), summarize() returns a canned string. Never hits a real LLM."""
 
-    def complete(self, messages, max_tokens=300, context_length=None):
+    def complete(self, messages, max_tokens=300, context_length=None, cancel=None):
         return "{}"
 
-    def summarize(self, title, source, max_tokens=2048):
+    def summarize(self, title, source, max_tokens=2048, cancel=None):
         return "A canned summary."
 
 

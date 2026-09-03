@@ -1,6 +1,7 @@
 const msgContainer = document.getElementById('messages');
 const inputEl      = document.getElementById('input');
 const sendBtn      = document.getElementById('send-btn');
+const stopBtn      = document.getElementById('stop-btn');
 const sessionList  = document.getElementById('session-list');
 
 let providerKind = '';  // 'ollama' | 'anthropic' — used to grey out unresumable sessions
@@ -43,10 +44,16 @@ function errorDetail(body, fallback) {
   return JSON.stringify(detail);
 }
 
-// The composer (send button) is only disabled for the session currently
-// being viewed — a turn running in some other session must never affect it.
+// The composer only reflects the session currently being viewed — a turn
+// running in some other session must never affect it. While this session is
+// mid-turn, Send is replaced by Stop rather than just greyed out, so there is
+// always something to click when a reply runs away.
 function updateComposerState() {
-  sendBtn.disabled = inFlight.has(activeSessionId) || serverBusy.includes(activeSessionId);
+  const busy = inFlight.has(activeSessionId) || serverBusy.includes(activeSessionId);
+  sendBtn.disabled = busy;
+  sendBtn.classList.toggle('hidden', busy);
+  stopBtn.classList.toggle('hidden', !busy);
+  if (!busy) stopBtn.disabled = false;
 }
 
 // Saves the outgoing session's textarea content as its draft, then loads
@@ -538,6 +545,9 @@ function pollUntilTurnLands(id, generation) {
     msgContainer.replaceChildren();
     history.forEach(renderTurn);
     scrollToBottom();
+    // The turn has landed, so this session is no longer busy — refresh the
+    // sidebar's view of that, which is what puts Send back in the composer.
+    loadSessions();
   }, 2000);
 }
 
@@ -819,6 +829,21 @@ papersSearch.addEventListener('input', () => {
 
 // ── Send ─────────────────────────────────────────────────────────────────
 
+// Undo the optimistic render of a turn that produced no answer — the user
+// stopped it, or the request never landed. Both bubbles go, and the typed text
+// comes back so it can just be sent again: into the live textarea if that
+// session is still on screen, otherwise into its draft so it isn't lost.
+function rollbackTurn(userDiv, assistantDiv, sessionId, viewing, text) {
+  userDiv.remove();
+  assistantDiv.remove();
+  if (viewing) {
+    inputEl.value = text;
+    resizeInput();
+  } else {
+    drafts[sessionId] = text;
+  }
+}
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -933,6 +958,21 @@ async function sendMessage() {
           }
           if (stillViewing()) scrollToBottom();
 
+        } else if (event.type === 'status') {
+          // Something is happening before the reply that's worth naming —
+          // right now only compaction, which is a whole extra LLM call and
+          // otherwise looks like the app has hung.
+          thinkingEl.textContent = event.state === 'compacting'
+            ? 'Compacting conversation history...'
+            : 'Working...';
+          thinkingEl.classList.toggle('compacting', event.state === 'compacting');
+
+        } else if (event.type === 'stopped') {
+          // The user hit Stop. The server has already discarded the turn, so
+          // the transcript must show no trace of it either.
+          rollbackTurn(userDiv, assistantDiv, sessionId, stillViewing(), text);
+          loadSessions();
+
         } else if (event.type === 'reply') {
           // Replace the placeholder with the finished response
           thinkingEl.remove();
@@ -951,12 +991,11 @@ async function sendMessage() {
     // rejection before the turn ever started, etc.) — nothing was recorded,
     // so roll the optimistic UI back completely rather than leaving an
     // orphaned user bubble sitting above a dead placeholder.
-    userDiv.remove();
-    assistantDiv.remove();
+    rollbackTurn(userDiv, assistantDiv, sessionId, stillViewing(), text);
     if (stillViewing()) {
       // Still looking at the session this message was for — show the error
-      // inline and hand the typed text back to the live textarea so the
-      // user can just hit Send again.
+      // inline so the failure isn't silent. (A deliberate stop takes the same
+      // rollback but gets no error bubble; it wasn't a failure.)
       const errorTurn = document.createElement('div');
       errorTurn.className = 'turn assistant';
       const bubble = document.createElement('div');
@@ -965,13 +1004,6 @@ async function sendMessage() {
       errorTurn.appendChild(bubble);
       msgContainer.appendChild(errorTurn);
       scrollToBottom();
-      inputEl.value = text;
-      resizeInput();
-    } else {
-      // The user has since switched away from sessionId — there's no
-      // visible composer to restore into, so the text goes back into that
-      // session's draft instead of being silently lost.
-      drafts[sessionId] = text;
     }
   } finally {
     inFlight.delete(sessionId);
@@ -1060,7 +1092,41 @@ function resizeInput() {
   inputEl.style.height = `${inputEl.scrollHeight}px`;
 }
 
+// Stop the turn running in the session being viewed. The server cancels it,
+// closes the upstream connection so the model stops generating, and ends the
+// SSE stream — the transcript rollback happens over there, when sendMessage's
+// reader receives the 'stopped' event.
+async function stopGeneration() {
+  const sessionId = activeSessionId;
+  if (!sessionId) return;
+  stopBtn.disabled = true;
+  try {
+    // A 404 means the turn had already finished (or hadn't registered yet in
+    // the moment between Send and the server handling it) — nothing to stop,
+    // and refreshing the session list settles the composer either way.
+    await fetch('/chat/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    // When this tab sent the message, its own stream reader gets the 'stopped'
+    // event and rolls the transcript back. When it only resumed into someone
+    // else's running turn there is no reader, and the "Working..." placeholder
+    // would sit there forever — so re-render from the (already rolled-back)
+    // history instead.
+    if (!inFlight.has(sessionId) && activeSessionId === sessionId) {
+      const history = await (await fetch('/history')).json();
+      msgContainer.replaceChildren();
+      history.forEach(renderTurn);
+      scrollToBottom();
+    }
+  } finally {
+    loadSessions();
+  }
+}
+
 sendBtn.addEventListener('click', sendMessage);
+stopBtn.addEventListener('click', stopGeneration);
 inputEl.addEventListener('input', resizeInput);
 inputEl.addEventListener('keydown', e => {
   // Enter sends; Shift+Enter falls through to the textarea's own default

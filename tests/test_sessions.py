@@ -23,8 +23,10 @@ from jarvis.chat.sessions import (
     mark_private,
     maybe_compact,
     new_session,
+    needs_compaction,
     prune_sessions,
     rename_session,
+    rollback_turn,
     save_session,
     set_pinned,
 )
@@ -39,6 +41,51 @@ def _session_with_turns(n_turns: int = 1, provider: str = "ollama") -> Session:
         session.display.append({"role": "user", "content": f"question {i}"})
         session.display.append({"role": "assistant", "content": f"answer {i}"})
     return session
+
+
+# ── Turn rollback ──────────────────────────────────────────────────────────────
+
+def test_rollback_turn_removes_the_whole_turn():
+    """
+    A stopped or failed turn must leave the session exactly as it was: the
+    question gone from both lists and from turn_starts, and the completed
+    turns before it untouched.
+    """
+    session = _session_with_turns(2)
+    before_messages = list(session.messages)
+    before_display = list(session.display)
+    before_starts = list(session.turn_starts)
+
+    # A third turn begins: question recorded, no answer yet.
+    session.turn_starts.append(len(session.messages))
+    session.messages.append({"role": "user", "content": "the stopped question"})
+    session.display.append({"role": "user", "content": "the stopped question"})
+
+    rollback_turn(session)
+
+    assert session.messages == before_messages
+    assert session.display == before_display
+    assert session.turn_starts == before_starts
+
+
+def test_rollback_turn_drops_provider_appended_messages_too():
+    """
+    If a caller did let the provider append tool calls to the live list,
+    rollback still truncates back to the turn's start — the three lists must
+    never be left disagreeing about where the turn began.
+    """
+    session = _session_with_turns(1)
+    session.turn_starts.append(len(session.messages))
+    session.messages.append({"role": "user", "content": "read a file"})
+    session.display.append({"role": "user", "content": "read a file"})
+    # An assistant tool_use with no matching tool_result — the shape that
+    # would 400 the next Anthropic turn if it survived.
+    session.messages.append({"role": "assistant", "content": [{"type": "tool_use"}]})
+
+    rollback_turn(session)
+
+    assert [m["content"] for m in session.messages] == ["question 0", "answer 0"]
+    assert session.turn_starts == [0]
 
 
 # ── Persistence ────────────────────────────────────────────────────────────────
@@ -306,9 +353,27 @@ class _CannedSummaryProvider:
     def __init__(self):
         self.calls = 0
 
-    def complete(self, messages, max_tokens=2048, context_length=None):
+    def complete(self, messages, max_tokens=2048, context_length=None, cancel=None):
         self.calls += 1
         return "Canned summary of earlier conversation."
+
+
+def test_needs_compaction_matches_maybe_compact():
+    """
+    needs_compaction exists so the UI can say "compacting" only when it is
+    actually about to happen — so it must agree with maybe_compact's own
+    decision on both sides of the threshold.
+    """
+    cfg = Config(compact_after_tokens=10, compact_keep_exchanges=1)
+    short_session = _session_with_turns(1)
+    assert needs_compaction(short_session, cfg) is False
+    assert maybe_compact(short_session, _CannedSummaryProvider(), cfg) is False
+
+    long_session = _session_with_turns(20)
+    assert needs_compaction(long_session, cfg) is True
+    assert maybe_compact(long_session, _CannedSummaryProvider(), cfg) is True
+    # Once compacted it no longer wants compacting again.
+    assert needs_compaction(long_session, cfg) is False
 
 
 def test_maybe_compact_noop_below_threshold():
