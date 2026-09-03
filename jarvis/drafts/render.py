@@ -47,10 +47,12 @@ def _mathml(latex: str, block: bool) -> str:
     """
     Convert one LaTeX expression to MathML, or fall back to showing the source.
 
-    MathML rather than a JavaScript typesetter because the preview iframe is
-    `sandbox=""` and runs no scripts — KaTeX or MathJax simply cannot execute
-    there. Browsers render MathML natively, so the maths arrives already laid
-    out and the sandbox stays shut.
+    MathML rather than a JavaScript typesetter because the preview iframe runs
+    no scripts — KaTeX or MathJax simply cannot execute there. Browsers render
+    MathML natively, so the maths arrives already laid out and the sandbox
+    stays shut. (The frame is `allow-same-origin` while it holds Markdown, so
+    the editor can scroll-sync it; that grants the page reading rights over the
+    frame, never the frame the right to run anything.)
     """
     import latex2mathml.converter
 
@@ -67,6 +69,26 @@ def _mathml(latex: str, block: bool) -> str:
         from html import escape
 
         return '<code class="math-error">' + escape(latex) + '</code>'
+
+
+def _tag_source_lines(state) -> None:
+    """
+    Stamp each top-level block with the source line it started on.
+
+    This is what the editor's scroll sync aims at. It reads the line at the top
+    of the editor viewport, finds the blocks either side of it in the preview,
+    and scrolls between them. Without the anchors the preview could only be
+    scrolled by percentage, which drifts as soon as one block takes up more of
+    the page than it does of the text — a table, or a long code block.
+
+    The attribute is inert: a number the browser ignores and the parent page
+    only ever parses as a number.
+    """
+    for token in state.tokens:
+        # A token's `map` is [first line, last line] in the source. Inline and
+        # closing tokens have none, which is exactly the set to skip.
+        if token.map:
+            token.attrSet("data-line", str(token.map[0]))
 
 
 def markdown_to_html(text: str) -> str:
@@ -91,6 +113,7 @@ def markdown_to_html(text: str) -> str:
         dollarmath_plugin,
         renderer=lambda content, options: _mathml(content, block=options.get("display_mode", False)),
     )
+    renderer.core.ruler.push("source_lines", _tag_source_lines)
     return renderer.render(text)
 
 

@@ -31,7 +31,6 @@ feature you switch on rather than the thing the daemon is built around.
     be restored from the editor. Restoring is itself undoable.
   - Added automatic clean up of the draft folder. Documents untouched for 30
     days are swept, unless marked to keep.
-    
 
 - Added new CLI commands to inspect what is indexed and what is available
   (PR #1): `kb schema`, `kb list --notes`, `kb models`, `kb drafts`.

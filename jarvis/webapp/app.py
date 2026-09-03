@@ -610,9 +610,14 @@ async def preview(req: PreviewRequest) -> dict:
     Render a Markdown draft for the preview pane.
 
     The HTML comes back as a string for the browser to put in a SANDBOXED
-    iframe (`sandbox=""`, via srcdoc): a draft can hold text the model produced
-    from an untrusted document, and it must never run script in the app's
-    origin. Embedded HTML is also stripped at render time.
+    iframe (via srcdoc): a draft can hold text the model produced from an
+    untrusted document, and it must never run script in the app's origin.
+    Embedded HTML is also stripped at render time.
+
+    The frame carries `allow-same-origin` for Markdown — enough for the editor
+    to read where each block sits and scroll-sync the preview, and never
+    `allow-scripts`, which is what would let anything in it execute. Blocks
+    come back tagged with the source line they were rendered from.
     """
     from jarvis.drafts import markdown_to_html, read_draft
 

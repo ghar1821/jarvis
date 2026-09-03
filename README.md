@@ -175,18 +175,23 @@ underneath, with a count beside the name. Right-click a document to add
 another file to it.
 
 The sidebar has two sections — **Chats** and **Documents** — each with a `+`
-to start a new one. Click a document, or press **Editor** in the header, and
-the editor opens above the chat, so you can talk about the document while
+to start a new one. Click a document, or press **Show editor** in the header,
+and the editor opens above the chat, so you can talk about the document while
 looking at it. Source sits on the left, preview on the right, **Recompile**
 re-renders, and a layout control switches between split / source only /
-output only. Markdown previews as you type; LaTeX compiles to a PDF (with the
+output only. Markdown renders to HTML; LaTeX compiles to a PDF (with the
 log underneath when it fails); both export to PDF.
 
 - **Open several at once.** Each file gets its own tab. A filled dot on the
   tab means unsaved changes; an × means none. Click it and it saves first if
   it needs to, then closes — a tab can never cost you work just by closing it.
-- **⌘S saves** the tab you're in. Previewing, compiling or exporting also
-  saves first, so what you act on is always what's on screen.
+- **⌘S saves** the tab you're in, and re-renders the preview with it, so what
+  you are looking at is never text you have since changed. Previewing,
+  compiling or exporting also saves first.
+- **Scrolling the source scrolls the preview** to the matching place, keeping
+  the two lined up as you move through a long document. Markdown only — a
+  compiled LaTeX PDF is displayed by the browser itself, which doesn't let the
+  page scroll it.
 - Every earlier version is kept. **History** restores one, and restoring is
   itself undoable.
 - When the assistant proposes a change, you get a diff with a checkbox per

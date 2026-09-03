@@ -117,20 +117,91 @@ def test_preview_escapes_embedded_html(sandbox, client):
     draft = create_draft("Doc", "doc.md", "# Title\n\n<script>alert(1)</script>\n")
     html = client.post("/preview", json={"draft_id": draft["id"], "file": "doc.md"}).json()["html"]
 
-    assert "<h1>Title</h1>" in html
+    assert '<h1 data-line="0">Title</h1>' in html
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
 
 
+def test_preview_blocks_carry_the_source_line_they_came_from(sandbox, client):
+    """
+    What the editor's scroll sync aims at. Without these the preview could only
+    be scrolled by percentage, which drifts from the source as soon as one
+    block takes up more of the page than it does of the text.
+    """
+    from jarvis.drafts import create_draft
+
+    draft = create_draft("Doc", "doc.md", "# Title\n\nA paragraph.\n\n- item\n")
+    html = client.post("/preview", json={"draft_id": draft["id"], "file": "doc.md"}).json()["html"]
+
+    assert '<h1 data-line="0">' in html
+    assert '<p data-line="2">' in html
+    assert '<ul data-line="4">' in html
+
+
 def test_preview_iframe_is_sandboxed_in_the_markup(sandbox):
     """
-    The other half of the pair: the frame the HTML lands in must carry an empty
-    sandbox attribute, which denies scripts and same-origin access.
+    The other half of the pair: the frame the HTML lands in ships with an empty
+    sandbox attribute, which denies scripts and same-origin access. Markdown
+    renders widen it by exactly one flag at render time — see the test below.
     """
-    from pathlib import Path
-
     markup = (Path(appmod.__file__).parent / "index.html").read_text()
     assert 'id="preview-frame" sandbox=""' in markup
+
+
+def test_the_preview_frame_is_never_granted_script_execution(sandbox):
+    """
+    Scroll sync needs this page to read where the preview's blocks sit, which
+    takes `allow-same-origin` on the frame holding the rendered Markdown.
+
+    `allow-scripts` must never join it. That pair is the one combination a
+    framed document can use to remove its own sandbox attribute, and with
+    same-origin granted it would be running in the app's own origin — able to
+    call every route on this server with the user's session. The Markdown that
+    lands there is escaped server-side (markdown-it with html:False), so this
+    is the second lock on the same door, not the only one.
+    """
+    import re
+
+    static = Path(appmod.__file__).parent
+    app_js = (static / "static" / "app.js").read_text()
+    markup = (static / "index.html").read_text()
+
+    # Checked through the mechanism rather than by looking for the flag as
+    # text: both files explain in comments why it is withheld, and a check
+    # that reads prose as code is a check that gets muted.
+    for value in re.findall(r'sandbox="([^"]*)"', markup):
+        assert "allow-scripts" not in value, f'sandbox="{value}" runs scripts'
+
+    # Every value the script puts on the attribute, literals included, and
+    # nothing reaching it by the property instead.
+    assert not re.search(r"\.sandbox\s*=", app_js), (
+        "the sandbox must be set through setAttribute, where this test can see it"
+    )
+    arguments = set(re.findall(r"setAttribute\(\s*'sandbox'\s*,\s*([^)]+)\)", app_js))
+    assert arguments == {"PREVIEW_SANDBOX_MARKDOWN", "PREVIEW_SANDBOX_PDF"}, arguments
+
+    # ...and what those two names are worth, so the indirection cannot be
+    # where a third flag gets in.
+    assert "const PREVIEW_SANDBOX_MARKDOWN = 'allow-same-origin';" in app_js
+    assert "const PREVIEW_SANDBOX_PDF = '';" in app_js
+
+
+def test_a_compiled_pdf_stays_in_the_tightest_sandbox(sandbox):
+    """
+    A PDF is an active content format, compiled from a .tex the model may have
+    written out of an untrusted document. It gains nothing from being readable
+    by this page — the browser's own PDF viewer cannot be scroll-synced — so
+    the compile path puts the empty sandbox back before loading it.
+    """
+    import re
+
+    app_js = (Path(appmod.__file__).parent / "static" / "app.js").read_text()
+    compile_fn = re.search(r"async function compileDocument\(.*?\n\}", app_js, re.S)
+    assert compile_fn, "compileDocument not found"
+    assert "PREVIEW_SANDBOX_PDF" in compile_fn.group(0), (
+        "the compiled PDF must go back into the empty sandbox, not inherit "
+        "the same-origin one the Markdown path leaves behind"
+    )
 
 
 # ── Compilation sandboxing ─────────────────────────────────────────────────────
@@ -232,10 +303,10 @@ def test_restore_puts_a_version_back_and_keeps_the_current_one(sandbox, client):
     assert len(after["versions"]) == 2
 def test_preview_renders_maths_as_mathml(sandbox, client):
     """
-    MathML rather than a JavaScript typesetter: the preview iframe is
-    `sandbox=""` and runs no scripts, so KaTeX or MathJax could never execute
-    there. Browsers render MathML natively, so the maths arrives already laid
-    out and the sandbox stays shut.
+    MathML rather than a JavaScript typesetter: the preview iframe runs no
+    scripts — it is never given `allow-scripts` — so KaTeX or MathJax could
+    never execute there. Browsers render MathML natively, so the maths arrives
+    already laid out and the sandbox stays shut.
     """
     from jarvis.drafts import create_draft
 

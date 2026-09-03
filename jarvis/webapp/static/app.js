@@ -1503,6 +1503,7 @@ function ensureEditor() {
     placeholder: 'Open a draft from the list, or ask the assistant to write one.',
   });
   cm.on('change', () => { if (openDraft) refreshDirtyUi(); });
+  cm.on('scroll', requestPreviewSync);
   return cm;
 }
 
@@ -1563,6 +1564,14 @@ function renderTabs() {
   }
 }
 
+// Whether this file has a preview to produce at all: every .md, and a .tex
+// only where there is a LaTeX toolchain to compile it with. Asked in two
+// places — to enable the button, and to decide whether saving refreshes.
+function canPreview(filename) {
+  if (filename.endsWith('.md')) return true;
+  return filename.endsWith('.tex') && Boolean(editorCapabilities.latex);
+}
+
 function setEditorButtons(filename) {
   const isTex = filename.endsWith('.tex');
   const isMd = filename.endsWith('.md');
@@ -1570,7 +1579,7 @@ function setEditorButtons(filename) {
   // compile for LaTeX. Two buttons that were each disabled half the time was
   // just clutter in a bar that is short on room.
   const recompile = document.getElementById('editor-recompile');
-  recompile.disabled = !(isMd || (isTex && editorCapabilities.latex));
+  recompile.disabled = !canPreview(filename);
   recompile.title = isTex ? 'Compile to PDF' : 'Render the preview';
   document.getElementById('editor-history').disabled = false;
   document.getElementById('editor-export').classList.toggle('hidden', !(isMd && editorCapabilities.pandoc));
@@ -1592,6 +1601,9 @@ function setLayoutMode(mode) {
   }
   try { localStorage.setItem('jarvis.layoutMode', mode); } catch (err) { /* private window */ }
   if (cm) setTimeout(() => cm.refresh(), 0);
+  // Changing the split changes the preview's width, and with it where every
+  // block in it sits, so the anchors have to be taken again.
+  if (previewAnchorsFile) measurePreviewAnchors(previewAnchorsFile);
 }
 
 async function loadDrafts() {
@@ -1929,6 +1941,21 @@ async function saveDraft({ tab = openDraft, silent = false } = {}) {
   return true;
 }
 
+// What the Save button and ⌘S actually do: write the file, then show what it
+// now looks like. A preview of text you have since changed is worse than no
+// preview, and the alternative was reaching for Recompile after every save.
+//
+// It hangs off the two things the user can press rather than off saveDraft
+// itself, because the preview path saves before it renders — putting it in
+// saveDraft would have each call render, and each render call back.
+async function saveAndRefreshPreview() {
+  if (!(await saveDraft())) return;   // a refused save keeps the old preview
+  if (!openDraft || !canPreview(openDraft.file)) return;
+  // Nothing to refresh in source-only mode, and a LaTeX run costs seconds.
+  if (document.getElementById('editor-panes').classList.contains('mode-source')) return;
+  recompile();
+}
+
 async function discardProposal(token) {
   await fetch('/discard-edit', {
     method: 'POST',
@@ -1939,9 +1966,31 @@ async function discardProposal(token) {
 
 // ── Preview, compile, export ─────────────────────────────────────────────
 
+// The frame's sandbox is set per render rather than once in the markup,
+// because the two things that land in it have earned different amounts of
+// rope. Both are set BEFORE the assignment that navigates the frame — sandbox
+// flags are read at navigation time, so setting them afterwards would apply to
+// the next render rather than this one.
+//
+// Markdown gets `allow-same-origin`, which is only what lets this page read
+// where the rendered blocks sit and scroll them. It does NOT permit scripts:
+// that takes `allow-scripts`, which is never granted here and never should be.
+// The pair together is the combination to avoid, because a frame holding both
+// can reach out and remove its own sandbox attribute. What lands here has also
+// had embedded markup escaped server-side (markdown-it with html:False), so it
+// is text and inert tags by the time it arrives.
+//
+// A compiled PDF gets the empty sandbox it has always had. A PDF is an active
+// content format built from a .tex the model may have written out of an
+// untrusted document, it gains nothing from being reachable, and the browser's
+// own PDF viewer cannot be scroll-synced anyway.
+const PREVIEW_SANDBOX_MARKDOWN = 'allow-same-origin';
+const PREVIEW_SANDBOX_PDF = '';
+
 async function showPreview() {
   if (!openDraft) return;
   await saveDraft({ silent: true });   // preview what's on disk, not a stale copy
+  const source = previewKeyFor(openDraft);
   const response = await fetch('/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1951,8 +2000,11 @@ async function showPreview() {
   const { html } = await response.json();
   compileLog.classList.add('hidden');
   previewFrame.classList.remove('hidden');
-  // srcdoc into a sandbox="" iframe: no scripts, no same-origin access. A
-  // draft can hold text the model produced from an untrusted document.
+  // Anchors can only be measured once the browser has laid the HTML out, and
+  // they belong to the file that was rendered — not to whichever tab is open
+  // by the time they land.
+  previewFrame.addEventListener('load', () => measurePreviewAnchors(source), { once: true });
+  previewFrame.setAttribute('sandbox', PREVIEW_SANDBOX_MARKDOWN);
   previewFrame.srcdoc =
     `<style>body{font:14px/1.6 -apple-system,system-ui,sans-serif;color:#e6e6e6;`
     + `background:#1c1c1e;padding:20px;max-width:70ch}`
@@ -1974,6 +2026,9 @@ async function compileDocument() {
   compileLog.textContent = 'Compiling…';
   compileLog.classList.remove('hidden');
   previewFrame.classList.add('hidden');
+  // A PDF has no line anchors to scroll to, and is about to go back into the
+  // tightest sandbox, so nothing here is readable from this side.
+  clearPreviewAnchors();
 
   const response = await fetch('/compile', {
     method: 'POST',
@@ -1990,6 +2045,7 @@ async function compileDocument() {
   compileLog.classList.add('hidden');
   previewFrame.classList.remove('hidden');
   previewFrame.removeAttribute('srcdoc');
+  previewFrame.setAttribute('sandbox', PREVIEW_SANDBOX_PDF);
   previewFrame.src = URL.createObjectURL(blob);
 }
 
@@ -2012,6 +2068,124 @@ async function exportPdf() {
   link.download = openDraft.file.replace(/\.[^.]+$/, '.pdf');
   link.click();
 }
+
+// ── Scroll sync ──────────────────────────────────────────────────────────
+//
+// One way, editor to preview: the source is the thing you are driving, and a
+// two-way sync spends most of its code stopping each side echoing the other
+// back. Every block in the preview carries the source line it came from, so
+// the two anchors either side of the top visible line say where to scroll,
+// and the distance between them says how far in.
+//
+// Markdown only. A compiled .tex is a PDF in the browser's own viewer, which
+// exposes no scroll position to set and no line numbers to set it from; doing
+// that properly means SyncTeX and a JavaScript PDF viewer, which is a
+// different project from this one.
+
+// [{line, top}] for the file named in previewAnchorsFile, top being the
+// element's offset from the top of the preview document.
+let previewAnchors = [];
+let previewAnchorsFile = null;
+let previewSyncQueued = false;
+
+// A few pixels of air, so the block you are editing is not flush against the
+// top edge of the preview.
+const PREVIEW_SCROLL_MARGIN = 8;
+
+function previewKeyFor(tab) {
+  return `${tab.draft_id}/${tab.file}`;
+}
+
+function clearPreviewAnchors() {
+  previewAnchors = [];
+  previewAnchorsFile = null;
+}
+
+// Null whenever the frame holds something this page is not allowed to read —
+// a PDF under the empty sandbox, or a render that has not landed yet. Reading
+// it is a DOM read of a document that has never been able to run code of its
+// own, and nothing from it is used as anything but a number.
+function previewDocument() {
+  try {
+    return previewFrame.contentDocument;
+  } catch (err) {
+    return null;
+  }
+}
+
+function measurePreviewAnchors(source) {
+  clearPreviewAnchors();
+  const doc = previewDocument();
+  const view = previewFrame.contentWindow;
+  if (!doc || !view || !doc.body) return;
+
+  for (const element of doc.querySelectorAll('[data-line]')) {
+    const line = Number(element.getAttribute('data-line'));
+    // The attribute is written by the renderer, so this is a guard against a
+    // future change rather than against the document: a non-number here would
+    // otherwise reach scrollTo as NaN and move the preview to the top.
+    if (!Number.isFinite(line)) continue;
+    previewAnchors.push({
+      line,
+      top: element.getBoundingClientRect().top + view.scrollY,
+    });
+  }
+  previewAnchors.sort((first, second) => first.line - second.line);
+  previewAnchorsFile = source;
+  // Re-rendering used to drop you back at the top of the document. Now a
+  // save that refreshes the preview leaves it where you were reading.
+  syncPreviewToEditor();
+}
+
+function syncPreviewToEditor() {
+  if (!cm || !openDraft || !previewAnchors.length) return;
+  // A review swaps in a Doc holding the current and suggested text at once,
+  // so its line numbers are not the file's and would aim at the wrong block.
+  if (openDraft.review) return;
+  // Anchors outlive the render that produced them; a tab switch must not
+  // scroll one file's preview to another file's lines.
+  if (previewAnchorsFile !== previewKeyFor(openDraft)) return;
+  if (document.getElementById('editor-panes').classList.contains('mode-source')) return;
+
+  const view = previewFrame.contentWindow;
+  if (!view) return;
+
+  const line = cm.lineAtHeight(cm.getScrollInfo().top, 'local');
+
+  // The anchors bracketing that line. Interpolating between them is what
+  // makes a long paragraph scroll smoothly instead of the preview jumping a
+  // block at a time.
+  let before = previewAnchors[0];
+  let after = null;
+  for (const anchor of previewAnchors) {
+    if (anchor.line <= line) before = anchor;
+    else { after = anchor; break; }
+  }
+
+  let top = before.top;
+  if (after && after.line > before.line) {
+    const progress = (line - before.line) / (after.line - before.line);
+    top += progress * (after.top - before.top);
+  }
+  view.scrollTo(0, Math.max(0, top - PREVIEW_SCROLL_MARGIN));
+}
+
+// Scroll events arrive far faster than the screen refreshes, and each one
+// reads layout out of the frame. One measurement per frame is plenty.
+function requestPreviewSync() {
+  if (previewSyncQueued) return;
+  previewSyncQueued = true;
+  requestAnimationFrame(() => {
+    previewSyncQueued = false;
+    syncPreviewToEditor();
+  });
+}
+
+// A resize changes where every block sits, so the anchors have to be taken
+// again before the next sync aims at them.
+window.addEventListener('resize', () => {
+  if (previewAnchorsFile) measurePreviewAnchors(previewAnchorsFile);
+});
 
 // ── Diff review ──────────────────────────────────────────────────────────
 //
@@ -2512,7 +2686,7 @@ document.getElementById('new-draft-btn').addEventListener('click', async () => {
   // document created here needs nothing extra to be usable in conversation.
   openDraftFile(body.id, body.main_file);
 });
-document.getElementById('editor-save').addEventListener('click', () => saveDraft());
+document.getElementById('editor-save').addEventListener('click', () => saveAndRefreshPreview());
 document.getElementById('editor-recompile').addEventListener('click', recompile);
 for (const name of ['split', 'source', 'output']) {
   document.getElementById(`mode-${name}`).addEventListener('click', () => setLayoutMode(name));
@@ -2528,7 +2702,7 @@ document.getElementById('editor-history').addEventListener('click', openHistoryM
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && e.key === 's' && editorOpen) {
     e.preventDefault();
-    saveDraft();
+    saveAndRefreshPreview();
   }
 });
 

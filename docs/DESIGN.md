@@ -1605,10 +1605,50 @@ can talk to the assistant about the file that's open.
 
 | Format | Preview | Export |
 |---|---|---|
-| `.md` | `POST /preview` → `markdown-it-py` with HTML disabled → shown via `srcdoc` in a **`sandbox=""` iframe**, so a draft built from an untrusted document can neither run script in the app's origin nor reach it | `POST /export` → pandoc → PDF |
+| `.md` | `POST /preview` → `markdown-it-py` with HTML disabled → shown via `srcdoc` in a **sandboxed iframe**, so a draft built from an untrusted document can never run script in the app's origin | `POST /export` → pandoc → PDF |
+
+**The preview frame's sandbox is set per render, not once in the markup**,
+because the two things that land in it have earned different amounts of rope.
+It ships as `sandbox=""` and the compiled-PDF path puts that back; a Markdown
+render widens it to `sandbox="allow-same-origin"`, which is what lets the page
+read where the rendered blocks sit and scroll them (see **Scroll sync**).
+
+`allow-scripts` is never granted, and the pair is the point: a frame holding
+both flags can reach out and remove its own sandbox attribute, and with
+same-origin it would be running in the app's origin with reach over every
+route on the server. Two tests hold that line — one enumerating every value
+the script puts on the attribute (literals included, and that nothing sets it
+by the property instead), one checking the compile path restores `sandbox=""`
+before loading a PDF, since a PDF is an active content format compiled from a
+`.tex` the model may have written out of an untrusted document. Escaping the
+Markdown server-side (`html: False`) remains the first lock on that door;
+the sandbox is the second.
+
+**Scroll sync.** `markdown_to_html` stamps each top-level block with the
+source line it came from (`data-line`, from the markdown-it token's `map`).
+The editor reads the line at the top of its viewport, finds the anchors either
+side of it, and interpolates between them, so a long paragraph scrolls
+smoothly rather than the preview jumping a block at a time. One way only —
+editor drives preview — because a two-way sync spends most of its code
+stopping each side echoing the other back. Anchors are re-measured on render,
+on a layout-mode change and on resize, and are tagged with the file they were
+measured from so a tab switch can't scroll one file's preview to another
+file's lines. It is skipped during a diff review, whose Doc holds the current
+and suggested text at once and whose line numbers are therefore not the
+file's. Markdown only: a compiled `.tex` is a PDF in the browser's own viewer,
+which exposes no scroll position to set and no line numbers to set it from —
+that needs SyncTeX and a JavaScript PDF viewer.
+
+**Saving refreshes the preview.** The Save button and ⌘S write the file and
+then re-render it, so the preview never shows text you have since changed.
+Skipped in source-only mode, where there is nothing on screen to refresh and a
+LaTeX run costs seconds. It hangs off the two controls the user can press
+rather than off `saveDraft` itself, because the preview path saves before it
+renders — putting it in `saveDraft` would have each call render and each
+render call back.
 
 **Maths is rendered to MathML server-side**, not by a JavaScript typesetter.
-The preview iframe is `sandbox=""` and runs no scripts, so KaTeX and MathJax
+The preview iframe runs no scripts, so KaTeX and MathJax
 simply can't execute there — but browsers render MathML natively, so
 `mdit-py-plugins`' `dollarmath` picks up `$inline$` and `$$display$$` and
 `latex2mathml` converts each one at render time, with `display="block"` on
