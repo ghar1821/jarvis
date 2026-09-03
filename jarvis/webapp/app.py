@@ -16,6 +16,7 @@ import queue
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,8 +27,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from jarvis.core.cancel import CancelToken
 from jarvis.core.config import get_config, reset_config, set_config_value
-from jarvis.core.errors import LLMError, PrivacyError
+from jarvis.core.errors import LLMError, PrivacyError, TurnCancelled
 from jarvis.chat.chat import (
     READ_SKILL_TOOL,
     TOOLS,
@@ -46,8 +48,10 @@ from jarvis.chat.sessions import (
     list_sessions,
     load_session,
     maybe_compact,
+    needs_compaction,
     new_session,
     rename_session,
+    rollback_turn,
     save_session,
     set_pinned,
 )
@@ -56,6 +60,11 @@ from jarvis.chat.skills import list_skills
 _ROOT = Path(__file__).parent
 cfg = get_config()
 _vault = cfg.vault_path
+
+# How long process shutdown waits for each cancelled turn to unwind, so it gets
+# the chance to close its own upstream connection rather than having the socket
+# yanked at interpreter exit.
+_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 2.0
 
 # Single-user state — shared across browser tabs (intended for local use only).
 # session      : the active (currently viewed) persistent Session — /history,
@@ -67,12 +76,13 @@ _vault = cfg.vault_path
 #                answers only from KB tools; when False, it may fall back to
 #                training knowledge after searching the KB. /config also
 #                updates the active session's own kb_only (see /config).
-# running      : {session_id: live Session object} — every session currently
-#                mid-turn in its own run_agent background thread. A second
-#                /chat addressed at an id already in here 409s; resuming that
-#                id installs this same live object (not a stale disk copy) so
-#                /history reflects turns as they land; sessions_delete refuses
-#                to delete an id that's in here.
+# running      : {session_id: RunningTurn} — every session currently mid-turn
+#                in its own run_agent background thread. A second /chat
+#                addressed at an id already in here 409s; resuming that id
+#                installs the same live Session object (not a stale disk copy)
+#                so /history reflects turns as they land; sessions_delete
+#                refuses to delete an id that's in here; /chat/stop reaches
+#                into it to cancel the turn.
 _session: dict = {
     "session": None,
     "provider": None,
@@ -94,6 +104,55 @@ _session: dict = {
     "pending_actions": {},
     "running": {},
 }
+
+
+@dataclass
+class RunningTurn:
+    """
+    Everything /chat/stop needs to reach into a turn that is already running.
+
+    session     : the live Session the worker thread is mutating — this is the
+                  object a resume installs, so /history follows the turn live.
+    cancel      : the worker's stop switch.
+    queue       : the worker's event queue; the stop endpoint pushes the
+                  terminal events itself so the browser is freed without
+                  waiting for the worker to notice.
+    thread      : the worker, so process shutdown can wait for it briefly.
+    commit_lock : held by whoever is about to write to `session`. The worker
+                  takes it to commit a finished turn; /chat/stop takes it to
+                  cancel and roll one back. Exactly one of those two outcomes
+                  can happen, and the lock is what decides which — without it,
+                  a stop arriving in the instant a reply lands could roll back
+                  a turn that had already been committed and saved.
+    """
+
+    session: Session
+    cancel: CancelToken
+    queue: "queue.Queue"
+    thread: threading.Thread | None = None
+    commit_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _record_failed_turn(turn: RunningTurn, reply: str, tool_calls_log: list) -> bool:
+    """
+    Persist a failed turn's ⚠️ reply so it survives a refresh, and report
+    whether the turn had in fact been stopped instead.
+
+    A failure and a stop can land in the same instant — the request dying
+    *because* the connection closed under it looks like an ordinary provider
+    error. Taking the same lock /chat/stop takes, and re-checking the token
+    inside it, keeps the two from both writing: if the stop got there first
+    the turn has already been rolled back, and appending an error reply to it
+    would leave an assistant bubble with no question above it.
+    """
+    with turn.commit_lock:
+        if turn.cancel.stopped:
+            return True
+        turn.session.display.append(
+            {"role": "assistant", "content": reply, "tool_calls": tool_calls_log}
+        )
+        save_session(turn.session)
+        return False
 
 
 def _clear_pending_for(session_id: str) -> None:
@@ -128,6 +187,15 @@ async def lifespan(app: FastAPI):
     _session["provider"] = make_provider(cfg.provider)
     _session["session"] = new_session(cfg.provider, kb_only=True)
     yield
+    # Ctrl-C on `uv run webapp`. The worker threads are daemons and would be
+    # killed at interpreter exit anyway, but cancelling them first lets each
+    # one close its own upstream connection — so the cloud or Ollama server
+    # stops generating, instead of being left to notice the socket died.
+    for turn in list(_session["running"].values()):
+        turn.cancel.stop()
+    for turn in list(_session["running"].values()):
+        if turn.thread is not None:
+            turn.thread.join(_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -156,6 +224,10 @@ async def log_validation_errors(request: Request, exc: RequestValidationError) -
 # the parameter as a query param instead of a JSON body.
 class ChatRequest(BaseModel):
     message: str
+    session_id: str
+
+
+class ChatStopRequest(BaseModel):
     session_id: str
 
 
@@ -252,7 +324,7 @@ async def sessions_resume(session_id: str) -> dict:
         # Mid-turn: a disk load would be stale (the background thread hasn't
         # saved yet) and check_resume is redundant — this session started
         # its turn under the current provider by construction.
-        session = live
+        session = live.session
     else:
         try:
             session = load_session(session_id)
@@ -503,20 +575,24 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     # a stale click 409s, without touching any other session's still-pending
     # dialogs (including ones belonging to a session mid-turn right now).
     _clear_pending_for(session.id)
-    # Registered on the event loop, before the thread is spawned, so a second
-    # /chat for the same id arriving before the thread has even started still
-    # sees the busy guard above.
-    _session["running"][session.id] = session
-
     # The agent runs in a background thread so the async event loop stays free
     # to serve SSE chunks. A plain queue bridges the two worlds. If the browser
     # aborts mid-stream the thread runs to completion with no consumer — fine
     # for a single-user local app; the turn still lands in the session history.
+    # (Deliberately closing the tab is not a stop — POST /chat/stop is.)
     event_queue: queue.Queue = queue.Queue()
+    cancel = CancelToken()
+    # Registered on the event loop, before the thread is spawned, so a second
+    # /chat for the same id arriving before the thread has even started still
+    # sees the busy guard above — and so /chat/stop can find the turn even if
+    # the stop arrives almost immediately.
+    turn = RunningTurn(session=session, cancel=cancel, queue=event_queue)
+    _session["running"][session.id] = turn
 
     def run_agent() -> None:
         tool_calls_log: list[tuple[str, str]] = []
         reply = None  # set on every path below; finally always has something to send
+        stopped = False
 
         def request_confirmation(description: str, action: dict):
             # Store the pending deletion under a fresh token, tagged with the
@@ -542,15 +618,25 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             return _dispatch_tool(
                 name, arguments, _vault, cfg.provider, provider,
                 session=session, request_confirmation=request_confirmation,
+                cancel=cancel,
             )
 
         try:
             from jarvis.kb.store import get_store
 
             try:
-                maybe_compact(session, provider, get_config())
+                # Compaction is a second LLM call made before the turn's own,
+                # and on a long history it is a long silent pause — tell the
+                # browser so it can say what it's waiting for.
+                if needs_compaction(session, get_config()):
+                    event_queue.put({"type": "status", "state": "compacting"})
+                    maybe_compact(session, provider, get_config(), cancel=cancel)
+                    event_queue.put({"type": "status", "state": "thinking"})
             except LLMError:
-                pass  # compaction is best-effort; the turn itself may still work
+                # Compaction is best-effort; the turn itself may still work.
+                # Clear the indicator either way so it doesn't sit there
+                # claiming to be compacting for the rest of the turn.
+                event_queue.put({"type": "status", "state": "thinking"})
 
             session.turn_starts.append(len(session.messages))
             session.messages.append({"role": "user", "content": req.message})
@@ -561,24 +647,43 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # vanishing from the sidebar's history.
             save_session(session)
 
+            # agentic_turn appends to the list it is given, so hand it a copy
+            # and commit only once a reply actually came back. A stopped turn
+            # then has nothing to unwind beyond the user's own question.
+            working_messages = list(session.messages)
             reply = provider.agentic_turn(
-                messages=session.messages,
+                messages=working_messages,
                 tools=tools,
                 dispatch_fn=dispatch_fn,
                 system=system,
+                cancel=cancel,
             )
 
-            session.display.append({
-                "role": "assistant",
-                "content": reply,
-                "tool_calls": tool_calls_log,
-            })
-            save_session(session, store=get_store())
+            # Committing the finished turn and rolling a stopped one back are
+            # the two things that must not interleave, so both happen under
+            # the turn's lock. Re-checking the token inside it is what makes a
+            # stop that arrives in this very instant win cleanly rather than
+            # racing: /chat/stop sets the token before it takes the lock.
+            with turn.commit_lock:
+                cancel.check()
+                session.messages[:] = working_messages
+                session.display.append({
+                    "role": "assistant",
+                    "content": reply,
+                    "tool_calls": tool_calls_log,
+                })
+                save_session(session, store=get_store())
+        except TurnCancelled:
+            # The human hit stop. /chat/stop owns the cleanup — it has already
+            # rolled the turn back, saved, freed the session, and told the
+            # browser. This thread must touch nothing: by now the session may
+            # well be mid-way through a *newer* turn. No reply event and no log
+            # entry either — a stop is not a failure.
+            stopped = True
         except LLMError as exc:
             log.exception("chat turn failed with an LLM error")
             reply = f"⚠️ {exc}"
-            session.display.append({"role": "assistant", "content": reply, "tool_calls": tool_calls_log})
-            save_session(session)
+            stopped = _record_failed_turn(turn, reply, tool_calls_log)
         except Exception as exc:
             # Anything else is a bug, not an expected provider failure — log
             # the full traceback (an LLM would only paraphrase the message,
@@ -586,8 +691,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # leaving the "Working..." placeholder stuck forever.
             log.exception("chat turn crashed unexpectedly")
             reply = f"⚠️ Internal error: {exc}"
-            session.display.append({"role": "assistant", "content": reply, "tool_calls": tool_calls_log})
-            save_session(session)
+            stopped = _record_failed_turn(turn, reply, tool_calls_log)
         finally:
             # Note: no reinstall step here. In the old single-session model,
             # resuming this same id mid-turn installed a fresh-from-disk copy
@@ -597,19 +701,33 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             # very same object this thread is mutating — so there is nothing
             # stale to reconcile.
             #
-            # Always reaches the browser and always clears the busy flag,
-            # even if the try block died before `reply` was ever assigned —
-            # this is what keeps the SSE stream from hanging indefinitely.
-            event_queue.put({
-                "type": "reply",
-                "content": reply,
-                "tool_calls": tool_calls_log,
-                "private": session.private,
-            })
-            event_queue.put(None)  # sentinel — tells the stream generator to stop
-            _session["running"].pop(session.id, None)
+            # The reply event always reaches the browser and always clears the
+            # busy flag, even if the try block died before `reply` was ever
+            # assigned. A stopped turn is the exception: /chat/stop has already
+            # told the browser, and a reply here would resurrect a turn the
+            # human cancelled.
+            #
+            # The sentinel goes out either way — it is the only thing that ends
+            # the SSE stream, so skipping it would hang the request forever. A
+            # duplicate (because /chat/stop sent one too) is harmless: the
+            # generator returns on the first one it sees.
+            if not stopped:
+                event_queue.put({
+                    "type": "reply",
+                    "content": reply,
+                    "tool_calls": tool_calls_log,
+                    "private": session.private,
+                })
+            event_queue.put(None)
+            # Only deregister if this turn is still the registered one. A
+            # stopped turn was deregistered by /chat/stop, and the session may
+            # already have a newer turn running in its place — popping by id
+            # alone would knock that one out of the busy guard.
+            if _session["running"].get(session.id) is turn:
+                _session["running"].pop(session.id, None)
 
-    threading.Thread(target=run_agent, daemon=True).start()
+    turn.thread = threading.Thread(target=run_agent, daemon=True)
+    turn.thread.start()
 
     async def stream():
         # Poll the queue every 50 ms. Yields SSE-formatted data lines.
@@ -624,3 +742,60 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/chat/stop")
+async def chat_stop(req: ChatStopRequest) -> dict:
+    """
+    Stop the turn running for this session, abruptly.
+
+    The turn is cancelled and abandoned in the same breath — this endpoint
+    does the cleanup itself rather than waiting for the worker thread to
+    notice, because how long the worker takes to notice is not under our
+    control. It checks the token between streamed events, so it dies in
+    milliseconds mid-response; but if the request is still waiting on its
+    *first* event (Ollama loading a cold model, say) there is nothing to check
+    between, and it could be many seconds. Waiting for that would leave the
+    session busy and reject the next message, which is exactly what the stop
+    exists to avoid.
+
+    So: cancel, roll the turn back, deregister the session, and tell the
+    browser — all here. The abandoned worker then unwinds on its own and, by
+    contract, touches nothing on the way out (see run_agent's TurnCancelled
+    branch). `commit_lock` is what makes handing ownership over safe: if the
+    worker is in the middle of committing a reply that just landed, we block
+    until it finishes and its turn stands.
+    """
+    turn: RunningTurn | None = _session["running"].get(req.session_id)
+    if turn is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no reply is being generated for this session",
+        )
+
+    # Set before taking the lock, so a worker racing us to commit sees it on
+    # its own re-check and stands down.
+    turn.cancel.stop()
+    # Ends the SSE stream now rather than when the worker lands, so the
+    # browser's composer comes back within one 50 ms poll.
+    turn.queue.put({"type": "stopped"})
+    turn.queue.put(None)
+
+    def abandon_turn() -> bool:
+        """Roll the turn back, unless the worker committed a reply first."""
+        with turn.commit_lock:
+            if turn.session.display and turn.session.display[-1]["role"] == "assistant":
+                return False  # the reply won the race and is already saved
+            rollback_turn(turn.session)
+            save_session(turn.session)  # no store= — a stopped turn is never indexed
+            return True
+
+    # Off the event loop: the lock can be held by a worker doing an indexed
+    # save, which embeds text and is far too slow to block the loop on.
+    rolled_back = await asyncio.to_thread(abandon_turn)
+
+    if _session["running"].get(req.session_id) is turn:
+        _session["running"].pop(req.session_id, None)
+    # Any confirmation dialog this turn put up is no longer actionable.
+    _clear_pending_for(req.session_id)
+    return {"stopped": True, "rolled_back": rolled_back}

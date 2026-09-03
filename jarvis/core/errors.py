@@ -54,6 +54,16 @@ class PrivacyError(PaperDigestError):
     """
 
 
+class TurnCancelled(PaperDigestError):
+    """
+    Raised when the human stops a chat turn while it is in flight.
+
+    Deliberately NOT an LLMError: the LLMError handlers turn a failure into a
+    "⚠️ ..." assistant reply saved to the session, and a stopped turn must
+    leave no trace at all. Callers catch this to roll the turn back instead.
+    """
+
+
 def with_retries(
     max_attempts: int = 5,
     backoff: float = 2.0,

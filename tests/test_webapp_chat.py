@@ -20,6 +20,12 @@ Tests for the webapp's /chat turn lifecycle (jarvis/webapp/app.py):
   object (the same one the background thread is mutating), not a stale
   disk copy — this is what makes /history correct without any reinstall
   step in run_agent's finally block
+- /chat/stop: the forceful stop. It ends the SSE stream immediately with a
+  'stopped' event, cancels the worker's token, waits for the worker to
+  unwind, and leaves the session with no trace of the stopped turn — so the
+  very next message can be sent straight away
+- the compaction status event, so a long pre-turn summarisation isn't a
+  silent wait
 
 These exercise the real FastAPI app via TestClient with a fake provider
 standing in for the LLM (a real agentic_turn needs a live API), and with
@@ -31,7 +37,9 @@ the fields it depends on rather than assuming a clean slate.
 
 import json
 import logging
+import queue
 import threading
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -39,6 +47,7 @@ from starlette.testclient import TestClient
 import jarvis.chat.chat as chat_module
 import jarvis.webapp.app as appmod
 from jarvis.chat.sessions import new_session
+from jarvis.core.cancel import CancelToken
 from jarvis.core.errors import LLMError
 
 
@@ -54,13 +63,33 @@ def isolated_log():
 
 
 class FakeProvider:
-    """Stands in for a real ChatProvider — agentic_turn just runs whatever behavior a test supplies."""
+    """
+    Stands in for a real ChatProvider — agentic_turn just runs whatever
+    behavior a test supplies.
+
+    The cancel token the webapp passes in is kept on the instance rather than
+    handed to the behavior, so the existing four-argument behaviors stay as
+    they are. A test that needs to act like a real provider (checking the
+    token where a streamed response would) reads provider.cancel.
+    """
 
     def __init__(self, behavior):
         self.behavior = behavior
+        self.cancel = None
 
-    def agentic_turn(self, messages, tools, dispatch_fn, system):
+    def agentic_turn(self, messages, tools, dispatch_fn, system, cancel=None):
+        self.cancel = cancel
         return self.behavior(messages, tools, dispatch_fn, system)
+
+
+def _fake_running_turn(session):
+    """
+    A RunningTurn standing in for an in-flight turn, for tests that only need
+    the registry to look busy without actually starting a thread.
+    """
+    return appmod.RunningTurn(
+        session=session, cancel=CancelToken(), queue=queue.Queue(), thread=None
+    )
 
 
 def _parse_sse(text: str) -> list[dict]:
@@ -133,7 +162,7 @@ def test_busy_guard_blocks_second_chat_and_session_delete(wired_session):
     THAT session 409s, deleting that session 409s, and /sessions surfaces
     its id in the busy list.
     """
-    appmod._session["running"] = {wired_session.id: wired_session}  # simulate an in-flight turn
+    appmod._session["running"] = {wired_session.id: _fake_running_turn(wired_session)}
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
 
@@ -269,7 +298,7 @@ def test_resume_of_busy_session_installs_live_object(wired_session, monkeypatch)
     body = resume_response.json()
     assert body["busy"] is True
     assert appmod._session["session"] is wired_session
-    assert appmod._session["session"] is appmod._session["running"][wired_session.id]
+    assert appmod._session["session"] is appmod._session["running"][wired_session.id].session
 
     # Let the turn finish and the stream drain.
     release_turn.set()
@@ -339,7 +368,9 @@ def test_two_parallel_turns(wired_session, monkeypatch):
     assert [t["role"] for t in session_a.display] == ["user"]  # still blocked, no reply yet
     assert [t["role"] for t in session_b.display] == ["user", "assistant"]
     assert session_b.display[-1]["content"] == "reply for B"
-    assert appmod._session["running"] == {session_a.id: session_a}  # B already popped, A still running
+    # B already popped, A still running
+    assert list(appmod._session["running"]) == [session_a.id]
+    assert appmod._session["running"][session_a.id].session is session_a
 
     release_a.set()
     thread_a.join(timeout=10)
@@ -354,6 +385,256 @@ def test_two_parallel_turns(wired_session, monkeypatch):
         {"role": "user", "content": "question for B"},
         {"role": "assistant", "content": "reply for B", "tool_calls": []},
     ]
+
+
+# ── forceful stop ────────────────────────────────────────────────────────────
+
+
+def test_stop_ends_the_stream_and_leaves_no_trace(wired_session, monkeypatch):
+    """
+    The whole point of the stop, end to end: the SSE stream terminates with a
+    'stopped' event (not a reply), the session is left exactly as it was
+    before the turn, nothing is indexed, and the session is free for the next
+    message immediately.
+    """
+    save_calls = []
+    monkeypatch.setattr(
+        appmod, "save_session",
+        lambda session, store=None: save_calls.append(store),
+    )
+
+    turn_started = threading.Event()
+    provider = FakeProvider(None)
+
+    def blocking_behavior(messages, tools, dispatch_fn, system):
+        turn_started.set()
+        # Stand in for a streaming provider: wait, then check the token at the
+        # point a real one would (between streamed events).
+        for _ in range(100):
+            provider.cancel.check()
+            time.sleep(0.02)
+        pytest.fail("the turn was never cancelled")
+
+    provider.behavior = blocking_behavior
+    appmod._session["provider"] = provider
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    stream_result = {}
+
+    def post_chat():
+        stream_result["response"] = client.post(
+            "/chat", json={"message": "a runaway question", "session_id": wired_session.id}
+        )
+
+    post_thread = threading.Thread(target=post_chat)
+    post_thread.start()
+    assert turn_started.wait(timeout=10), "the turn never started"
+
+    stop_response = client.post("/chat/stop", json={"session_id": wired_session.id})
+    assert stop_response.status_code == 200
+    body = stop_response.json()
+    assert body["stopped"] is True
+    # The endpoint rolled the turn back itself rather than waiting for the
+    # worker, so the session is already clean when this response is sent.
+    assert body["rolled_back"] is True
+
+    post_thread.join(timeout=10)
+    assert not post_thread.is_alive(), "the SSE stream never terminated"
+
+    events = _parse_sse(stream_result["response"].text)
+    assert [e["type"] for e in events] == ["stopped"]
+
+    # No trace: the question is gone from both lists and from turn_starts.
+    assert wired_session.display == []
+    assert wired_session.messages == []
+    assert wired_session.turn_starts == []
+    # And nothing was indexed — every save on the stop path is store-free, so
+    # the abandoned turn never becomes a searchable chat exchange.
+    assert save_calls and all(store is None for store in save_calls)
+    assert appmod._session["running"] == {}
+
+
+def test_stop_frees_the_session_for_the_next_message(wired_session, monkeypatch):
+    """
+    "The user can just send another request through": a stopped session must
+    accept a new /chat straight away, with no 409 and no leftover history from
+    the abandoned turn.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+
+    turn_started = threading.Event()
+    provider = FakeProvider(None)
+
+    def blocking_behavior(messages, tools, dispatch_fn, system):
+        turn_started.set()
+        for _ in range(100):
+            provider.cancel.check()
+            time.sleep(0.02)
+        pytest.fail("the turn was never cancelled")
+
+    provider.behavior = blocking_behavior
+    appmod._session["provider"] = provider
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    post_thread = threading.Thread(
+        target=lambda: client.post(
+            "/chat", json={"message": "first question", "session_id": wired_session.id}
+        )
+    )
+    post_thread.start()
+    assert turn_started.wait(timeout=10)
+
+    client.post("/chat/stop", json={"session_id": wired_session.id})
+    post_thread.join(timeout=10)
+
+    appmod._session["provider"] = FakeProvider(
+        lambda messages, tools, dispatch_fn, system: "the second reply"
+    )
+    second = client.post(
+        "/chat", json={"message": "second question", "session_id": wired_session.id}
+    )
+    assert second.status_code == 200
+
+    # Only the second exchange survives; the stopped one left nothing behind.
+    assert [t["content"] for t in wired_session.display] == [
+        "second question", "the second reply"
+    ]
+
+
+def test_stop_landing_as_the_reply_commits_leaves_the_reply_standing(wired_session, monkeypatch):
+    """
+    A stop and a finished reply can land in the same instant. If the reply won,
+    it has already been committed and saved, and rolling the turn back would
+    delete an answer the user is looking at — so the stop stands down instead.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+
+    # A session whose turn has just been committed: the assistant reply is
+    # already in display, but the turn is still registered as running.
+    wired_session.turn_starts.append(0)
+    wired_session.messages.append({"role": "user", "content": "a question"})
+    wired_session.display.append({"role": "user", "content": "a question"})
+    wired_session.display.append({"role": "assistant", "content": "the answer", "tool_calls": []})
+    appmod._session["running"] = {wired_session.id: _fake_running_turn(wired_session)}
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/chat/stop", json={"session_id": wired_session.id})
+
+    assert response.status_code == 200
+    assert response.json() == {"stopped": True, "rolled_back": False}
+    # The committed exchange is untouched.
+    assert [t["content"] for t in wired_session.display] == ["a question", "the answer"]
+    assert appmod._session["running"] == {}
+
+
+def test_worker_stands_down_when_a_stop_beats_its_commit(wired_session, monkeypatch):
+    """
+    The other side of that race: if the stop got there first, the worker must
+    not commit the reply it just produced — the turn was abandoned, and the
+    session may already be onto a newer one.
+    """
+    save_calls = []
+    monkeypatch.setattr(
+        appmod, "save_session", lambda session, store=None: save_calls.append(store)
+    )
+
+    provider = FakeProvider(None)
+
+    def stopped_before_committing(messages, tools, dispatch_fn, system):
+        # Stands in for a stop arriving in the window between the provider
+        # returning and run_agent committing the result.
+        provider.cancel.stop()
+        return "a reply nobody asked for any more"
+
+    provider.behavior = stopped_before_committing
+    appmod._session["provider"] = provider
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+
+    # No reply event, and the reply never reached the session.
+    events = _parse_sse(response.text)
+    assert [e["type"] for e in events] == []
+    assert all(t["content"] != "a reply nobody asked for any more" for t in wired_session.display)
+    # Only the early save ran; the indexed save on the success path did not.
+    assert save_calls == [None]
+    assert appmod._session["running"] == {}
+
+
+def test_stop_on_an_idle_session_404s(wired_session):
+    """
+    Stopping a session with nothing in flight is a 404, not a silent success —
+    the browser can then tell the difference between "cancelled" and "there
+    was nothing to cancel".
+    """
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/chat/stop", json={"session_id": wired_session.id})
+    assert response.status_code == 404
+    assert "no reply is being generated" in response.json()["detail"]
+
+
+def test_stop_clears_only_its_own_sessions_pending_dialogs(wired_session, monkeypatch):
+    """
+    A confirmation dialog the stopped turn put up is no longer actionable, but
+    another session's pending dialogs must survive — the same per-session rule
+    _clear_pending_for follows everywhere else.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+
+    turn_started = threading.Event()
+    provider = FakeProvider(None)
+
+    def blocking_behavior(messages, tools, dispatch_fn, system):
+        turn_started.set()
+        for _ in range(100):
+            provider.cancel.check()
+            time.sleep(0.02)
+        pytest.fail("the turn was never cancelled")
+
+    provider.behavior = blocking_behavior
+    appmod._session["provider"] = provider
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    post_thread = threading.Thread(
+        target=lambda: client.post(
+            "/chat", json={"message": "hi", "session_id": wired_session.id}
+        )
+    )
+    post_thread.start()
+    assert turn_started.wait(timeout=10)
+
+    appmod._session["pending_actions"] = {
+        "mine": {"session_id": wired_session.id, "action": {"ids": [], "title": "mine"}},
+        "theirs": {"session_id": "another-session", "action": {"ids": [], "title": "theirs"}},
+    }
+
+    client.post("/chat/stop", json={"session_id": wired_session.id})
+    post_thread.join(timeout=10)
+
+    assert list(appmod._session["pending_actions"]) == ["theirs"]
+    appmod._session["pending_actions"] = {}  # leave the shared state clean
+
+
+def test_compaction_emits_a_status_event(wired_session, monkeypatch):
+    """
+    Compaction is an extra LLM call before the reply even starts. The browser
+    is told when it begins and when it's over, so a long summarisation shows
+    as "compacting" instead of an unexplained wait.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    monkeypatch.setattr(appmod, "needs_compaction", lambda session, cfg: True)
+    monkeypatch.setattr(appmod, "maybe_compact", lambda *a, **k: True)
+    appmod._session["provider"] = FakeProvider(
+        lambda messages, tools, dispatch_fn, system: "compacted then answered"
+    )
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+
+    events = _parse_sse(response.text)
+    states = [e["state"] for e in events if e["type"] == "status"]
+    assert states == ["compacting", "thinking"]
+    assert [e["type"] for e in events][-1] == "reply"
 
 
 # ── session addressing ───────────────────────────────────────────────────────

@@ -275,19 +275,57 @@ def _split_markdown(content: str) -> list[tuple[str, str]]:
 
 
 # ── Core write operations ─────────────────────────────────────────────────────
+#
+# Each add_* function below splits into two halves: a build_* function that
+# turns its input into Documents without touching the database, and one shared
+# commit_documents() that performs the only write. Keeping the halves separate
+# is what lets a caller assemble a whole document — body, annotations, figure
+# captions — and commit it in a single atomic write. An ingest that is stopped
+# or fails part-way then leaves nothing behind at all, instead of a half-indexed
+# document. See _add_document in jarvis/chat/chat.py for the staged caller.
 
 
-def add_texts(
+def commit_documents(
+    documents: list[Document],
+    store: Chroma | None = None,
+    replace_source: str = "",
+) -> list[str]:
+    """
+    Write staged documents to the knowledge base. Returns the new chunk IDs.
+
+    All of it happens inside one write lock: when replace_source is set, the
+    old entry's chunks are deleted and the new ones added together, so a
+    re-ingest is never observable as "old entry gone, new entry not yet here".
+
+    Cancellation is deliberately not checked in here. This is the point of no
+    return — an interrupted Chroma write is exactly the corruption the staging
+    above exists to prevent, so once we reach this function the write always
+    runs to completion.
+    """
+    s = store or get_store()
+    try:
+        with _kb_write_lock():
+            if replace_source:
+                existing = s._collection.get(where={"source": {"$eq": replace_source}})
+                if existing["ids"]:
+                    s.delete(existing["ids"])
+            if not documents:
+                return []
+            return s.add_documents(documents)
+    except Exception as exc:
+        raise _diagnose_kb_error(exc, f"Failed to add documents: {exc}") from exc
+
+
+def build_text_documents(
     content: str,
     doc_type: str,
     visibility: str,
     source: str,
     extra_metadata: dict | None = None,
-    store: Chroma | None = None,
     embed_header: str = "",
-) -> list[str]:
+) -> list[Document]:
     """
-    Chunk content and add all chunks to the knowledge base. Returns chunk IDs.
+    Chunk content into Documents ready for commit_documents(). Touches nothing.
 
     embed_header, when set, is prepended to the EMBEDDED text of every chunk
     (not just the first) — an author-name or title-word query must be able to
@@ -315,26 +353,39 @@ def add_texts(
         body = f"{breadcrumb}\n{chunk_text}" if breadcrumb else chunk_text
         page_content = f"{embed_header}\n{body}" if embed_header else body
         documents.append(Document(page_content=page_content, metadata=metadata))
-    s = store or get_store()
-    try:
-        with _kb_write_lock():
-            return s.add_documents(documents)
-    except Exception as exc:
-        raise _diagnose_kb_error(exc, f"Failed to add documents: {exc}") from exc
+    return documents
 
 
-def add_annotations(
+def add_texts(
+    content: str,
+    doc_type: str,
+    visibility: str,
+    source: str,
+    extra_metadata: dict | None = None,
+    store: Chroma | None = None,
+    embed_header: str = "",
+) -> list[str]:
+    """Chunk content and add all chunks to the knowledge base. Returns chunk IDs."""
+    documents = build_text_documents(
+        content, doc_type, visibility, source,
+        extra_metadata=extra_metadata, embed_header=embed_header,
+    )
+    if not documents:
+        return []
+    return commit_documents(documents, store)
+
+
+def build_annotation_documents(
     pdf_path: Path,
     doc_type: str,
     visibility: str,
     source: str,
     title: str = "",
     file_path: str = "",
-    store: Chroma | None = None,
-) -> list[str]:
+) -> list[Document]:
     """
-    Extract highlights/typed comments from a PDF and index each as its own
-    searchable chunk. Returns the chunk IDs ([] when the PDF has none).
+    Extract highlights/typed comments from a PDF as Documents, one per
+    annotation, ready for commit_documents(). Returns [] when the PDF has none.
 
     The embedded text is prefixed "[HIGHLIGHT p.N]" or "[USER NOTE p.N]" so
     retrieval (and the chat agent reading the results) can tell user-marked
@@ -372,15 +423,31 @@ def add_annotations(
             metadata["file_path"] = file_path
         documents.append(Document(page_content=page_content, metadata=metadata))
 
-    s = store or get_store()
-    try:
-        with _kb_write_lock():
-            return s.add_documents(documents)
-    except Exception as exc:
-        raise RAGError(f"Failed to add annotations: {exc}") from exc
+    return documents
 
 
-def add_figures(
+def add_annotations(
+    pdf_path: Path,
+    doc_type: str,
+    visibility: str,
+    source: str,
+    title: str = "",
+    file_path: str = "",
+    store: Chroma | None = None,
+) -> list[str]:
+    """
+    Extract a PDF's highlights/typed comments and index each as its own
+    searchable chunk. Returns the chunk IDs ([] when the PDF has none).
+    """
+    documents = build_annotation_documents(
+        pdf_path, doc_type, visibility, source, title=title, file_path=file_path
+    )
+    if not documents:
+        return []
+    return commit_documents(documents, store)
+
+
+def build_figure_documents(
     pdf_path: Path,
     doc_type: str,
     visibility: str,
@@ -389,14 +456,19 @@ def add_figures(
     provider_str: str,
     title: str = "",
     file_path: str = "",
-    store: Chroma | None = None,
     *,
     enabled: bool | None = None,
-) -> list[str]:
+    cancel=None,
+) -> list[Document]:
     """
     Caption a PDF's embedded figures with the active provider's vision model
-    and index one chunk per figure. Returns the chunk IDs ([] when there are
-    no figures, captioning is disabled, or the privacy guard blocks it).
+    and build one Document per figure, ready for commit_documents(). Returns []
+    when there are no figures, captioning is disabled, or the privacy guard
+    blocks it.
+
+    This is the slowest build step by far — one vision call per figure — so
+    cancel is checked before each one. Nothing has been written at this point,
+    so a stop here simply throws the captions away.
 
     enabled=None follows cfg.figure_captions (off by default); enabled=True
     forces captioning for this one document — the per-document opt-in behind
@@ -441,8 +513,12 @@ def add_figures(
 
     documents = []
     for index, figure in enumerate(figures):
+        if cancel is not None:
+            cancel.check()
         try:
-            caption = provider_obj.describe_image(figure["image_bytes"], context=title)
+            caption = provider_obj.describe_image(
+                figure["image_bytes"], context=title, cancel=cancel
+            )
         except LLMError as exc:
             print(f"  ⚠️  figure caption failed (p.{figure['page']}): {exc}", flush=True)
             continue
@@ -463,15 +539,33 @@ def add_figures(
             metadata["file_path"] = file_path
         documents.append(Document(page_content=page_content, metadata=metadata))
 
+    return documents
+
+
+def add_figures(
+    pdf_path: Path,
+    doc_type: str,
+    visibility: str,
+    source: str,
+    provider_obj,
+    provider_str: str,
+    title: str = "",
+    file_path: str = "",
+    store: Chroma | None = None,
+    *,
+    enabled: bool | None = None,
+) -> list[str]:
+    """
+    Caption a PDF's embedded figures and index one chunk per figure. Returns
+    the chunk IDs ([] when there is nothing to caption).
+    """
+    documents = build_figure_documents(
+        pdf_path, doc_type, visibility, source, provider_obj, provider_str,
+        title=title, file_path=file_path, enabled=enabled,
+    )
     if not documents:
         return []
-
-    s = store or get_store()
-    try:
-        with _kb_write_lock():
-            return s.add_documents(documents)
-    except Exception as exc:
-        raise RAGError(f"Failed to add figures: {exc}") from exc
+    return commit_documents(documents, store)
 
 
 def _source_exists(source: str, store: Chroma) -> bool:
@@ -507,6 +601,40 @@ def _title_exists(title: str, store: Chroma) -> bool:
         return False
 
 
+def build_paper_documents(
+    paper: dict,
+    dense_summary: str,
+    score: int = 0,
+    track: str = "",
+    storage_mode: str = "summary",
+) -> list[Document]:
+    """
+    Assemble a paper's summary into Documents ready for commit_documents().
+
+    The chunked text leads with title, source URL and authors so a chunk can
+    match on any of them, then carries the dense summary.
+    """
+    source = paper.get("link", "")
+    header_lines = [paper.get("title", ""), source]
+    if paper.get("authors"):
+        header_lines.append(paper["authors"])
+    content = "\n".join(header_lines) + f"\n\n{dense_summary}"
+    return build_text_documents(
+        content=content,
+        doc_type="paper",
+        visibility="public",
+        source=source,
+        extra_metadata={
+            "title": paper.get("title", ""),
+            "authors": paper.get("authors", ""),
+            "doi": paper.get("doi", ""),
+            "score": int(score),
+            "track": str(track),
+            "storage_mode": storage_mode,
+        },
+    )
+
+
 def add_paper(
     paper: dict,
     dense_summary: str,
@@ -526,25 +654,12 @@ def add_paper(
     source = paper.get("link", "")
     if not allow_duplicate and (_source_exists(source, s) or _title_exists(paper.get("title", ""), s)):
         return []
-    header_lines = [paper.get("title", ""), source]
-    if paper.get("authors"):
-        header_lines.append(paper["authors"])
-    content = "\n".join(header_lines) + f"\n\n{dense_summary}"
-    return add_texts(
-        content=content,
-        doc_type="paper",
-        visibility="public",
-        source=source,
-        extra_metadata={
-            "title": paper.get("title", ""),
-            "authors": paper.get("authors", ""),
-            "doi": paper.get("doi", ""),
-            "score": int(score),
-            "track": str(track),
-            "storage_mode": storage_mode,
-        },
-        store=s,
+    documents = build_paper_documents(
+        paper, dense_summary, score=score, track=track, storage_mode=storage_mode
     )
+    if not documents:
+        return []
+    return commit_documents(documents, s)
 
 
 def add_papers_batch(

@@ -65,8 +65,6 @@ A personal research tool that:
 ├── docs/
 │   ├── DESIGN.md                    # This file
 │   ├── TESTING.md
-│   ├── TODO.md
-│   ├── ROADMAP.md
 │   └── CHANGELOG.md
 └── pyproject.toml
 ```
@@ -272,6 +270,8 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 | `add_papers_batch(entries)` | Batch add from digest; no extra LLM call |
 | `add_texts(content, doc_type, visibility, source, ..., embed_header="")` | Low-level: section-aware chunk and add; `embed_header` is prepended to the embedded text of every chunk (metadata untouched) |
 | `add_annotations(pdf_path, doc_type, visibility, source, ...)` | Extract highlights/typed notes from a PDF and index each as its own chunk (see Annotations) |
+| `build_text_documents(...)` · `build_annotation_documents(...)` · `build_figure_documents(...)` · `build_paper_documents(...)` | The build half of each `add_*`: turn input into `Document`s, touching nothing (see Staged writes) |
+| `commit_documents(documents, store, replace_source="")` | The only write. Optional delete of a replaced source plus the add, inside one write lock |
 | `search(query, n_results, visibility, doc_type, annotation_kind, rerank=True)` | Hybrid (dense+BM25, gated by `[rag] hybrid`) or dense-only search with filters, then optional cross-encoder re-ranking; `doc_type` accepts one type or a list (`$in` filter, e.g. `["paper", "digest"]`); raises `KBCorruptionError` on a stale-id failure |
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
@@ -285,6 +285,31 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 | `find_pdf_notes()` / `reclassify_notes_as_papers(sources)` | `kb doctor` migration helpers: find legacy `doc_type="note"` chunks with a `.pdf` `file_path`, and flip public ones to `doc_type="paper"` in place |
 
 **Cross-process write lock (`_kb_write_lock`).** The daemon, webapp, and CLI all open the same ChromaDB `PersistentClient` directory, and Chroma's SQLite backend is not safe for concurrent multi-process writers. Every write path takes an advisory `flock` on `<rag_dir>/.write.lock` (re-entrant per thread, so composite operations like `refresh_vault` → `add_texts` don't self-deadlock). Reads stay unlocked — SQLite WAL handles concurrent readers.
+
+### Staged writes — all-or-nothing ingest
+
+Every `add_*` function splits into two halves: a `build_*` that turns its input
+into `Document`s without touching the database, and one shared
+`commit_documents()` that performs the only write. `add_texts` /
+`add_annotations` / `add_figures` / `add_paper` are simply build + commit, so
+their signatures and every existing caller are unchanged.
+
+The separation exists so a caller can assemble a *whole* document — body
+chunks, annotation chunks, figure captions — and write it in a single atomic
+commit. `_add_document` (the `add_document` chat tool) does exactly that:
+download, convert, summarise and caption all produce `Document`s in memory,
+with cancel checks between the steps, and one `commit_documents()` at the end.
+An ingest that is stopped or that fails part-way therefore leaves the knowledge
+base **exactly as it was** — never a body with no annotations, and never an old
+entry deleted in favour of a replacement that never arrived (the delete and the
+add share one lock via `replace_source`, which is also why an empty commit with
+`replace_source` set still supersedes the old entry).
+
+Cancellation is deliberately **never** checked inside `commit_documents()`.
+That is the point of no return: an interrupted Chroma write is precisely the
+corruption the staging exists to prevent, so once the commit starts it always
+runs to completion. Vault indexing (`refresh_vault`) is already one write per
+file, so a stop there leaves whole files indexed and never a partial one.
 
 ### Annotations — `jarvis/kb/annotations.py`
 
@@ -461,35 +486,98 @@ index_scored_papers()           →  score-tiered knowledge-base indexing
 
 ## LLM providers — `jarvis/core/llm.py`
 
-`ChatProvider` protocol — four methods used across the system:
+`ChatProvider` protocol — four methods used across the system. Every one takes
+an optional `cancel` token (see Cancellation below); callers that can't be
+interrupted — the digest pipeline, the sync daemon, the `kb` CLI — leave it
+`None`.
 
 ```python
-complete(messages, max_tokens, context_length) -> str
+complete(messages, max_tokens, context_length, cancel) -> str
 # Single-shot completion. context_length sets Ollama's num_ctx; ignored by Anthropic.
 
-summarize(title, source, max_tokens) -> str
+summarize(title, source, max_tokens, cancel) -> str
 # Dense paper summary. source: str (abstract) or Path (PDF).
 
-agentic_turn(messages, tools, dispatch_fn, system) -> str
-# Full tool-calling loop. Modifies messages in place.
+agentic_turn(messages, tools, dispatch_fn, system, cancel) -> str
+# Full tool-calling loop. Appends to the messages list it is given.
 
-describe_image(image_bytes, context) -> str
+describe_image(image_bytes, context, cancel) -> str
 # Caption one PDF figure for indexing. context is the document title.
 ```
+
+**All requests are streamed**, through each adapter's single `_request()`
+helper — the only place either provider makes an HTTP call. This is not about
+showing tokens as they arrive (replies are still delivered whole); it is what
+makes a turn interruptible. A blocking non-streaming call offers no moment to
+bail out of, whereas a stream can be checked between events and closed
+part-way. `_request()` is also the only place the `try/except → LLMError`
+wrapping lives, and it deliberately re-raises `TurnCancelled` and
+`KeyboardInterrupt` rather than folding them into `LLMError`.
 
 **`OllamaProvider`** talks to a local Ollama server (`http://localhost:11434`) via the `ollama` python client. One Ollama process keeps the model resident across the CLI, webapp, and sync daemon. Notes:
 
 - Requires a model with tool-calling and (for figure captioning / vision summaries) vision support; the default is `qwen3-vl:30b`.
-- Ollama returns tool arguments as a **mapping already** (not a JSON string like the OpenAI wire format), so they are used directly; a defensive `json.loads` covers the unlikely string case.
-- The assistant message with tool calls is a pydantic object; it is normalised to a plain dict via `model_dump(exclude_none=True)` (`_message_to_dict`) so session history stays JSON-serialisable.
+- Ollama returns tool arguments as a **mapping already** (not a JSON string like the OpenAI wire format), so they are used directly; a defensive `json.loads` covers the unlikely string case (`_tool_arguments`).
+- `_request()` assembles the streamed chunks into the assistant message itself — concatenating `content` and collecting `tool_calls` from whichever chunk carries them — returning a plain dict. Session history therefore stays JSON-serialisable by construction, with no pydantic object to normalise.
 - Ollama honours a per-request context window, so `complete()` passes `context_length` through as `options={"num_ctx": ...}`.
 - `summarize()` with a PDF path converts to Markdown locally first (`pdf_to_markdown`) — Ollama has no document input in this flow.
 - `describe_image()` sends the image via `images=[bytes]`.
 - `PrivacyError` from a tool pops the just-appended assistant message and returns immediately, same contract as the Anthropic adapter.
 
-**`AnthropicProvider`** — API-key auth (`ANTHROPIC_API_KEY` env var, then `config.anthropic_api_key`); `summarize()` uploads the PDF as a base64 `document` block (safe because only public papers ever reach that path — see the invariant); `describe_image()` sends a base64 `image` block; tool results are bundled into a single `user` message of `tool_result` blocks.
+**`AnthropicProvider`** — API-key auth (`ANTHROPIC_API_KEY` env var, then `config.anthropic_api_key`); `summarize()` uploads the PDF as a base64 `document` block (safe because only public papers ever reach that path — see the invariant); `describe_image()` sends a base64 `image` block; tool results are bundled into a single `user` message of `tool_result` blocks. `_request()` uses `client.messages.stream(...)` and returns `get_final_message()`, which reassembles exactly the `Message` the old non-streaming `messages.create()` returned (content blocks plus `stop_reason`), so nothing downstream of the call changed.
 
 A single `_FIGURE_CAPTION_PROMPT` is shared by both providers' `describe_image()`, so captions read the same regardless of model.
+
+### Cancellation — `jarvis/core/cancel.py`
+
+A `CancelToken` is one turn's stop switch: `stop()` from another thread,
+`check()` on the thread doing the work, raising `TurnCancelled`. Python threads
+cannot be killed and the HTTP call cannot be interrupted by a signal, so
+stopping is cooperative — but placed so that two things hold the instant
+`stop()` returns:
+
+- **Nothing further is sent.** `agentic_turn` checks at the top of every loop
+  iteration, so a turn stopped between iterations never issues another request.
+- **The message list is never touched again.** It checks a second time
+  immediately after `_request()` returns, *before* any `append`. Without that,
+  a stopped turn could leave an assistant `tool_use` message with no matching
+  `tool_result` bundle, which 400s the *next* turn. A stop landing while a tool
+  runs pops the assistant message first, exactly as the `PrivacyError` path
+  does.
+
+Streaming is what makes it abrupt rather than merely eventual: `check()` runs
+between streamed events, and raising there unwinds the streaming context
+manager, which closes the HTTP response. **Closing the connection is the kill
+signal** — neither Anthropic's Messages API nor Ollama has a
+cancel-this-request endpoint, and both stop generating when the client
+disconnects. Measured against both live services, a cancelled turn's thread
+dies within 0.1 s of `stop()`.
+
+The limit of the technique: there is nothing to check *between* until the first
+event arrives, so a request still waiting on it — Ollama cold-loading a 30B
+model, say — cannot be interrupted at all yet. This is why the webapp's stop
+never waits for the worker (see Stopping a turn); the user's side of the stop
+must not be hostage to it.
+
+`TurnCancelled` is deliberately **not** an `LLMError`: the `LLMError` handlers
+turn a failure into a "⚠️ …" assistant reply saved to the session, and a
+stopped turn must leave no trace. `_add_document`'s broad `except Exception`
+re-raises it for the same reason — a stop reported back to the model as a tool
+error is a stop the model tries to work around.
+
+The token only exists where the work happens on a *different* thread, i.e. the
+webapp. The terminal CLI runs its turn on the main thread, where `Ctrl-C`
+already delivers `KeyboardInterrupt` into the blocked call and unwinds through
+the same streaming context manager — so it needs no token and no signal
+handler.
+
+**Turn rollback.** `agentic_turn` appends to the list it is given, so both
+callers hand it a *copy* of `session.messages` and commit it back
+(`session.messages[:] = working`) only once a reply actually arrives. A
+stopped turn therefore has nothing to unwind at the wire level, and
+`rollback_turn(session)` just drops the user's question from `messages`,
+`display`, and `turn_starts` together. The re-save on that path passes no
+`store=`, so an abandoned turn is never indexed as a chat exchange.
 
 `make_provider(spec, model=None)` factory:
 - `"anthropic"` → `AnthropicProvider` with config `anthropic_model` (or the override)
@@ -503,6 +591,8 @@ A single `_FIGURE_CAPTION_PROMPT` is shared by both providers' `describe_image()
 ## KB agent — `jarvis/chat/chat.py`
 
 Single `run_session(vault, kb_only=True, session=None)` loop using `provider.agentic_turn()`. Every tool call is printed to the terminal (`→ tool_name(args)`) so the user sees each step. Each turn runs through the persistent `Session` (see Sessions below): compaction check, turn recorded, saved after the reply. CLI flags `--list-sessions` and `--resume <id>` list and resume stored sessions.
+
+**`Ctrl-C` kills everything.** It still means "quit", but now it cancels the request on the way out instead of dumping a traceback. `KeyboardInterrupt` is a `BaseException`, so it passes straight through the providers' `except Exception` handlers and unwinds the streaming context manager — which closes the connection and stops the model generating. `run_session` catches it around both `maybe_compact()` and `agentic_turn()`, calls `rollback_turn(session)` so the saved session has no trace of the abandoned turn, and exits 130. Ctrl-D at the idle prompt still quits normally.
 
 `build_system_prompt(kb_only=True, response_style="", skills=None)` loads the base prompt from `~/.jarvis/system_prompt.md` if present, otherwise uses the built-in default, then appends:
 1. a knowledge-source instruction based on `kb_only`,
@@ -530,7 +620,7 @@ Single `run_session(vault, kb_only=True, session=None)` loop using `provider.age
 | `get_document` | Read one document's stored chunks in full, paginated (15/page) — works for anything indexed, including PDFs | `PrivacyError` if any chunk of the document is private |
 | `read_file` | Read one vault Markdown file in full (after search identifies it); cannot open PDFs — use `get_document` for those | `PrivacyError` for files whose resolved path is in `private_vault_dirs` |
 | `read_skill` | Load a user-defined skill's full instructions (or one named supporting file); only in the tools list when skills exist | Any (skills are the user's own trusted files) |
-| `add_document` | Add a paper — arXiv URL or local PDF, always public; two storage modes (see below); title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry (old chunks deleted first), which is the reingest-with-figures path | Any |
+| `add_document` | Add a paper — arXiv URL or local PDF, always public; two storage modes (see below); title/authors/DOI auto-inferred for local PDFs unless overridden; `with_figures=true` opts this document into figure captioning; on a source/title duplicate returns an ask-the-user message unless `allow_duplicate=true` — a same-source re-add then **replaces** the old entry in the same atomic commit as the new one (see Staged writes), which is the reingest-with-figures path. The only tool that takes the cancel token: it is the one slow enough to be worth interrupting | Any |
 | `update_file_path` | Update stored path for a local document without re-embedding | Any |
 | `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only | Any |
 | `remove_document` | One call: immediately shows a **human** confirmation prompt; only that human answer executes the removal — database entry only, files on disk are never touched (see Security) | Any |
@@ -550,11 +640,11 @@ The tool exposes two modes; the LLM asks the user which to use if not specified:
 | `summary` (default for papers) | abstract/PDF → LLM generates ~1000-word summary → chunk | 1–2 | Most papers — fast, compact |
 | `full_text` | download PDF → `pdf_to_markdown()` → chunk raw Markdown | Many | Papers the user wants to query at paragraph level |
 
-Both modes also run `add_annotations()` and `add_figures()` on local PDFs, so highlights/typed notes and captioned figures are indexed even when the body is stored as a summary.
+Both modes also index a local PDF's annotations and figure captions, so highlights/typed notes and captioned figures are stored even when the body is a summary. All of it — body, annotations, figures, and the delete of a replaced entry — goes in as **one atomic commit** at the end (see Staged writes), so a stopped or failed add leaves nothing partial behind.
 
 For local PDFs, an optional `title`/`authors`/`doi` override is also accepted. Local PDFs are always indexed as public papers — there is no `doc_type`/`visibility` choice, since notes come exclusively from the Obsidian vault.
 
-**Duplicate handling** — a paper can now arrive via arXiv and bioRxiv under different URLs, so `add_paper` and the manual-add paths skip on a normalised-title match as well as a source-URL match (`_title_exists` in `store.py`). The digest batch skips silently and reports `(added, skipped)`; `kb add` prompts `[y/N]`; the chat `add_document` tool returns an ask-the-user message and only proceeds when re-invoked with `allow_duplicate=true`. **Re-adding replaces:** once the user opts in, a SAME-SOURCE duplicate has its old chunks deleted by source before the re-add (annotations and figures share `source`, so the whole old entry is swept) — the store never holds two copies of one source. A same-title-but-different-source duplicate deletes nothing and becomes a separate entry. This replace path is how an already-indexed paper gets reingested with figure captions on.
+**Duplicate handling** — a paper can now arrive via arXiv and bioRxiv under different URLs, so `add_paper` and the manual-add paths skip on a normalised-title match as well as a source-URL match (`_title_exists` in `store.py`). The digest batch skips silently and reports `(added, skipped)`; `kb add` prompts `[y/N]`; the chat `add_document` tool returns an ask-the-user message and only proceeds when re-invoked with `allow_duplicate=true`. **Re-adding replaces:** once the user opts in, a SAME-SOURCE duplicate has its old chunks deleted by source in the same commit that adds the new ones (annotations and figures share `source`, so the whole old entry is swept) — the store never holds two copies of one source, and never zero either. A same-title-but-different-source duplicate deletes nothing and becomes a separate entry. This replace path is how an already-indexed paper gets reingested with figure captions on.
 
 ### `remove_document` flow — one-shot human confirmation
 
@@ -581,6 +671,8 @@ One JSON file per session in `~/.jarvis/sessions/<id>.json` (dir 0700, files 060
 - `check_resume()` refuses to resume a private session under the cloud provider (it would replay private history to Anthropic) and refuses cross-provider resumes. The provider match is strict per name (only `anthropic` shares a family with itself), so a session recorded under the retired `llamacpp` provider refuses to resume under `ollama` rather than replaying an incompatible history.
 
 **Compaction** — `maybe_compact()` runs before each turn. When `estimate_tokens(messages)` (serialised JSON length / 4 — crude but adequate) exceeds `compact_after_tokens`, everything before the last `compact_keep_exchanges` turns is summarised by the session's **own provider** (a private session is by definition local, so private history never goes to a cloud model for summarisation) and replaced with a two-message summary pair. The cut always lands on a `turn_starts` boundary, keeping `tool_use`/`tool_result` message structure intact. The `display` list is untouched — the UI always shows full history — and chat-history indexing is display-driven, so search is unaffected.
+
+`needs_compaction(session, cfg)` is the same decision without the side effect, split out so both front ends can *say* it is happening — compaction is a second LLM call before the turn's own, and on a long history it is a long pause that otherwise looks like a hang. The webapp emits a `status` SSE event and the CLI prints a line; `maybe_compact` also takes the turn's cancel token, and stopping during compaction leaves the session uncompacted rather than half-rewritten (the rewrite only happens once the summary is in hand).
 
 ---
 
@@ -613,7 +705,7 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 | `kb_only` | `True` | Default `kb_only` for brand-new sessions; `POST /config` also updates the *active* session's own `kb_only` (see below) |
 | `response_style` | from config | Current style instruction; updated by `POST /settings` |
 | `pending_actions` | `{}` | Deletions awaiting the user's Confirm/Cancel click, keyed by token: `{token: {session_id, action}}`. Each dialog owns its own token, so several stacked confirmations (e.g. a bulk removal) are each independently confirmable — confirming or cancelling one only pops its own entry. `session_id` lets a new turn on session S clear only S's own dialogs (`_clear_pending_for`) without touching any other session's — including one that's mid-turn concurrently. `POST /confirm-action` itself does not check `session_id`: token possession is the capability, regardless of which session happens to be active in the browser right now |
-| `running` | `{}` | `{session_id: live Session object}` — every session currently mid-turn in its own `run_agent` background thread. A second `/chat` addressed at an id already in here 409s; resuming that id installs this *same live object* (not a stale disk copy); `sessions_delete` refuses to delete an id that's in here |
+| `running` | `{}` | `{session_id: RunningTurn}` — every session currently mid-turn in its own `run_agent` background thread. A `RunningTurn` carries the live `session` (the object the thread is mutating), the turn's `cancel` token, its event `queue`, and its `thread`. A second `/chat` addressed at an id already in here 409s; resuming that id installs that *same live session object* (not a stale disk copy); `sessions_delete` refuses to delete an id that's in here; `/chat/stop` reaches in to cancel the turn |
 
 **Routes:**
 
@@ -633,6 +725,7 @@ Browser-based alternative to `vault-chat`. Runs on `http://127.0.0.1:8080` (loca
 | `POST /settings` | `{response_style}` — applies immediately (next turn's system prompt is built fresh, see below) and persists to `config.toml` via tomlkit |
 | `POST /confirm-action` | `{confirmed: bool, token: str}` — the human decision point for one pending deletion; pops that token from `pending_actions` and executes `execute_remove()` or cancels; 409 if the token isn't in the dict |
 | `POST /chat` | Accepts `{message, session_id}`, streams SSE events; 409 if `session_id` is already in `running`; 404 if `session_id` isn't the active session and has no file on disk; 409 if it's a stored session `check_resume` refuses |
+| `POST /chat/stop` | `{session_id}` — the forceful stop. Cancels the turn, ends its SSE stream immediately with a `stopped` event, rolls the turn back, deregisters the session, and clears that session's pending dialogs. Returns `{stopped: true, rolled_back: bool}` (`rolled_back: false` means a finished reply won the race and stands); 404 if nothing is running for that id. See Stopping a turn below |
 | `GET /papers` | `?q=<search>` — every indexed paper (`list_papers`, de-duplicated by source, most-recent-first), optionally narrowed by a case-insensitive substring match over title/authors/doi/source. Each row: title, authors, doi, source, storage_mode, visibility, score, track, date_added, chunk_count, file_path |
 | `POST /papers/meta` | `{source, title?, authors?, doi?}` — wraps `update_paper_metadata`; sets only the given fields, no re-embedding; 404 if `source` matches no chunks |
 | `POST /papers/remove` | `{source}` — wraps `execute_remove` directly (not the token-confirmed `/confirm-action` flow); 404 if `source` matches no chunks. Human-only by construction: no chat tool references this route, so the model can never reach it; see Security below |
@@ -652,28 +745,41 @@ Browser POST /chat {message, session_id}
     kb_only (not a cached global) — so a /config change or a resumed
     session's own setting is never silently ignored for this turn
   → clears only this session's pending_actions, registers
-    _session["running"][session.id] = session on the event loop (before the
-    thread spawns, so a second /chat for the same id racing in immediately
-    after still sees the busy guard)
+    _session["running"][session.id] = RunningTurn(...) on the event loop
+    (before the thread spawns, so a second /chat for the same id racing in
+    immediately after still sees the busy guard — and so /chat/stop can find
+    the turn even if the stop arrives almost at once)
   → spawns a background thread running run_agent()
-      → runs maybe_compact(), records the turn in the session
+      → if needs_compaction(): pushes {type: "status", state: "compacting"},
+        runs maybe_compact(), then {type: "status", state: "thinking"} — the
+        summarisation is a whole extra LLM call, so the browser names the wait
+        instead of showing a bare "Working..."
+      → records the turn in the session
       → save_session(session) immediately — no store=, so no indexing/prune
         side effects, but the user's message is now on disk even if the
         browser switches sessions or the process dies before the reply lands
-      → calls provider.agentic_turn(); each tool call pushes {type: "tool"}
-        to the queue as it fires; a deletion request pushes
+      → calls provider.agentic_turn() with a COPY of session.messages and the
+        turn's cancel token; each tool call pushes {type: "tool"} to the queue
+        as it fires; a deletion request pushes
         {type: "confirm", description, token} and adds
         {token: {session_id, action}} to pending_actions
-      → on success: appends the reply to display, save_session(session, store=...)
-        (this save also indexes new exchanges and prunes old sessions)
+      → on success: commits the copy back to session.messages, appends the
+        reply to display, save_session(session, store=...) (this save also
+        indexes new exchanges and prunes old sessions)
+      → on TurnCancelled: touches nothing at all. /chat/stop already rolled
+        the turn back, freed the session and told the browser, and the session
+        may already be running a newer turn. No reply event and no log entry
+        either — a stop is not a failure
       → on LLMError or any other exception: logs it (log.exception, so
         ~/.jarvis/logs/chat.log gets the traceback), builds a ⚠️ reply instead,
         and saves the session so the error turn survives a refresh
-      → finally: pushes {type: "reply", ...} + the None sentinel, and pops
-        session.id from _session["running"] — this always runs, so the SSE
-        stream never hangs even if the turn crashed outright. No reinstall
-        step: resume installs the live registry object directly (see above),
-        so there is never a stale copy to reconcile
+      → finally: pushes {type: "reply", ...} unless the turn was stopped (a
+        stopped turn's reply was cancelled, and /chat/stop already sent the
+        browser its terminal events), then ALWAYS pushes the None sentinel —
+        it is the only thing that ends the SSE stream. Finally deregisters
+        session.id, but only if the registered turn is still this one. No
+        reinstall step: resume installs the live registry object directly
+        (see above), so there is never a stale copy to reconcile
   → async SSE generator drains the queue (50 ms poll) and yields data: lines
 Browser reads the stream via fetch() + ReadableStream
   → tool events (regular): appended live to an open <details> box
@@ -690,9 +796,62 @@ Browser reads the stream via fetch() + ReadableStream
 
 **Resuming into a running turn:** if `resumeSession` finds `busy: true` in the resume response (the resumed session's own turn is still in flight — e.g. the user switched away mid-turn and back again), the frontend shows a "Working..." placeholder and polls `GET /sessions` every ~2 s until that session's id is no longer in the `busy` list, then re-renders from `GET /history`. A generation counter bumped on every successful resume guards this: a poll left over from an earlier resume checks its snapshot against the current value and stops rather than clobbering a conversation the user has since navigated away from again (a failed resume doesn't bump it, so the previous session's still-legitimate poll survives). The `/history` fetch is correct by construction because resume installs the exact live object `run_agent` is mutating (see the request flow above) — there is nothing stale left to reconcile.
 
-**True parallel sessions:** any number of sessions can be mid-turn at once, each in its own background thread and its own SSE stream. The composer's disabled state is keyed per session (`inFlight` set of session ids the current tab has sent to, unioned with the server's `busy` list from `/sessions`) via `updateComposerState()`, so a slow turn in one session never locks the composer for another. A sidebar row for a busy session gets a `.busy` class (pulsing dot).
+**True parallel sessions:** any number of sessions can be mid-turn at once, each in its own background thread and its own SSE stream. The composer's state is keyed per session (`inFlight` set of session ids the current tab has sent to, unioned with the server's `busy` list from `/sessions`) via `updateComposerState()`, so a slow turn in one session never locks the composer for another. While the viewed session is mid-turn, `updateComposerState()` swaps **Send for a red Stop button** rather than merely greying Send out, so there is always something to click when a reply runs away. A sidebar row for a busy session gets a `.busy` class (pulsing dot).
 
-**SSE event types:** `tool` (name + arg summary), `confirm` (deletion description + token), `reply` (final text, tool-call log, session `private` flag). The tool-call arg summary elides overly long values with a shared middle-ellipsis helper (`truncate_middle` in `chat.py`, used by both the CLI and the webapp) so a `file:///` URI's filename stays visible.
+**Rolling back a turn in the browser:** `rollbackTurn()` removes the optimistic user bubble and the assistant placeholder and hands the typed text back — to the live textarea if that session is still on screen, otherwise to its draft. Both the `stopped` event and a failed request use it; only the failure adds a "⚠️ Request failed" bubble, because a deliberate stop is not an error. No `AbortController` is involved: the server ends the stream itself, which keeps one code path for both. The exception is stopping a turn this tab only *resumed* into rather than sent: there is no stream reader to receive the `stopped` event, so `stopGeneration()` re-renders from `/history` (already rolled back server-side) to clear the "Working..." placeholder.
+
+**Stopping a turn.** `POST /chat/stop` cancels the turn **and abandons it in
+the same breath** — it does the cleanup itself rather than waiting for the
+worker thread to notice:
+
+1. **Cancels the turn** (`turn.cancel.stop()`), then
+2. **Frees the browser** by putting the `stopped` event and the `None` sentinel
+   on the queue itself, on the event loop, so the composer comes back within
+   one 50 ms poll, and
+3. **Rolls the turn back and deregisters the session** — off the event loop via
+   `asyncio.to_thread`, because the lock it needs can be held by a worker doing
+   an indexed save (which embeds text, far too slow to block the loop on).
+
+An earlier design waited for the worker to unwind and let *it* do the rollback.
+That was wrong, and testing against a real cold Ollama model is what showed it:
+the cancel check runs *between* streamed events, so while a request is still
+waiting on its **first** event — a 30B model loading, say — there is nothing to
+check between, and the worker can sit there for 20+ seconds. Waiting on that
+left the session in `running`, so the next message 409'd, which is precisely
+what the stop exists to prevent. How long the worker takes to notice is not
+under our control, so the stop path no longer depends on it.
+
+The worker is therefore no longer the sole writer of session state, and
+`RunningTurn.commit_lock` is what keeps the two sides from interleaving. Both
+outcomes are mutually exclusive and the lock decides which happens:
+
+- The **worker** takes it to commit a finished turn, re-checking the token
+  inside it (`/chat/stop` sets the token *before* taking the lock, so a worker
+  racing to commit sees it and stands down).
+- **`/chat/stop`** takes it to roll a turn back, and skips the rollback if the
+  session's `display` already ends in an assistant turn — the reply won the
+  race, is committed and saved, and deleting it would remove an answer the user
+  is looking at. The response reports which happened as `rolled_back`.
+- The **`LLMError`/crash handlers** go through the same lock
+  (`_record_failed_turn`), because a request dying *because* its connection
+  closed under it looks exactly like an ordinary provider error, and appending
+  a ⚠️ reply to an already-rolled-back turn would leave an assistant bubble
+  with no question above it.
+
+Two invariants keep the abandoned worker harmless. Its `TurnCancelled` branch
+touches **nothing** — by then the session may already be mid-way through a
+newer turn. And its `finally` deregisters the session only if the registered
+turn `is` still its own, since popping by id alone would knock a newer turn out
+of the busy guard. The `None` sentinel, though, is pushed unconditionally: it
+is the only thing that ends the SSE stream, and a duplicate is harmless because
+the generator returns on the first one it sees. (Skipping it hung the request
+forever — another bug the tests caught.)
+
+`lifespan`'s shutdown half cancels every live turn and joins briefly, so
+`Ctrl-C` on `uv run webapp` lets each worker close its own upstream connection
+rather than having the socket yanked at interpreter exit.
+
+**SSE event types:** `tool` (name + arg summary), `confirm` (deletion description + token), `status` (`state: "compacting" | "thinking"` — a named wait before the reply starts), `stopped` (the turn was cancelled; terminal, and never accompanied by a `reply`), `reply` (final text, tool-call log, session `private` flag). The tool-call arg summary elides overly long values with a shared middle-ellipsis helper (`truncate_middle` in `chat.py`, used by both the CLI and the webapp) so a `file:///` URI's filename stays visible.
 
 **Per-session input drafts:** the frontend keeps a `drafts` map keyed by session id. `switchDraft(newId)` — called from `resumeSession`, "New chat", and session delete — saves the outgoing session's textarea contents and loads the incoming session's (or blank), so a half-typed message never leaks into the wrong conversation. A failed send restores its text the same way if the user has since switched away from the session it was addressed to.
 
@@ -778,16 +937,18 @@ arXiv (arxiv package) + bioRxiv (details API: categories + keywords)
 ### Vault chat turn
 
 ```
-User message → maybe_compact() → provider.agentic_turn() → tool loop → reply
+User message → maybe_compact() → provider.agentic_turn(copy of messages) → tool loop → reply
+  → commit the message copy back to the session
   → save_session(): write JSON, index new exchanges as doc_type="chat", prune old sessions
+  stopped mid-turn (webapp ⏹ / CLI Ctrl-C) → discard the copy, rollback_turn(), store-free save
 
   retrieve_papers / search_notes  → search_with_privacy_check() → full chunk text + section → wrap in RETRIEVED DATA markers
   get_document                    → get_document_chunks() → privacy check (any private chunk → PrivacyError) → paginate 15/page → wrap
   search_chat_history             → search_with_privacy_check(doc_type="chat") → wrap
   read_file                       → resolved-path privacy check → filesystem read → wrap
   read_skill                      → validated name (+ optional validated file) → SKILL.md + supporting-files listing, or one supporting file
-  add_document (summary mode)     → resolve_pdf_metadata() (local PDFs, always paper/public) → provider.summarize() → add_texts() (+ annotations)
-  add_document (full_text mode)   → download PDF → pdf_to_markdown() → chunk → add_texts() + add_annotations()
+  add_document (summary mode)     → resolve_pdf_metadata() (local PDFs, always paper/public) → provider.summarize() → stage body + annotations + figures → one commit_documents()
+  add_document (full_text mode)   → download PDF → pdf_to_markdown() → stage body + annotations + figures → one commit_documents()
   update_file_path                → update file_path + source URI in all matching chunks; no re-embedding
   update_document_metadata        → update_paper_metadata(); no re-embedding
   remove_document                 → lookup metadata → build preview → request_confirmation → human decides → execute_remove()
