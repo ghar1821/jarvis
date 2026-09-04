@@ -1348,7 +1348,11 @@ a router in the request and the model that ran in the response, so keying by
 the request would pile a whole session's spend under a name that never served
 a token. `record_usage` also records that model as `served_model` when it
 differs from `model_spec`, which is what lets the header say *what* auto
-picked instead of only reporting "auto". Recorded in a `finally`
+picked instead of only reporting "auto". It is cleared again the moment it
+stops being true: when a model answers for itself, and when `apply_switch`
+moves the session to a different model. A routed pick belongs to the model
+that was replaced, so leaving it set made the header claim the new model had
+routed somewhere it never touched. Recorded in a `finally`
 block, so a turn that failed part-way still counts the requests it made.
 Sessions are saved after every completed turn — crash-safe — and empty
 sessions are never written.

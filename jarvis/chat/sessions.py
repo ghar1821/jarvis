@@ -122,8 +122,11 @@ def record_usage(session: Session, spec: str, usage: "dict | None") -> None:
     # Key on what actually ran, so a router's spend breaks down by the models
     # it picked rather than piling up under the router's own name.
     served = str(usage.get("model") or "")
-    if served and served != spec:
-        session.served_model = served
+    if served:
+        # Set when a router picked something else, cleared when the model that
+        # answered is the one that was asked for. Only ever setting it would
+        # leave a stale detour on the session for the rest of its life.
+        session.served_model = served if served != spec else ""
     entry = session.cost.setdefault(served or spec, {"usd": 0.0, "requests": 0})
     entry["usd"] = round(entry["usd"] + float(usage.get("usd", 0.0)), 6)
     entry["requests"] += int(usage.get("requests", 0))

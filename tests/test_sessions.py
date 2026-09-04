@@ -624,3 +624,43 @@ def test_the_routed_model_survives_a_save_and_load(tmp_path):
 
     assert reloaded.served_model == "openrouter:anthropic/claude-sonnet-4.6"
     assert reloaded.model_spec == "openrouter:openrouter/auto"
+
+
+def test_switching_model_clears_the_routers_pick():
+    """
+    The reported bug: switch from `openrouter/auto` to a specific model and
+    the header kept the `→ claude-sonnet-4.6` arrow, claiming the new model
+    routed to something it never touched. The frontend cleared its own copy,
+    but /info and the reply event both read the session, so it came straight
+    back.
+    """
+    from jarvis.chat.models import apply_switch
+    from jarvis.core.config import Config
+
+    session = new_session("openrouter:openrouter/auto")
+    record_usage(session, session.model_spec, {
+        "usd": 0.002, "requests": 1, "model": "openrouter:anthropic/claude-sonnet-4.6",
+    })
+    assert session.served_model == "openrouter:anthropic/claude-sonnet-4.6"
+
+    apply_switch(session, "openrouter:openai/gpt-5",
+                 Config(openrouter_model="openai/gpt-5", openrouter_api_key="k"))
+
+    assert session.served_model == "", "the old router's pick must not survive the switch"
+    assert session.served_spec == "openrouter:openai/gpt-5"
+
+
+def test_a_direct_answer_clears_a_stale_router_pick():
+    """
+    Belt and braces: even without a switch, the next turn on a model that
+    answers for itself clears the detour. Only ever setting it would leave a
+    stale value on the session for the rest of its life.
+    """
+    session = new_session("openrouter:openai/gpt-5")
+    session.served_model = "openrouter:anthropic/claude-sonnet-4.6"   # left over
+
+    record_usage(session, session.model_spec, {
+        "usd": 0.001, "requests": 1, "model": "openrouter:openai/gpt-5",
+    })
+
+    assert session.served_model == ""

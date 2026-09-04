@@ -122,4 +122,9 @@ def apply_switch(session, spec: str, cfg) -> str:
     """Validate and record a switch on the session. Returns the new spec."""
     normalised = validate_switch(spec, session, cfg)
     session.provider, session.model = split_spec(normalised)
+    # A routed pick belongs to the model that was replaced. Leaving it set
+    # makes the header claim the new model routed to something it never
+    # touched — the arrow from openrouter/auto stays pointing at whatever
+    # auto last chose.
+    session.served_model = ""
     return normalised
