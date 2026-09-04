@@ -10,6 +10,11 @@ bill per token / need a running model server. They pin down the PrivacyError
 contract both providers must honour: return the error text, restore message
 history exactly, and make no further LLM call.
 
+Both providers stream their requests, so the fakes below are streams rather
+than single responses. They record whether the stream was closed, because
+closing it is what drops the connection and tells the server to stop
+generating — the mechanism the forceful stop depends on.
+
 Running
 -------
     uv run pytest -m integration          # integration tests only
@@ -22,7 +27,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from jarvis.core.errors import PrivacyError
+from jarvis.core.cancel import CancelToken
+from jarvis.core.errors import PrivacyError, TurnCancelled
 from jarvis.core.llm import (
     AnthropicProvider,
     OllamaProvider,
@@ -169,7 +175,7 @@ class _OllamaMessage:
     """
     Minimal stand-in for the ollama client's pydantic Message object. Ollama
     hands tool_calls back as objects whose function.arguments is already a
-    dict (not a JSON string), and the message normalises via model_dump().
+    dict (not a JSON string), and supports .get() for the plain fields.
     """
 
     def __init__(self, content=None, tool_calls=None):
@@ -179,31 +185,59 @@ class _OllamaMessage:
     def get(self, key, default=None):
         return getattr(self, key, default)
 
-    def model_dump(self, exclude_none=False):
-        dumped = {"role": "assistant", "content": self.content}
-        if self.tool_calls:
-            dumped["tool_calls"] = [
-                {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in self.tool_calls
-            ]
-        return dumped
-
 
 def _ollama_tool_call(name: str, arguments: dict):
     return SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))
 
 
-class _FakeOllamaClient:
-    """Replays a scripted sequence of responses; records every request."""
+class _FakeOllamaStream:
+    """One streamed response: a sequence of chunk messages, closeable."""
 
-    def __init__(self, responses):
-        self._responses = list(responses)
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.closed = False
+
+    def __iter__(self):
+        for message in self._chunks:
+            yield {"message": message}
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeOllamaClient:
+    """
+    Replays a scripted sequence of streamed responses — one list of chunk
+    messages per request — and records every request and stream handed out.
+    """
+
+    def __init__(self, turns):
+        self._turns = list(turns)
         self.calls: list[dict] = []
+        self.streams: list[_FakeOllamaStream] = []
 
     def chat(self, **kwargs):
         self.calls.append(kwargs)
-        message = self._responses.pop(0)
-        return {"message": message}
+        stream = _FakeOllamaStream(self._turns.pop(0))
+        self.streams.append(stream)
+        return stream
+
+
+class _StopAfterChunks(CancelToken):
+    """
+    A token that stops itself once it has been checked `allowed` times —
+    stands in for the human hitting stop while a response streams in.
+    """
+
+    def __init__(self, allowed: int):
+        super().__init__()
+        self._remaining = allowed
+
+    def check(self):
+        if self._remaining <= 0:
+            self.stop()
+        self._remaining -= 1
+        super().check()
 
 
 def test_ollama_agentic_turn_dispatches_tools_with_dict_args():
@@ -212,17 +246,18 @@ def test_ollama_agentic_turn_dispatches_tools_with_dict_args():
     as a dict without any JSON parsing. The wire sent to Ollama uses its
     role="tool" / tool_name shape, while the history appended to `messages` is
     the provider-neutral transcript — that split is what lets the next turn run
-    on a different model.
+    on a different model. Content split across chunks is reassembled into one
+    reply.
 
-    Input:  scripted tool_use response then a text response
+    Input:  scripted tool_use response then a two-chunk text response
     Expected output: dispatch got dict args; reply text returned; neutral
             history has the tool_call block, its tool_result, and the reply
     """
     provider = OllamaProvider(model="test-model")
     provider._client = _FakeOllamaClient(
         [
-            _OllamaMessage(tool_calls=[_ollama_tool_call("read_file", {"path": "notes.md"})]),
-            _OllamaMessage(content="Here is the summary."),
+            [_OllamaMessage(tool_calls=[_ollama_tool_call("read_file", {"path": "notes.md"})])],
+            [_OllamaMessage(content="Here is "), _OllamaMessage(content="the summary.")],
         ]
     )
 
@@ -262,7 +297,7 @@ def test_ollama_agentic_turn_privacy_error_stops_cleanly():
     """
     provider = OllamaProvider(model="test-model")
     client = _FakeOllamaClient(
-        [_OllamaMessage(tool_calls=[_ollama_tool_call("read_file", {"path": "private/x.md"})])]
+        [[_OllamaMessage(tool_calls=[_ollama_tool_call("read_file", {"path": "private/x.md"})])]]
     )
     provider._client = client
 
@@ -277,6 +312,86 @@ def test_ollama_agentic_turn_privacy_error_stops_cleanly():
     assert len(client.calls) == 1
 
 
+# ── Unit: cancellation ─────────────────────────────────────────────────────────
+
+
+def test_ollama_cancel_before_request_sends_nothing():
+    """
+    A turn stopped before the loop's first iteration must never reach the
+    server — this is the "if the request has not been sent, don't send it" half
+    of the contract.
+
+    Input:  an already-stopped token
+    Expected output: TurnCancelled; zero requests made; messages untouched
+    """
+    provider = OllamaProvider(model="test-model")
+    client = _FakeOllamaClient([])
+    provider._client = client
+    cancel = CancelToken()
+    cancel.stop()
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, lambda n, a: "", cancel=cancel)
+
+    assert client.calls == []
+    assert messages == [user_message("hello")]
+
+
+def test_ollama_cancel_mid_stream_closes_the_connection():
+    """
+    Stopping while the response is streaming closes the stream — that is the
+    kill signal Ollama sees — and leaves the message history untouched, so the
+    turn can simply be discarded.
+
+    Input:  a three-chunk response, token stops after the first chunk
+    Expected output: TurnCancelled; stream closed; messages unchanged
+    """
+    provider = OllamaProvider(model="test-model")
+    client = _FakeOllamaClient([[
+        _OllamaMessage(content="Here "),
+        _OllamaMessage(content="is "),
+        _OllamaMessage(content="the answer."),
+    ]])
+    provider._client = client
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(
+            messages, TOOLS, lambda n, a: "", cancel=_StopAfterChunks(1)
+        )
+
+    assert client.streams[0].closed, "the stream must be closed so Ollama stops generating"
+    assert messages == [user_message("hello")]
+
+
+def test_ollama_cancel_during_tool_dispatch_leaves_history_valid():
+    """
+    A stop that lands while a tool is running must not leave the assistant's
+    tool-call message behind without its result — the same invariant the
+    PrivacyError path protects, since a dangling tool call poisons the next
+    turn.
+
+    Input:  a tool_use response; dispatch raises TurnCancelled
+    Expected output: TurnCancelled propagates; messages back to the user turn
+    """
+    provider = OllamaProvider(model="test-model")
+    client = _FakeOllamaClient(
+        [[_OllamaMessage(tool_calls=[_ollama_tool_call("read_file", {"path": "a.md"})])]]
+    )
+    provider._client = client
+
+    def dispatch_fn(name, args):
+        raise TurnCancelled("Stopped.")
+
+    messages = [user_message("read a.md")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, dispatch_fn, cancel=CancelToken())
+
+    assert messages == [user_message("read a.md")]
+    assert len(client.calls) == 1
+
+
 # ── Unit: AnthropicProvider.agentic_turn ───────────────────────────────────────
 
 
@@ -287,15 +402,46 @@ def _anthropic_tool_use_response():
     return SimpleNamespace(stop_reason="tool_use", content=[block])
 
 
+class _FakeAnthropicStream:
+    """
+    Stands in for the SDK's MessageStream: a context manager that yields raw
+    events as it goes and hands back the assembled Message at the end. Records
+    whether __exit__ ran, since closing the stream is what tells Anthropic to
+    stop generating.
+    """
+
+    def __init__(self, response, event_count=3):
+        self._response = response
+        self._event_count = event_count
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.closed = True
+        return False
+
+    def __iter__(self):
+        for index in range(self._event_count):
+            yield SimpleNamespace(type=f"event_{index}")
+
+    def get_final_message(self):
+        return self._response
+
+
 class _FakeAnthropicClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls: list[dict] = []
-        self.messages = SimpleNamespace(create=self._create)
+        self.streams: list[_FakeAnthropicStream] = []
+        self.messages = SimpleNamespace(stream=self._stream)
 
-    def _create(self, **kwargs):
+    def _stream(self, **kwargs):
         self.calls.append(kwargs)
-        return self._responses.pop(0)
+        stream = _FakeAnthropicStream(self._responses.pop(0))
+        self.streams.append(stream)
+        return stream
 
 
 def test_anthropic_agentic_turn_privacy_error_stops_cleanly():
@@ -359,34 +505,90 @@ def test_anthropic_agentic_turn_bundles_tool_results_in_one_user_message():
 
 
 def _openai_tool_call(call_id: str, name: str, arguments: str):
+    """One tool call, for _openai_response to break into stream deltas."""
+    return (call_id, name, arguments)
+
+
+def _openai_chunk(content=None, tool_calls=None, cost=None, model=None):
+    """
+    One streamed chunk. A chunk carrying usage has no choices at all, which is
+    how the real API sends the final one.
+    """
+    chunk = SimpleNamespace(choices=[], usage=None, model=model or "")
+    if content is not None or tool_calls is not None:
+        chunk.choices = [
+            SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=tool_calls))
+        ]
+    if cost is not None:
+        chunk.usage = SimpleNamespace(cost=cost)
+    return chunk
+
+
+def _tool_call_delta(index, call_id=None, name=None, arguments=None):
     return SimpleNamespace(
-        id=call_id, type="function",
+        index=index, id=call_id, type="function",
         function=SimpleNamespace(name=name, arguments=arguments),
     )
 
 
 def _openai_response(content=None, tool_calls=None, cost=None, model=None):
-    """`model` is what OpenRouter says answered — the interesting half of a
-    router response, where it is not the model that was asked for."""
-    message = SimpleNamespace(content=content, tool_calls=tool_calls)
-    usage = SimpleNamespace(cost=cost) if cost is not None else None
-    response = SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
-    if model is not None:
-        response.model = model
-    return response
+    """
+    One streamed response, as the chunk sequence the SDK would yield.
+
+    Content is split across two chunks and every tool call's arguments across
+    two more, with the id and name arriving in a chunk of their own — that is
+    how the real API drives it, and handing the accumulator everything at once
+    would test nothing. `model` is what OpenRouter says answered, the
+    interesting half of a router response where it isn't what was asked for.
+    """
+    chunks = []
+    if content:
+        half = len(content) // 2
+        chunks.append(_openai_chunk(content=content[:half]))
+        chunks.append(_openai_chunk(content=content[half:]))
+    for index, (call_id, name, arguments) in enumerate(tool_calls or []):
+        chunks.append(
+            _openai_chunk(tool_calls=[_tool_call_delta(index, call_id=call_id, name=name)])
+        )
+        half = len(arguments) // 2
+        chunks.append(_openai_chunk(tool_calls=[_tool_call_delta(index, arguments=arguments[:half])]))
+        chunks.append(_openai_chunk(tool_calls=[_tool_call_delta(index, arguments=arguments[half:])]))
+    # The closing chunk carries usage and the served model, and no choices.
+    chunks.append(_openai_chunk(cost=cost, model=model))
+    return chunks
+
+
+class _FakeOpenAIStream:
+    """One streamed response: a sequence of chunks, closeable."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.closed = False
+
+    def __iter__(self):
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeOpenAIClient:
-    """Replays scripted chat.completions responses; records every request."""
+    """
+    Replays scripted streamed responses — one chunk list per request — and
+    records every request and stream handed out.
+    """
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls: list[dict] = []
+        self.streams: list[_FakeOpenAIStream] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
         self.calls.append(kwargs)
-        return self._responses.pop(0)
+        stream = _FakeOpenAIStream(self._responses.pop(0))
+        self.streams.append(stream)
+        return stream
 
 
 def test_openrouter_agentic_turn_runs_the_tool_loop():
@@ -440,6 +642,124 @@ def test_openrouter_privacy_error_stops_cleanly():
     assert reply == "blocked: private content"
     assert messages == [user_message("read my private note")]
     assert len(client.calls) == 1
+
+
+def test_openrouter_streams_and_still_reports_cost():
+    """
+    The request must be streamed — that is the only way it can be interrupted —
+    and the cost must survive the switch, since it now arrives on the stream's
+    final chunk rather than on a whole response. A session's spend silently
+    reading as zero is the failure this guards.
+
+    Only OpenRouter's own `usage: {include: true}` is sent; the OpenAI-standard
+    `stream_options` would ask for the same thing twice.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([_openai_response(content="hi", cost=0.01)])
+
+    provider.complete([{"role": "user", "content": "hello"}])
+
+    sent = provider._client.calls[-1]
+    assert sent["stream"] is True
+    assert "stream_options" not in sent
+    assert sent["extra_body"]["usage"] == {"include": True}
+    assert provider.pop_usage()["usd"] == 0.01
+
+
+def test_openrouter_reassembles_two_tool_calls_split_across_chunks():
+    """
+    A turn asking for two tools at once must come back as two calls, each with
+    its own id and its arguments JSON rejoined from the fragments it arrived
+    in — the accumulator keys on the delta `index`, so interleaved fragments
+    must not bleed between calls.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    provider._client = _FakeOpenAIClient([
+        _openai_response(tool_calls=[
+            _openai_tool_call("c1", "read_file", '{"path": "a.md"}'),
+            _openai_tool_call("c2", "read_file", '{"path": "b.md"}'),
+        ]),
+        _openai_response(content="Read both."),
+    ])
+
+    dispatched = []
+    reply = provider.agentic_turn(
+        [user_message("read both files")], TOOLS,
+        lambda name, args: dispatched.append((name, args)) or "contents",
+    )
+
+    assert reply == "Read both."
+    assert dispatched == [
+        ("read_file", {"path": "a.md"}),
+        ("read_file", {"path": "b.md"}),
+    ]
+    # Each result goes back keyed by its own call id.
+    sent = provider._client.calls[-1]["messages"]
+    tool_messages = [m for m in sent if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_messages] == ["c1", "c2"]
+
+
+def test_openrouter_cancel_before_request_sends_nothing():
+    """
+    Same contract as the other two adapters: a turn already stopped must not
+    reach the API at all, so a stop can never cost money it didn't have to.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    client = _FakeOpenAIClient([])
+    provider._client = client
+    cancel = CancelToken()
+    cancel.stop()
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, lambda n, a: "", cancel=cancel)
+
+    assert client.calls == []
+    assert messages == [user_message("hello")]
+
+
+def test_openrouter_cancel_mid_stream_closes_the_connection():
+    """
+    Stopping mid-response closes the stream, which drops the connection and is
+    what tells the upstream model to stop generating. The neutral transcript is
+    left untouched, so the abandoned turn leaves no trace.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    client = _FakeOpenAIClient([_openai_response(content="A long answer about soil.")])
+    provider._client = client
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(
+            messages, TOOLS, lambda n, a: "", cancel=_StopAfterChunks(1)
+        )
+
+    assert client.streams[0].closed, "the stream must close so the model stops generating"
+    assert messages == [user_message("hello")]
+
+
+def test_openrouter_cancel_during_tool_dispatch_leaves_history_valid():
+    """
+    A stop landing while a tool runs must not publish the assistant's tool call
+    without its result — the transcript would be invalid for the next turn.
+    Nothing is committed until the turn returns, so there is nothing to undo.
+    """
+    provider = OpenRouterProvider(model="openai/gpt-5")
+    client = _FakeOpenAIClient([
+        _openai_response(tool_calls=[_openai_tool_call("c1", "read_file", '{"path": "a.md"}')]),
+    ])
+    provider._client = client
+
+    def dispatch_fn(name, args):
+        raise TurnCancelled("Stopped.")
+
+    messages = [user_message("read a.md")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, dispatch_fn, cancel=CancelToken())
+
+    assert messages == [user_message("read a.md")]
+    assert len(client.calls) == 1
+
 
 
 def test_openrouter_sends_the_routing_hardening_on_every_request():
@@ -551,3 +871,63 @@ def test_openrouter_usage_names_no_model_when_the_response_does_not():
     provider.agentic_turn([user_message("go")], TOOLS, lambda n, a: "result")
 
     assert "model" not in provider.pop_usage()
+
+def test_anthropic_cancel_before_request_sends_nothing():
+    """
+    Same contract as the Ollama case: a turn already stopped must not reach the
+    API at all, so a stop can never cost money it didn't have to.
+    """
+    provider = AnthropicProvider(model="claude-test")
+    client = _FakeAnthropicClient([])
+    provider._client = client
+    cancel = CancelToken()
+    cancel.stop()
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, lambda n, a: "", cancel=cancel)
+
+    assert client.calls == []
+    assert messages == [user_message("hello")]
+
+
+def test_anthropic_cancel_mid_stream_closes_the_connection():
+    """
+    Stopping mid-response must exit the streaming context manager, which is
+    what closes the HTTP response and stops generation server-side (the
+    Messages API has no cancel endpoint). History stays untouched.
+    """
+    text_block = SimpleNamespace(type="text", text="A long answer.")
+    provider = AnthropicProvider(model="claude-test")
+    client = _FakeAnthropicClient([SimpleNamespace(stop_reason="end_turn", content=[text_block])])
+    provider._client = client
+
+    messages = [user_message("hello")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(
+            messages, TOOLS, lambda n, a: "", cancel=_StopAfterChunks(1)
+        )
+
+    assert client.streams[0].closed, "the stream must close so Anthropic stops generating"
+    assert messages == [user_message("hello")]
+
+
+def test_anthropic_cancel_during_tool_dispatch_pops_the_assistant_message():
+    """
+    The Anthropic wire format is strict: an assistant tool_use message must be
+    followed by a user message bundling every tool_result. A stop mid-dispatch
+    must therefore drop the assistant message, or the next turn 400s.
+    """
+    provider = AnthropicProvider(model="claude-test")
+    client = _FakeAnthropicClient([_anthropic_tool_use_response()])
+    provider._client = client
+
+    def dispatch_fn(name, args):
+        raise TurnCancelled("Stopped.")
+
+    messages = [user_message("read a file")]
+    with pytest.raises(TurnCancelled):
+        provider.agentic_turn(messages, TOOLS, dispatch_fn, cancel=CancelToken())
+
+    assert messages == [user_message("read a file")]
+    assert len(client.calls) == 1

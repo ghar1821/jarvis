@@ -1,5 +1,104 @@
 # Jarvis
 
+## PR #3 — Forceful stop
+
+A reply can now be stopped while it is being generated, and a stop leaves
+nothing behind — not in the session, and not in the knowledge base.
+
+**Stopping a reply**
+
+- Web UI: the Send button becomes a red **Stop** while a reply is in flight.
+  Clicking it returns control immediately.
+- The upstream connection is closed, so Ollama or Anthropic actually stops
+  generating rather than being left to finish an answer nobody will read.
+  Measured against both live services, the worker dies within 0.1 s of the stop.
+- All three providers stream, OpenRouter included: its `_create()` folds the
+  OpenAI-style chunk stream back into one result, concatenating content deltas
+  and rejoining each tool call's arguments JSON from the fragments it arrives
+  in (keyed by the delta `index`, so interleaved calls don't bleed into each
+  other). Cost still lands — it rides the stream's final chunk, which is where
+  OpenRouter puts it when usage accounting is on.
+- A stopped turn leaves **no trace**: the question returns to the input box,
+  nothing is written to the session history, and nothing is indexed as a chat
+  exchange. The next message can be sent straight away.
+- New `POST /chat/stop` endpoint. It cancels the turn and abandons it in the
+  same breath — ending the SSE stream and rolling the turn back itself rather
+  than waiting for the worker thread, because how long the worker takes to
+  notice is not under our control. (Testing against a real cold Ollama model
+  found this: the cancel check runs *between* streamed events, so a request
+  still waiting on its **first** event can sit there for 20+ seconds, which
+  under the earlier wait-for-the-worker design left the session busy and made
+  the next message 409 — exactly what the stop exists to prevent.)
+- `Ctrl-C` on `uv run webapp` now cancels every live turn on the way out.
+
+**Both providers now stream**
+
+- `OllamaProvider` and `AnthropicProvider` each make every request through a
+  single `_request()` helper using the streaming APIs. This is what makes a
+  turn interruptible: a blocking call offers no moment to bail out of, whereas
+  a stream can be checked between events and closed part-way — and closing the
+  connection is the only "stop generating" signal either service has.
+- Replies are still delivered whole; nothing about the output changed.
+- Consolidation, not just addition: `_request()` replaced four near-identical
+  `try/except → LLMError` blocks per provider, and assembling Ollama's message
+  from the stream removed the pydantic `model_dump` normalisation
+  (`_message_to_dict`) that kept session history JSON-serialisable.
+
+**All-or-nothing knowledge-base writes**
+
+- Every `add_*` in `store.py` split into a `build_*` half that touches nothing
+  and one shared `commit_documents()` that performs the only write. The public
+  `add_texts` / `add_annotations` / `add_figures` / `add_paper` signatures and
+  all their callers are unchanged.
+- `add_document` now stages a whole paper — body, annotations, figure captions
+  — and commits it in a single atomic write. An add that is stopped or that
+  fails part-way leaves the knowledge base exactly as it was.
+- This also fixes a latent bug: a re-ingest used to delete the old entry
+  before indexing the new one's annotations, so a failure in between lost the
+  old entry's irreplaceable annotation chunks. The delete and the add now share
+  one commit.
+- Cancellation is never checked inside the commit — an interrupted ChromaDB
+  write is the corruption the staging exists to prevent.
+
+**Compaction is visible**
+
+- Compaction is a second LLM call made before the turn's own, and it used to
+  show nothing at all. The webapp now shows a pulsing "Compacting conversation
+  history..." indicator and the CLI prints the equivalent line. New
+  `needs_compaction()` predicate so the indicator only appears when compaction
+  is actually about to run.
+
+**Under the hood**
+
+- New `jarvis/core/cancel.py` (`CancelToken`) and `TurnCancelled`, which is
+  deliberately not an `LLMError` — the `LLMError` handlers save a "⚠️ …" reply
+  to the session, which is precisely the trace a stop must not leave.
+- A cancelled turn needs no unwinding: each adapter already builds its turn in
+  a provider-wire copy and publishes it to the neutral transcript with one
+  `commit()` at the return points, so raising in between leaves `messages`
+  exactly as it was found. Shared `rollback_turn()` drops the question from
+  `messages`, `display`, and `turn_starts` together.
+- Cancel checks are placed so that two things hold the moment a stop is
+  requested: nothing further is sent, and the message list is never appended to
+  again — an assistant `tool_use` block is never left without its matching
+  `tool_result` bundle, which would 400 the following turn.
+- `_session["running"]` in the webapp now holds a `RunningTurn` (live session,
+  cancel token, event queue, thread, commit lock) rather than a bare `Session`.
+  The lock is what keeps a stop and a just-landed reply from both writing: the
+  reply stands if it committed first, the worker stands down if the stop did.
+- 23 new tests: stream cancellation and connection close for both providers,
+  the `/chat/stop` lifecycle end to end including both sides of that race,
+  staged-write atomicity, a stopped ingest leaving the store untouched, and the
+  neutral-transcript rollback. Verified live against Ollama and Anthropic as
+  well: a cancelled turn's thread dies within 0.1 s, and `/chat/stop` returns
+  in 0.02 s with the session already clean.
+- Fixed a stub in `test_security.py` that had silently started exercising the
+  crash handler instead of the path it was testing (and writing tracebacks to
+  the real `~/.jarvis/logs/chat.log`) once `agentic_turn` gained its `cancel`
+  parameter.
+- Dropped the stale `docs/TODO.md` / `docs/ROADMAP.md` references from
+  `DESIGN.md`'s repository tree; neither file exists.
+
 
 
 ## PR #1 — general assistant: OpenRouter, records, a draft sandbox, an editor

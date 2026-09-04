@@ -204,6 +204,28 @@ def _migrate_v1_messages(payload: dict) -> list:
     return transcript.from_openai(messages, provider=provider, model="")
 
 
+def rollback_turn(session: Session) -> None:
+    """
+    Undo the current turn's bookkeeping so it leaves no trace.
+
+    Called when a turn ends without an answer — the human stopped it, or the
+    provider failed. Drops the user's question from the transcript, from the
+    display list, and from turn_starts, putting the session back exactly where
+    it was before the turn began. The three lists must move together: display
+    drives chat-history indexing, and turn_starts drives where compaction cuts.
+
+    Truncating to turn_starts[-1] also sweeps up anything the provider managed
+    to commit mid-turn. agentic_turn normally publishes nothing until the turn
+    ends (it works on a wire copy and commits once), but a turn that ended via
+    the PrivacyError path did commit, and a stop must clear that too.
+    """
+    if session.turn_starts:
+        del session.messages[session.turn_starts[-1]:]
+        session.turn_starts.pop()
+    if session.display and session.display[-1]["role"] == "user":
+        session.display.pop()
+
+
 def load_session(session_id: str, sessions_dir: Path = SESSIONS_DIR) -> Session:
     """
     Load a session by id, migrating a v1 (provider wire format) file to the
@@ -435,7 +457,21 @@ _COMPACT_PROMPT = (
 )
 
 
-def maybe_compact(session: Session, provider_obj, cfg) -> bool:
+def needs_compaction(session: Session, cfg) -> bool:
+    """
+    Whether the next turn would trigger compaction.
+
+    Split out of maybe_compact so a caller can show the user a "compacting"
+    indicator only when it is actually about to happen — the summarisation is
+    an extra LLM call, and on a long history it is a long, otherwise silent
+    pause before the turn's own reply starts.
+    """
+    if len(session.turn_starts) <= max(1, cfg.compact_keep_exchanges):
+        return False
+    return estimate_tokens(session.messages) >= cfg.compact_after_tokens
+
+
+def maybe_compact(session: Session, provider_obj, cfg, cancel=None) -> bool:
     """
     When the session's LLM context exceeds cfg.compact_after_tokens, replace
     everything but the last cfg.compact_keep_exchanges turns with a summary
@@ -448,14 +484,17 @@ def maybe_compact(session: Session, provider_obj, cfg) -> bool:
     The cut always lands on a recorded turn boundary (turn_starts), keeping
     tool_use/tool_result message structure intact.
 
+    Compaction runs before the turn's own LLM call and can take a while on a
+    long history, so it takes the turn's cancel token too — stopping during
+    compaction leaves the session uncompacted rather than half-rewritten (the
+    rewrite below only happens once the summary is in hand).
+
     Returns True when compaction happened.
     """
-    keep = max(1, cfg.compact_keep_exchanges)
-    if len(session.turn_starts) <= keep:
-        return False
-    if estimate_tokens(session.messages) < cfg.compact_after_tokens:
+    if not needs_compaction(session, cfg):
         return False
 
+    keep = max(1, cfg.compact_keep_exchanges)
     cut = session.turn_starts[-keep]
     old_messages = session.messages[:cut]
 
@@ -463,6 +502,7 @@ def maybe_compact(session: Session, provider_obj, cfg) -> bool:
     summary = provider_obj.complete(
         [{"role": "user", "content": _COMPACT_PROMPT.format(transcript=transcript)}],
         max_tokens=1024,
+        cancel=cancel,
     )
 
     # Neutral-format messages: compaction rewrites the transcript, so it has

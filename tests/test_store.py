@@ -43,6 +43,8 @@ from jarvis.kb.store import (
     add_paper,
     add_papers_batch,
     add_texts,
+    build_text_documents,
+    commit_documents,
     count,
     delete_by_metadata,
     find_pdf_notes,
@@ -71,6 +73,73 @@ def _paper(n: int) -> dict:
         "title": f"Test Paper {n}",
         "authors": "Test Author",
     }
+
+
+# ── 0. Staged writes ───────────────────────────────────────────────────────────
+#
+# Building Documents and committing them are separate steps so a caller can
+# assemble a whole document — body, annotations, figure captions — and write it
+# in one go. An ingest abandoned before the commit must leave nothing behind.
+
+
+def test_building_documents_writes_nothing(store):
+    """
+    The build half must not touch the database at all. This is what makes an
+    abandoned ingest safe: whatever was built is simply dropped.
+    """
+    before = count(store)
+    documents = build_text_documents(
+        content="Staged but never committed.",
+        doc_type="paper", visibility="public", source="file:///staged.pdf",
+    )
+    assert documents, "the build step should have produced chunks"
+    assert count(store) == before
+
+
+def test_commit_documents_replaces_and_adds_together(store):
+    """
+    A re-ingest passes replace_source, and the delete of the old entry plus
+    the add of the new one happen inside one write — so the entry is never
+    observable as "old gone, new not yet here", and a failure before the
+    commit leaves the old entry intact.
+    """
+    source = "file:///paper.pdf"
+    add_texts(
+        content="The original body text.",
+        doc_type="paper", visibility="public", source=source,
+        extra_metadata={"title": "Original"},
+        store=store,
+    )
+
+    replacement = build_text_documents(
+        content="The replacement body text.",
+        doc_type="paper", visibility="public", source=source,
+        extra_metadata={"title": "Replacement"},
+    )
+    ids = commit_documents(replacement, store, replace_source=source)
+    assert ids
+
+    surviving = store._collection.get(
+        where={"source": {"$eq": source}}, include=["documents", "metadatas"]
+    )
+    assert all("original" not in text.lower() for text in surviving["documents"])
+    assert {m["title"] for m in surviving["metadatas"]} == {"Replacement"}
+
+
+def test_commit_documents_with_nothing_staged_still_replaces(store):
+    """
+    An empty commit is not a no-op when replace_source is set — a document
+    whose new content chunked to nothing must still supersede the old entry
+    rather than silently leaving stale chunks behind.
+    """
+    source = "file:///empty.pdf"
+    add_texts(
+        content="Stale content to be superseded.",
+        doc_type="paper", visibility="public", source=source,
+        store=store,
+    )
+    assert commit_documents([], store, replace_source=source) == []
+    assert store._collection.get(where={"source": {"$eq": source}}, include=[])["ids"] == []
 
 
 # ── 1. Indexing ────────────────────────────────────────────────────────────────
@@ -1034,7 +1103,7 @@ class _CountingVisionProvider:
     def __init__(self):
         self.calls = 0
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
+    def describe_image(self, image_bytes: bytes, context: str, cancel=None) -> str:
         self.calls += 1
         return "A bar chart comparing methods."
 

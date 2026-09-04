@@ -67,12 +67,16 @@
         <div id="messages"></div>
         <div id="input-bar">
           <textarea id="input" rows="1" placeholder="Ask about your notes and documents..." autocomplete="off" autofocus></textarea>
+          <button id="send-btn">Send</button>
+          <!-- Swapped in for Send while this session has a turn in flight, so
+               the control nearest the box is always the one that acts on what
+               is happening right now. -->
+          <button id="stop-btn" class="hidden" title="Stop this reply">■ Stop</button>
           <label class="toggle-wrap" title="Off: answers from database only. On: uses model training knowledge if database has no results.">
             <input type="checkbox" id="ai-toggle" checked>
             <span class="toggle-track"></span>
             <span>DB only</span>
           </label>
-          <button id="send-btn">Send</button>
         </div>
       </div>
 

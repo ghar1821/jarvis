@@ -327,7 +327,7 @@ def test_turn_start_clears_only_that_sessions_tokens(monkeypatch):
     from jarvis.chat.sessions import new_session
 
     class _StubProvider:
-        def agentic_turn(self, messages, tools, dispatch_fn, system):
+        def agentic_turn(self, messages, tools, dispatch_fn, system, cancel=None):
             return "ok"
 
     session_a = new_session(appmod.cfg.provider)

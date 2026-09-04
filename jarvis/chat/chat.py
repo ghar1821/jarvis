@@ -29,7 +29,7 @@ from pathlib import Path
 
 from jarvis.core import transcript
 from jarvis.core.config import get_config
-from jarvis.core.errors import KBCorruptionError, LLMError, PrivacyError
+from jarvis.core.errors import KBCorruptionError, LLMError, PrivacyError, TurnCancelled
 from jarvis.core.llm import is_cloud_provider, make_provider
 
 # Tool failures are caught and turned into a short string for the LLM to
@@ -775,7 +775,7 @@ def _get_document(args: dict, provider_str: str) -> tuple[str, bool]:
     return "\n".join(lines), is_private
 
 
-def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str:
+def _add_document(args: dict, provider_obj, provider_str: str = "ollama", cancel=None) -> str:
     """
     Add a paper to the knowledge base — always public, whether the source is
     an arXiv URL or a local PDF path. Notes come only from the Obsidian
@@ -790,12 +790,20 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
     A paper already in the knowledge base (matched by source URL or title) is
     not re-added silently: the tool asks the user, who must re-invoke with
     allow_duplicate=true to force it in.
+
+    Everything is staged before anything is written. Downloading, converting,
+    summarising and figure captioning all produce Documents in memory, checking
+    the cancel token between steps, and one commit_documents() call at the end
+    performs the single atomic write (including the delete of a replaced
+    entry). So an add that is stopped or fails part-way leaves the knowledge
+    base exactly as it was — never a document with a body but no annotations,
+    and never an old entry deleted in favour of one that never arrived.
     """
     try:
         from pathlib import Path as _Path
         from jarvis.kb.store import (
-            add_annotations, add_figures, add_paper, add_texts,
-            delete_by_metadata, get_store,
+            build_annotation_documents, build_figure_documents, build_paper_documents,
+            build_text_documents, commit_documents, get_store,
             _source_exists, _title_exists,
         )
 
@@ -863,8 +871,11 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
             if notice:
                 return notice
 
+            staged = []
             if mode == "full_text":
                 import tempfile
+                if cancel is not None:
+                    cancel.check()
                 print("  Downloading PDF...", flush=True)
                 with tempfile.TemporaryDirectory() as tmp:
                     pdf_path = download_arxiv_pdf(arxiv_id, _Path(tmp))
@@ -873,43 +884,48 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
                         content = pdf_to_markdown(pdf_path)
                     except ConversionError as exc:
                         return f"[Error: {exc}]"
-                    if replace_source:
-                        deleted = delete_by_metadata("source", replace_source, store)
-                        print(f"  Replacing existing entry — {deleted} old chunk(s) removed", flush=True)
-                    add_annotations(
-                        pdf_path, doc_type="paper", visibility="public",
-                        source=paper["link"], title=paper.get("title", ""), store=store,
+                    if cancel is not None:
+                        cancel.check()
+                    print("  Chunking full text...", flush=True)
+                    paper_authors = paper.get("authors", "")
+                    embed_header = (
+                        f"{paper['title']} — {paper_authors}" if paper_authors else paper["title"]
                     )
-                    figure_ids = add_figures(
+                    body = build_text_documents(
+                        content=content, doc_type="paper", visibility="public",
+                        source=paper["link"],
+                        extra_metadata={"title": paper.get("title", ""),
+                                        "authors": paper_authors,
+                                        "doi": paper.get("doi", ""),
+                                        "score": score, "track": track},
+                        embed_header=embed_header,
+                    )
+                    annotations = build_annotation_documents(
+                        pdf_path, doc_type="paper", visibility="public",
+                        source=paper["link"], title=paper.get("title", ""),
+                    )
+                    figures = build_figure_documents(
                         pdf_path, doc_type="paper", visibility="public",
                         source=paper["link"], provider_obj=provider_obj,
                         provider_str=provider_str, title=paper.get("title", ""),
-                        store=store, enabled=figures_enabled,
+                        enabled=figures_enabled, cancel=cancel,
                     )
-                    if figure_ids:
-                        print(f"  {len(figure_ids)} figure(s) captioned", flush=True)
-                print("  Chunking and indexing full text...", flush=True)
-                paper_authors = paper.get("authors", "")
-                embed_header = f"{paper['title']} — {paper_authors}" if paper_authors else paper["title"]
-                ids = add_texts(
-                    content=content, doc_type="paper", visibility="public",
-                    source=paper["link"],
-                    extra_metadata={"title": paper.get("title", ""),
-                                    "authors": paper_authors,
-                                    "doi": paper.get("doi", ""),
-                                    "score": score, "track": track},
-                    store=store,
-                    embed_header=embed_header,
-                )
+                    if figures:
+                        print(f"  {len(figures)} figure(s) captioned", flush=True)
+                    staged = body + annotations + figures
             else:
+                if cancel is not None:
+                    cancel.check()
                 print("  Generating summary...", flush=True)
-                summary = provider_obj.summarize(paper["title"], paper["abstract"])
-                if replace_source:
-                    deleted = delete_by_metadata("source", replace_source, store)
-                    print(f"  Replacing existing entry — {deleted} old chunk(s) removed", flush=True)
-                ids = add_paper(paper=paper, dense_summary=summary,
-                                score=score, track=track, store=store,
-                                allow_duplicate=allow_duplicate)
+                summary = provider_obj.summarize(paper["title"], paper["abstract"], cancel=cancel)
+                staged = build_paper_documents(
+                    paper=paper, dense_summary=summary, score=score, track=track
+                )
+
+            print("  Indexing...", flush=True)
+            ids = commit_documents(staged, store, replace_source=replace_source or "")
+            if replace_source:
+                print("  Replaced the existing entry", flush=True)
 
             return (
                 f"Added \"{paper['title']}\" ({mode}, {len(ids)} chunk(s)).\n"
@@ -925,6 +941,8 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
 
         from jarvis.kb.metadata import resolve_pdf_metadata
 
+        if cancel is not None:
+            cancel.check()
         meta = resolve_pdf_metadata(
             pdf_path, provider_obj,
             title_override=title_override, authors_override=authors_override,
@@ -938,24 +956,6 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
         if notice:
             return notice
 
-        def index_annotations() -> int:
-            # Highlights and typed notes become their own chunks, regardless
-            # of whether the body was stored as summary or full text. Figure
-            # captions are indexed alongside them via the active provider.
-            figure_ids = add_figures(
-                pdf_path, doc_type="paper", visibility="public",
-                source=file_source, provider_obj=provider_obj,
-                provider_str=provider_str, title=title,
-                file_path=str(pdf_path), store=store, enabled=figures_enabled,
-            )
-            if figure_ids:
-                print(f"  {len(figure_ids)} figure(s) captioned", flush=True)
-            return len(add_annotations(
-                pdf_path, doc_type="paper", visibility="public",
-                source=file_source, title=title,
-                file_path=str(pdf_path), store=store,
-            ))
-
         if mode == "full_text":
             from jarvis.core.errors import ConversionError
             from jarvis.kb.convert import pdf_to_markdown
@@ -964,43 +964,60 @@ def _add_document(args: dict, provider_obj, provider_str: str = "ollama") -> str
                 content = pdf_to_markdown(pdf_path)
             except ConversionError as exc:
                 return f"[Error: {exc}]"
-            if replace_source:
-                deleted = delete_by_metadata("source", replace_source, store)
-                print(f"  Replacing existing entry — {deleted} old chunk(s) removed", flush=True)
-            print("  Chunking and indexing full text...", flush=True)
-            extra_metadata = {"title": title, "file_path": str(pdf_path),
-                               "score": score, "track": track, "storage_mode": "full_text",
-                               "authors": authors, "doi": doi}
-            ids = add_texts(
-                content=content, doc_type="paper", visibility="public",
-                source=file_source,
-                extra_metadata=extra_metadata,
-                store=store,
-                embed_header=(f"{title} — {authors}" if authors else title),
-            )
+            print("  Chunking full text...", flush=True)
+            body_content = content
+            storage_mode = "full_text"
         else:
             print(f"  Generating summary from {pdf_path.name}...", flush=True)
-            summary = provider_obj.summarize(title, pdf_path)
-            if replace_source:
-                deleted = delete_by_metadata("source", replace_source, store)
-                print(f"  Replacing existing entry — {deleted} old chunk(s) removed", flush=True)
-            extra_metadata = {"title": title, "file_path": str(pdf_path),
-                               "score": score, "track": track, "storage_mode": "summary",
-                               "authors": authors, "doi": doi}
-            ids = add_texts(
-                content=f"{title}\n\n{summary}", doc_type="paper", visibility="public",
-                source=file_source,
-                extra_metadata=extra_metadata,
-                store=store,
-                embed_header=(f"{title} — {authors}" if authors else title),
-            )
+            summary = provider_obj.summarize(title, pdf_path, cancel=cancel)
+            body_content = f"{title}\n\n{summary}"
+            storage_mode = "summary"
 
-        annotation_count = index_annotations()
+        if cancel is not None:
+            cancel.check()
+        extra_metadata = {"title": title, "file_path": str(pdf_path),
+                          "score": score, "track": track, "storage_mode": storage_mode,
+                          "authors": authors, "doi": doi}
+        body = build_text_documents(
+            content=body_content, doc_type="paper", visibility="public",
+            source=file_source,
+            extra_metadata=extra_metadata,
+            embed_header=(f"{title} — {authors}" if authors else title),
+        )
+        # Highlights and typed notes become their own chunks, regardless of
+        # whether the body was stored as summary or full text. Figure captions
+        # are built alongside them via the active provider.
+        annotations = build_annotation_documents(
+            pdf_path, doc_type="paper", visibility="public",
+            source=file_source, title=title, file_path=str(pdf_path),
+        )
+        figures = build_figure_documents(
+            pdf_path, doc_type="paper", visibility="public",
+            source=file_source, provider_obj=provider_obj,
+            provider_str=provider_str, title=title,
+            file_path=str(pdf_path), enabled=figures_enabled, cancel=cancel,
+        )
+        if figures:
+            print(f"  {len(figures)} figure(s) captioned", flush=True)
+
+        print("  Indexing...", flush=True)
+        ids = commit_documents(
+            body + annotations + figures, store, replace_source=replace_source or ""
+        )
+        if replace_source:
+            print("  Replaced the existing entry", flush=True)
+
         return (
-            f"Added paper \"{title}\" ({mode}, {len(ids)} chunk(s), "
-            f"{annotation_count} annotation(s)).\n"
+            f"Added paper \"{title}\" ({mode}, {len(body)} chunk(s), "
+            f"{len(annotations)} annotation(s)).\n"
             f"  Source: {file_source}"
         )
+    except TurnCancelled:
+        # A stop is not a tool failure: let it out so the turn unwinds instead
+        # of being reported back to the model as an error string it would then
+        # try to work around. Nothing was committed, so there is nothing to
+        # undo here.
+        raise
     except Exception as exc:
         log.exception("add_document tool failed")
         return f"[add_document error: {exc}]"
@@ -1470,6 +1487,7 @@ def _dispatch_tool(
     session=None,
     request_confirmation=None,
     request_edit_review=None,
+    cancel=None,
 ) -> str:
     print(f"  → {name}({_format_tool_args(arguments)})", flush=True)
 
@@ -1496,7 +1514,9 @@ def _dispatch_tool(
     if name == "search_chat_history":
         return _wrap_retrieved(_search_chat_history(arguments, provider_str, session))
     if name == "add_document":
-        return _add_document(arguments, provider_obj, provider_str)
+        # The only tool slow enough to be worth interrupting mid-flight — it
+        # downloads, converts, summarises and captions before it writes.
+        return _add_document(arguments, provider_obj, provider_str, cancel=cancel)
     if name == "remove_document":
         return _remove_document(arguments, vault, request_confirmation)
     if name == "create_draft":

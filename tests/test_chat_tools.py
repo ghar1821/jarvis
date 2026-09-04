@@ -1,7 +1,9 @@
 """
-Tests for chunk-first retrieval in jarvis/chat/chat.py — the chat agent should
-be able to answer from search hits and the get_document tool without falling
-back to reading raw files.
+Tests for the chat agent's tools (jarvis/chat/chat.py).
+
+The bulk is chunk-first retrieval — the agent should be able to answer from
+search hits and the get_document tool without falling back to reading raw
+files.
 
 Covers:
 - _search_kb returns the full chunk text (previously
@@ -11,18 +13,23 @@ Covers:
 - _dispatch_tool wraps get_document's output in the RETRIEVED DATA markers
   and flags the session private when the local provider returns private
   content, exactly like the other retrieval tools.
-
+- _add_document stages its whole document in memory and commits it in one
+  write, so a stopped ingest leaves the knowledge base untouched rather than
+  half-indexed.
 Privacy hard-stops for get_document are covered separately in
 test_privacy_guard.py.
 """
 
 from pathlib import Path
 
+import pymupdf
 import pytest
 
-from jarvis.chat.chat import _dispatch_tool, _get_document, _search_kb
+from jarvis.chat.chat import _add_document, _dispatch_tool, _get_document, _search_kb
 from jarvis.chat.sessions import new_session
-from jarvis.kb.store import add_paper, add_texts
+from jarvis.core.cancel import CancelToken
+from jarvis.core.errors import TurnCancelled
+from jarvis.kb.store import add_paper, add_texts, count
 
 
 # ── Full-text hits (no more 300-char truncation) ────────────────────────────────
@@ -344,3 +351,119 @@ def test_no_chat_tool_can_write_outside_the_drafts_root(drafts, tmp_path, monkey
     root = (tmp_path / "drafts").resolve()
     for path in written:
         assert root in path.parents, f"{path} is outside the drafts sandbox"
+
+# ── Staged ingest: a stopped add leaves nothing behind ─────────────────────────
+
+
+class _StopOnSummarizeProvider:
+    """
+    Stands in for a provider whose summarize() the user stops part-way — the
+    realistic case, since summarising is where an ingest spends its time.
+    """
+
+    def __init__(self, cancel):
+        self._cancel = cancel
+
+    def complete(self, messages, max_tokens=300, context_length=None, cancel=None):
+        return "{}"  # metadata inference degrades to no fields
+
+    def summarize(self, title, source, max_tokens=2048, cancel=None):
+        self._cancel.stop()
+        (cancel or self._cancel).check()
+        raise AssertionError("summarize should have been cancelled")
+
+
+class _CannedSummaryProvider:
+    def complete(self, messages, max_tokens=300, context_length=None, cancel=None):
+        return "{}"
+
+    def summarize(self, title, source, max_tokens=2048, cancel=None):
+        return "A canned summary of the paper."
+
+
+def _one_page_pdf(path: Path, text: str) -> Path:
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), text, fontsize=12)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def test_add_document_stopped_mid_ingest_writes_nothing(store, tmp_path, monkeypatch):
+    """
+    An ingest stopped before its commit must leave the knowledge base exactly
+    as it was — this is the "nothing partial in the database" guarantee. The
+    stop propagates as TurnCancelled rather than being reported back to the
+    model as a tool error it would try to work around.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    pdf = _one_page_pdf(tmp_path / "stopped.pdf", "Body text of a paper being ingested.")
+    before = count(store)
+    cancel = CancelToken()
+
+    with pytest.raises(TurnCancelled):
+        _add_document(
+            {"source": str(pdf), "mode": "summary"},
+            _StopOnSummarizeProvider(cancel),
+            cancel=cancel,
+        )
+
+    assert count(store) == before, "a stopped ingest must not write any chunks"
+    assert store._collection.get(
+        where={"source": {"$eq": pdf.resolve().as_uri()}}, include=[]
+    )["ids"] == []
+
+
+def test_add_document_commits_body_and_annotations_together(store, tmp_path, monkeypatch):
+    """
+    The happy path still indexes everything, and does it in the single commit
+    the staging exists for — body chunks and annotation chunks share the
+    source, so one query sees the whole document.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    pdf = _one_page_pdf(tmp_path / "good.pdf", "Body text of a paper being ingested.")
+
+    result = _add_document(
+        {"source": str(pdf), "mode": "summary", "title": "Ingested Paper"},
+        _CannedSummaryProvider(),
+        cancel=CancelToken(),
+    )
+    assert result.startswith("Added paper ")
+
+    indexed = store._collection.get(
+        where={"source": {"$eq": pdf.resolve().as_uri()}}, include=["documents"]
+    )
+    assert indexed["ids"], "the paper should be indexed"
+    assert any("canned summary" in text.lower() for text in indexed["documents"])
+
+
+def test_add_document_arxiv_summary_mode_indexes_the_paper(store, monkeypatch):
+    """
+    The arXiv summary path — the one add_document branch no other test drove,
+    which is how a missing import survived in it. Fetch metadata, summarise,
+    stage, commit.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    paper = {
+        "link": "https://arxiv.org/abs/2401.00042",
+        "title": "A Paper About Soil",
+        "abstract": "An abstract about soil formation.",
+        "authors": "Ada Lovelace",
+        "doi": "",
+    }
+    monkeypatch.setattr("jarvis.digest.arxiv.fetch.fetch_arxiv_paper", lambda arxiv_id: paper)
+
+    result = _add_document(
+        {"source": paper["link"], "mode": "summary", "score": 7, "track": "soil"},
+        _CannedSummaryProvider(),
+        cancel=CancelToken(),
+    )
+    assert result.startswith("Added ")
+
+    indexed = store._collection.get(
+        where={"source": {"$eq": paper["link"]}}, include=["documents", "metadatas"]
+    )
+    assert indexed["ids"]
+    assert any("canned summary" in text.lower() for text in indexed["documents"])
+    assert indexed["metadatas"][0]["title"] == paper["title"]
+    assert indexed["metadatas"][0]["track"] == "soil"

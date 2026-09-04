@@ -25,6 +25,15 @@ switch models mid-flight. Each adapter converts neutral → wire on the way in a
 converts only the messages it generated back on the way out, so history written
 by a different provider is never round-tripped through a lossy conversion.
 
+Every method takes an optional cancel token (jarvis/core/cancel.py) so a turn
+can be stopped while it is in flight. Ollama and Anthropic send their requests
+streamed, through each adapter's single _request() helper — not to show tokens
+as they arrive (replies are still delivered whole) but because a stream can be
+checked between events and closed part-way, and closing the connection is the
+only "stop generating" signal either service has. Because a turn's work stays
+in the local `wire` list until commit(), a cancelled turn needs no unwinding:
+nothing was ever published to the neutral transcript.
+
 Ollama must be running (the macOS login-item app or `ollama serve`). For full
 functionality the configured model needs tool-calling and vision support —
 figure captioning and vision-based summaries depend on the vision capability.
@@ -32,13 +41,15 @@ figure captioning and vision-based summaries depend on the vision capability.
 
 import base64
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from . import transcript
-from .errors import AuthenticationError, LLMError, PrivacyError
+from .errors import AuthenticationError, LLMError, PrivacyError, TurnCancelled
 
 if TYPE_CHECKING:
+    from .cancel import CancelToken
     from .config import Config
 
 # The one local provider. Everything else sends content to someone else's
@@ -61,16 +72,30 @@ def is_cloud_provider(provider_str: str) -> bool:
 
 @runtime_checkable
 class ChatProvider(Protocol):
+    """
+    Every method takes an optional cancel token. When one is supplied and the
+    human stops the turn, the method raises TurnCancelled instead of returning.
+    Callers that can't be interrupted (the digest pipeline, the sync daemon,
+    the kb CLI) simply leave it None.
+    """
+
     def complete(
         self,
         messages: list[dict],
         max_tokens: int = 2048,
         context_length: int | None = None,
+        cancel: "CancelToken | None" = None,
     ) -> str:
         """Single-shot text completion. A system message may be included in messages."""
         ...
 
-    def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
+    def summarize(
+        self,
+        title: str,
+        source: "str | Path",
+        max_tokens: int = 2048,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         """
         Generate a dense paper summary.
 
@@ -84,6 +109,7 @@ class ChatProvider(Protocol):
         tools: list[dict],
         dispatch_fn: Callable[[str, dict], str],
         system: str = "",
+        cancel: "CancelToken | None" = None,
     ) -> str:
         """
         Run a full agentic turn including tool dispatch loop.
@@ -93,10 +119,20 @@ class ChatProvider(Protocol):
         are appended in neutral form, never in this provider's wire format.
         dispatch_fn(tool_name, arguments) -> result_string
         Returns the final text reply.
+
+        A cancelled turn appends nothing at all. Each adapter accumulates the
+        turn in a local wire list and publishes it to `messages` in one commit()
+        at the return points, so raising TurnCancelled anywhere in between
+        leaves the transcript exactly as it was found.
         """
         ...
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
+    def describe_image(
+        self,
+        image_bytes: bytes,
+        context: str,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         """
         Caption one image (a figure lifted from a PDF) so it can be indexed as
         searchable text. context is free text — usually the document title —
@@ -138,11 +174,20 @@ def _get_summary_prompt() -> str:
     return _load_prompt("paper_summary")
 
 
-def _message_to_dict(message) -> dict:
-    """Normalise an ollama pydantic Message to a JSON-serialisable dict."""
-    if hasattr(message, "model_dump"):
-        return message.model_dump(exclude_none=True)
-    return message
+def _tool_arguments(raw) -> dict:
+    """
+    Normalise the arguments of one tool call to a plain dict.
+
+    Ollama hands arguments back as a mapping already (not a JSON string like
+    the OpenAI wire format), so this is usually just a copy; the parse is there
+    for model variants that return a string anyway.
+    """
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return {}
+    return dict(raw or {})
 
 
 # ── Ollama adapter ─────────────────────────────────────────────────────────────
@@ -169,22 +214,84 @@ class OllamaProvider:
             self._client = ollama.Client()
         return self._client
 
+    def _request(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        options: dict | None = None,
+        cancel: "CancelToken | None" = None,
+    ) -> dict:
+        """
+        Make one streamed chat request and return the assembled assistant
+        message as a plain dict — role, content, and tool_calls when the model
+        asked for any.
+
+        Assembling the message ourselves (rather than handing back ollama's
+        pydantic object) keeps the wire history JSON-serialisable for free, and
+        streaming gives the cancel token somewhere to act: it is checked
+        between chunks, and closing the generator on the way out drops the HTTP
+        connection, which is how Ollama is told to stop generating.
+        """
+        client = self._get_client()
+        content_parts: list[str] = []
+        tool_calls: list[dict] = []
+        try:
+            stream = client.chat(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                options=options or {},
+                stream=True,
+            )
+            try:
+                for chunk in stream:
+                    if cancel is not None:
+                        cancel.check()
+                    message = chunk["message"]
+                    content_parts.append(message.get("content") or "")
+                    for call in message.get("tool_calls") or []:
+                        tool_calls.append({
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": _tool_arguments(call.function.arguments),
+                            }
+                        })
+            finally:
+                # Closing the generator unwinds ollama's streaming context and
+                # drops the connection. On a cancel that is the kill signal; on
+                # normal completion the generator is already exhausted and this
+                # is a no-op.
+                close_stream = getattr(stream, "close", None)
+                if close_stream is not None:
+                    close_stream()
+        except (TurnCancelled, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            raise LLMError(_redact(f"Ollama request failed: {exc}")) from exc
+
+        assembled: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if tool_calls:
+            assembled["tool_calls"] = tool_calls
+        return assembled
+
     def complete(
         self,
         messages: list[dict],
         max_tokens: int = 2048,
         context_length: int | None = None,
+        cancel: "CancelToken | None" = None,
     ) -> str:
-        client = self._get_client()
         # Ollama honours a per-request context window; only set it when asked.
         options = {"num_ctx": context_length} if context_length else {}
-        try:
-            response = client.chat(model=self.model, messages=messages, options=options)
-            return response["message"]["content"] or ""
-        except Exception as exc:
-            raise LLMError(_redact(f"Ollama complete failed: {exc}")) from exc
+        return self._request(messages, options=options, cancel=cancel)["content"]
 
-    def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
+    def summarize(
+        self,
+        title: str,
+        source: "str | Path",
+        max_tokens: int = 2048,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
         if isinstance(source, Path):
             # Ollama has no document-input API, and the conversion is cheap
@@ -195,7 +302,7 @@ class OllamaProvider:
         else:
             text = source
         messages = [{"role": "user", "content": f"{prompt}\n\nAbstract/text:\n{text}"}]
-        return self.complete(messages, max_tokens=max_tokens)
+        return self.complete(messages, max_tokens=max_tokens, cancel=cancel)
 
     def agentic_turn(
         self,
@@ -203,8 +310,8 @@ class OllamaProvider:
         tools: list[dict],
         dispatch_fn: Callable[[str, dict], str],
         system: str = "",
+        cancel: "CancelToken | None" = None,
     ) -> str:
-        client = self._get_client()
         wire = transcript.to_ollama(messages, model=self.model)
         # Everything from here on is appended to the wire list; only this tail
         # is converted back, so history from another provider stays untouched.
@@ -214,35 +321,29 @@ class OllamaProvider:
             messages.extend(transcript.from_ollama(wire[turn_start:], model=self.model))
 
         while True:
-            full = ([{"role": "system", "content": system}] + wire) if system else wire
-            try:
-                response = client.chat(model=self.model, messages=full, tools=tools)
-            except Exception as exc:
-                raise LLMError(_redact(f"Ollama agentic turn failed: {exc}")) from exc
+            # Checked before the request so a turn stopped between iterations
+            # never sends another one. Every raise below leaves `messages`
+            # untouched, because commit() is only reached on a return.
+            if cancel is not None:
+                cancel.check()
 
-            message = response["message"]
-            tool_calls = getattr(message, "tool_calls", None) or []
+            full = ([{"role": "system", "content": system}] + wire) if system else wire
+            message = self._request(full, tools=tools, cancel=cancel)
+
+            tool_calls = message.get("tool_calls") or []
             if not tool_calls:
-                reply = message.get("content") or ""
+                reply = message["content"]
                 wire.append({"role": "assistant", "content": reply})
                 commit()
                 return reply
 
-            # The ollama client returns a pydantic Message — normalise it to a
-            # plain dict so session history stays JSON-serialisable.
-            wire.append(_message_to_dict(message))
-            for tc in tool_calls:
-                # Ollama hands back arguments as a mapping already (not a JSON
-                # string like the OpenAI wire format), so use it directly; only
-                # parse if some model variant ever returns a string.
-                arguments = tc.function.arguments
-                if isinstance(arguments, str):
-                    try:
-                        arguments = json.loads(arguments or "{}")
-                    except json.JSONDecodeError:
-                        arguments = {}
+            wire.append(message)
+            for call in tool_calls:
+                if cancel is not None:
+                    cancel.check()
+                name = call["function"]["name"]
                 try:
-                    result = dispatch_fn(tc.function.name, dict(arguments))
+                    result = dispatch_fn(name, dict(call["function"]["arguments"]))
                 except PrivacyError as exc:
                     # Drop the assistant message we just added — with its tool
                     # calls unanswered it would leave the transcript invalid
@@ -250,21 +351,20 @@ class OllamaProvider:
                     wire.pop()
                     commit()
                     return str(exc)
-                wire.append(
-                    {"role": "tool", "tool_name": tc.function.name, "content": result}
-                )
+                wire.append({"role": "tool", "tool_name": name, "content": result})
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
-        client = self._get_client()
+    def describe_image(
+        self,
+        image_bytes: bytes,
+        context: str,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _FIGURE_CAPTION_PROMPT.format(context=context or "untitled document")
-        try:
-            response = client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
-            )
-            return response["message"]["content"] or ""
-        except Exception as exc:
-            raise LLMError(_redact(f"Ollama describe_image failed: {exc}")) from exc
+        message = self._request(
+            [{"role": "user", "content": prompt, "images": [image_bytes]}],
+            cancel=cancel,
+        )
+        return message["content"]
 
     def pop_usage(self) -> "dict | None":
         """Nothing to report: the model runs on the user's own hardware."""
@@ -317,27 +417,66 @@ class AnthropicProvider:
             "  Set ANTHROPIC_API_KEY env var or add api_key to [auth] in ~/.jarvis/config.toml"
         )
 
+    def _request(
+        self,
+        messages: list[dict],
+        system: str = "",
+        tools: list[dict] | None = None,
+        max_tokens: int = 2048,
+        cancel: "CancelToken | None" = None,
+    ):
+        """
+        Make one streamed message request and return the finished Message.
+
+        get_final_message() reassembles exactly what messages.create() used to
+        return (content blocks plus stop_reason), so callers are unaffected by
+        the streaming. What streaming buys is the loop below: the cancel token
+        is checked between events, and raising out of the `with` closes the
+        HTTP response, which is how Anthropic is told to stop generating (the
+        Messages API has no cancel endpoint — disconnecting is the signal).
+        """
+        client = self._get_client()
+        request: dict = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
+        if system:
+            request["system"] = system
+        if tools:
+            request["tools"] = tools
+        try:
+            with client.messages.stream(**request) as stream:
+                for _ in stream:
+                    if cancel is not None:
+                        cancel.check()
+                return stream.get_final_message()
+        except (TurnCancelled, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            raise LLMError(_redact(f"Anthropic request failed: {exc}")) from exc
+
+    def _reply_text(self, response) -> str:
+        """The first text block of a response, or empty when it has none."""
+        return next((b.text for b in response.content if b.type == "text"), "")
+
     def complete(
         self,
         messages: list[dict],
         max_tokens: int = 2048,
         context_length: int | None = None,  # unused for Anthropic; accepted for interface compatibility
+        cancel: "CancelToken | None" = None,
     ) -> str:
-        client = self._get_client()
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
         non_system = [m for m in messages if m["role"] != "system"]
-        try:
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=non_system,
-            )
-            return next((b.text for b in response.content if b.type == "text"), "")
-        except Exception as exc:
-            raise LLMError(_redact(f"Anthropic complete failed: {exc}")) from exc
+        response = self._request(
+            non_system, system=system, max_tokens=max_tokens, cancel=cancel
+        )
+        return self._reply_text(response)
 
-    def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
+    def summarize(
+        self,
+        title: str,
+        source: "str | Path",
+        max_tokens: int = 2048,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
         if isinstance(source, Path):
             pdf_b64 = base64.b64encode(source.read_bytes()).decode()
@@ -356,14 +495,8 @@ class AnthropicProvider:
             content = [{"type": "text", "text": f"{prompt}\n\nAbstract/text:\n{source}"}]
 
         messages = [{"role": "user", "content": content}]
-        client = self._get_client()
-        try:
-            response = client.messages.create(
-                model=self.model, max_tokens=max_tokens, messages=messages
-            )
-            return next((b.text for b in response.content if b.type == "text"), "")
-        except Exception as exc:
-            raise LLMError(_redact(f"Anthropic summarize failed: {exc}")) from exc
+        response = self._request(messages, max_tokens=max_tokens, cancel=cancel)
+        return self._reply_text(response)
 
     def agentic_turn(
         self,
@@ -371,8 +504,8 @@ class AnthropicProvider:
         tools: list[dict],
         dispatch_fn: Callable[[str, dict], str],
         system: str = "",
+        cancel: "CancelToken | None" = None,
     ) -> str:
-        client = self._get_client()
         anthropic_tools = _convert_tools_to_anthropic(tools)
         wire = transcript.to_anthropic(messages, model=self.model)
         # Everything from here on is appended to the wire list; only this tail
@@ -383,22 +516,15 @@ class AnthropicProvider:
             messages.extend(transcript.from_anthropic(wire[turn_start:], model=self.model))
 
         while True:
-            try:
-                response = client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=system,
-                    messages=wire,
-                    tools=anthropic_tools,
-                )
-            except Exception as exc:
-                raise LLMError(_redact(f"Anthropic agentic turn failed: {exc}")) from exc
+            # Checked before the request so a turn stopped between iterations
+            # never sends another one. Every raise below leaves `messages`
+            # untouched, because commit() is only reached on a return.
+            if cancel is not None:
+                cancel.check()
 
-            if response.stop_reason == "end_turn":
-                reply = next((b.text for b in response.content if b.type == "text"), "")
-                wire.append({"role": "assistant", "content": [_block_to_dict(b) for b in response.content]})
-                commit()
-                return reply
+            response = self._request(
+                wire, system=system, tools=anthropic_tools, max_tokens=4096, cancel=cancel
+            )
 
             if response.stop_reason == "tool_use":
                 wire.append({"role": "assistant", "content": [_block_to_dict(b) for b in response.content]})
@@ -406,6 +532,8 @@ class AnthropicProvider:
                 for block in response.content:
                     if block.type != "tool_use":
                         continue
+                    if cancel is not None:
+                        cancel.check()
                     try:
                         result = dispatch_fn(block.name, block.input)
                     except PrivacyError as exc:
@@ -419,15 +547,22 @@ class AnthropicProvider:
                 # All results for one assistant turn go in a SINGLE user
                 # message; separate messages are a 400 from this API.
                 wire.append({"role": "user", "content": tool_results})
+                continue
 
+            reply = self._reply_text(response)
+            if response.stop_reason == "end_turn":
+                wire.append({"role": "assistant", "content": [_block_to_dict(b) for b in response.content]})
             else:
-                reply = next((b.text for b in response.content if b.type == "text"), "")
                 wire.append({"role": "assistant", "content": reply})
-                commit()
-                return reply
+            commit()
+            return reply
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
-        client = self._get_client()
+    def describe_image(
+        self,
+        image_bytes: bytes,
+        context: str,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _FIGURE_CAPTION_PROMPT.format(context=context or "untitled document")
         # PDF figures are extracted as PNG bytes (see jarvis/kb/images.py), so
         # the media type is fixed.
@@ -439,14 +574,10 @@ class AnthropicProvider:
             },
             {"type": "text", "text": prompt},
         ]
-        try:
-            response = client.messages.create(
-                model=self.model, max_tokens=1024,
-                messages=[{"role": "user", "content": content}],
-            )
-            return next((b.text for b in response.content if b.type == "text"), "")
-        except Exception as exc:
-            raise LLMError(_redact(f"Anthropic describe_image failed: {exc}")) from exc
+        response = self._request(
+            [{"role": "user", "content": content}], max_tokens=1024, cancel=cancel
+        )
+        return self._reply_text(response)
 
     def pop_usage(self) -> "dict | None":
         """
@@ -497,6 +628,86 @@ def _openrouter_extra_body(cfg: "Config") -> dict:
     }
 
 
+@dataclass
+class _StreamedToolCall:
+    """One tool call reassembled from an OpenAI-style stream."""
+
+    id: str = ""
+    name: str = ""
+    # Arguments arrive as JSON split across chunks, so they accumulate as text
+    # and are parsed once the whole call has landed.
+    arguments: str = ""
+
+
+@dataclass
+class _StreamedCompletion:
+    """
+    One OpenRouter request's result, reassembled from its stream.
+
+    Deliberately not shaped like the SDK's response object: the callers below
+    read these four fields directly, which is easier to follow than mimicking
+    `choices[0].message` and lets the cost and served-model fields sit where
+    they are actually used.
+    """
+
+    content: str = ""
+    tool_calls: list = field(default_factory=list)
+    cost: "float | None" = None
+    model: str = ""
+
+
+def _accumulate_openai_stream(stream, cancel: "CancelToken | None") -> _StreamedCompletion:
+    """
+    Fold an OpenAI-style chat completion stream into one result.
+
+    Content arrives as deltas to concatenate. Tool calls arrive piecemeal too
+    and are keyed by `index`: the id and function name come once, while the
+    arguments JSON is split across as many chunks as it takes, so each field is
+    only overwritten when the chunk actually carries it. Usage and the served
+    model ride on a final chunk that has no choices at all.
+
+    The cancel token is checked per chunk; raising here unwinds through the
+    caller's `finally`, which closes the stream and drops the connection.
+    """
+    completion = _StreamedCompletion()
+    calls_by_index: dict = {}
+
+    for chunk in stream:
+        if cancel is not None:
+            cancel.check()
+
+        if getattr(chunk, "model", ""):
+            completion.model = chunk.model
+        usage = getattr(chunk, "usage", None)
+        if usage is not None and getattr(usage, "cost", None) is not None:
+            completion.cost = float(usage.cost)
+
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue  # the usage-only chunk that closes the stream
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        if getattr(delta, "content", None):
+            completion.content += delta.content
+
+        for part in getattr(delta, "tool_calls", None) or []:
+            index = getattr(part, "index", 0) or 0
+            call = calls_by_index.setdefault(index, _StreamedToolCall())
+            if getattr(part, "id", None):
+                call.id = part.id
+            function = getattr(part, "function", None)
+            if function is not None:
+                if getattr(function, "name", None):
+                    call.name = function.name
+                if getattr(function, "arguments", None):
+                    call.arguments += function.arguments
+
+    completion.tool_calls = [calls_by_index[i] for i in sorted(calls_by_index)]
+    return completion
+
+
 class OpenRouterProvider:
     """
     Any model reachable through OpenRouter, spoken over the OpenAI wire format.
@@ -537,30 +748,61 @@ class OpenRouterProvider:
         self._client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
         return self._client
 
-    def _create(self, **kwargs):
-        """One place for the shared request options, cost accounting, and errors."""
+    def _create(
+        self,
+        cancel: "CancelToken | None" = None,
+        **kwargs,
+    ) -> _StreamedCompletion:
+        """
+        One place for the shared request options, cost accounting, and errors.
+
+        The request is streamed for the same reason the other two adapters
+        stream: it is the only way to interrupt one. The token is checked
+        before the request and again between chunks, and closing the stream on
+        the way out drops the connection, which is what stops the upstream
+        model generating.
+
+        Cost still arrives: `_openrouter_extra_body` already asks for usage
+        accounting, and OpenRouter puts it in the final SSE chunk. The
+        OpenAI-standard `stream_options={"include_usage": True}` would ask for
+        the same thing a second way, so it is deliberately not sent — a
+        redundant parameter buys nothing and is one more thing an upstream
+        provider could reject outright.
+        """
         from .config import get_config
 
+        if cancel is not None:
+            cancel.check()
         client = self._get_client()
         try:
-            response = client.chat.completions.create(
-                model=self.model, extra_body=_openrouter_extra_body(get_config()), **kwargs
+            stream = client.chat.completions.create(
+                model=self.model,
+                extra_body=_openrouter_extra_body(get_config()),
+                stream=True,
+                **kwargs,
             )
+            try:
+                completion = _accumulate_openai_stream(stream, cancel)
+            finally:
+                # On a cancel this is the kill signal; on normal completion the
+                # stream is already exhausted and closing is a no-op.
+                close_stream = getattr(stream, "close", None)
+                if close_stream is not None:
+                    close_stream()
+        except (TurnCancelled, KeyboardInterrupt):
+            raise
         except Exception as exc:
             raise LLMError(_redact(f"OpenRouter request failed: {exc}")) from exc
-        self._record_usage(response)
-        return response
+        self._record_usage(completion)
+        return completion
 
-    def _record_usage(self, response) -> None:
+    def _record_usage(self, completion: _StreamedCompletion) -> None:
         """Accumulate the credits OpenRouter reports, and note who answered."""
         self._requests += 1
-        usage = getattr(response, "usage", None)
-        cost = getattr(usage, "cost", None) if usage is not None else None
-        if cost is not None:
-            self._usd += float(cost)
-        served = getattr(response, "model", "") or ""
-        if served:
-            self._served = served
+        if completion.cost is not None:
+            self._usd += completion.cost
+        if completion.model:
+            self._served = completion.model
 
     def pop_usage(self) -> "dict | None":
         """
@@ -586,11 +828,17 @@ class OpenRouterProvider:
         messages: list[dict],
         max_tokens: int = 2048,
         context_length: int | None = None,  # Ollama-only knob; accepted for interface compatibility
+        cancel: "CancelToken | None" = None,
     ) -> str:
-        response = self._create(messages=messages, max_tokens=max_tokens)
-        return response.choices[0].message.content or ""
+        return self._create(messages=messages, max_tokens=max_tokens, cancel=cancel).content
 
-    def summarize(self, title: str, source: "str | Path", max_tokens: int = 2048) -> str:
+    def summarize(
+        self,
+        title: str,
+        source: "str | Path",
+        max_tokens: int = 2048,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _get_summary_prompt().replace("{title}", title)
         if isinstance(source, Path):
             # Convert locally rather than uploading the file: the conversion is
@@ -602,7 +850,7 @@ class OpenRouterProvider:
         else:
             text = source
         messages = [{"role": "user", "content": f"{prompt}\n\nAbstract/text:\n{text}"}]
-        return self.complete(messages, max_tokens=max_tokens)
+        return self.complete(messages, max_tokens=max_tokens, cancel=cancel)
 
     def agentic_turn(
         self,
@@ -610,6 +858,7 @@ class OpenRouterProvider:
         tools: list[dict],
         dispatch_fn: Callable[[str, dict], str],
         system: str = "",
+        cancel: "CancelToken | None" = None,
     ) -> str:
         wire = transcript.to_openai(messages, provider="openrouter", model=self.model)
         # Everything from here on is appended to the wire list; only this tail
@@ -624,13 +873,15 @@ class OpenRouterProvider:
             )
 
         while True:
+            # Checked before the request so a turn stopped between iterations
+            # never sends another one. Every raise below leaves `messages`
+            # untouched, because commit() is only reached on a return.
             full = ([{"role": "system", "content": system}] + wire) if system else wire
-            response = self._create(messages=full, tools=tools or None)
-            message = response.choices[0].message
-            tool_calls = message.tool_calls or []
+            completion = self._create(messages=full, tools=tools or None, cancel=cancel)
+            tool_calls = completion.tool_calls
 
             if not tool_calls:
-                reply = message.content or ""
+                reply = completion.content
                 wire.append({"role": "assistant", "content": reply})
                 commit()
                 return reply
@@ -638,24 +889,23 @@ class OpenRouterProvider:
             wire.append(
                 {
                     "role": "assistant",
-                    "content": message.content or "",
+                    "content": completion.content,
                     "tool_calls": [
                         {
                             "id": call.id,
                             "type": "function",
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments,
-                            },
+                            "function": {"name": call.name, "arguments": call.arguments},
                         }
                         for call in tool_calls
                     ],
                 }
             )
             for call in tool_calls:
-                arguments = transcript._arguments_to_dict(call.function.arguments)
+                if cancel is not None:
+                    cancel.check()
+                arguments = transcript._arguments_to_dict(call.arguments)
                 try:
-                    result = dispatch_fn(call.function.name, arguments)
+                    result = dispatch_fn(call.name, arguments)
                 except PrivacyError as exc:
                     # Drop the assistant message we just added — with its tool
                     # calls unanswered it would leave the transcript invalid —
@@ -666,12 +916,18 @@ class OpenRouterProvider:
                 # The OpenAI wire wants one tool message per call, keyed by id.
                 wire.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
-    def describe_image(self, image_bytes: bytes, context: str) -> str:
+    def describe_image(
+        self,
+        image_bytes: bytes,
+        context: str,
+        cancel: "CancelToken | None" = None,
+    ) -> str:
         prompt = _FIGURE_CAPTION_PROMPT.format(context=context or "untitled document")
         # PDF figures are extracted as PNG bytes (see jarvis/kb/images.py), so
         # the media type is fixed.
         image_b64 = base64.b64encode(image_bytes).decode()
         response = self._create(
+            cancel=cancel,
             max_tokens=1024,
             messages=[
                 {
@@ -686,7 +942,7 @@ class OpenRouterProvider:
                 }
             ],
         )
-        return response.choices[0].message.content or ""
+        return response.content
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
