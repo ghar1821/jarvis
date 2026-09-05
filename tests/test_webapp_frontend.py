@@ -146,3 +146,26 @@ def test_the_readme_menu_items_exist_in_the_markup():
         f"README names menu items that do not exist: {sorted(labels - menu_items)}; "
         f"the menu has {sorted(menu_items)}"
     )
+
+
+def test_an_export_shows_it_is_running_and_always_stops_saying_so():
+    """
+    A PDF export can run for minutes on a machine whose font cache is cold. With
+    no feedback the button looks dead and the natural response is to click it
+    again, which stacks a second LaTeX run on the first. The counter and the
+    disabled button are the feedback; the `finally` is what stops a timeout
+    leaving the bar claiming an export is still in flight.
+    """
+    js = APP_JS.read_text()
+    exporter = re.search(r"async function exportPdf\(.*?\n\}", js, re.S)
+    assert exporter, "exportPdf not found"
+    body = exporter.group(0)
+
+    assert "startExportProgress()" in body, "an export must show that it started"
+    assert re.search(r"finally\s*\{[^}]*stopExportProgress\(\)", body, re.S), (
+        "the progress counter must be cleared in a finally, so a timeout or a "
+        "dropped connection ends it the same way a finished export does"
+    )
+    assert "disabled = true" in js[js.index("function startExportProgress"):], (
+        "the button must be disabled while the export runs"
+    )

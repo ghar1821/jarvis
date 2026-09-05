@@ -98,6 +98,10 @@
             <button id="editor-recompile" disabled>Recompile</button>
             <button id="editor-save" disabled>Save</button>
             <button id="editor-export" class="hidden">PDF</button>
+            <!-- Elapsed time while an export runs. pandoc and the LaTeX engine
+                 report no progress of their own, so how long it has been going
+                 is the only honest thing to show. -->
+            <span id="export-status" class="hidden"></span>
             <button id="editor-history" disabled>History</button>
             <!-- Closing a pane belongs on the pane. Making the only way out a
                  button in the app's top bar means looking away from the thing

@@ -211,7 +211,7 @@ Resolution order (later wins): defaults → `~/.jarvis/config.toml` → env vars
 | `drafts_gc_hour` | `4` | — | `[drafts] gc_hour` — hour of day (0–23) for the retention sweep |
 | `latex_engine` | `latexmk` | — | `[drafts] latex_engine` — used to compile `.tex`. `""` disables compilation and hides the button rather than failing on click |
 | `pdf_engine` | `xelatex` | — | `[drafts] pdf_engine` — the engine pandoc drives for Markdown → PDF. Separate from `latex_engine` because they are different jobs: latexmk is a build wrapper that reruns until references settle, while pandoc needs an actual engine. xelatex rather than pandoc's default pdflatex because notes carry Greek letters and accented names, which pdflatex fails outright on; the cost is that xelatex loads fontspec, whose first run builds a system font cache and can take minutes — which is why a `.tex` can compile fine on a new machine while a `.md` export times out |
-| `compile_timeout_seconds` | `60` | — | `[drafts] compile_timeout_seconds` — hard ceiling on a LaTeX run, so a `\loop` bomb in a model-written document dies instead of pinning a core |
+| `compile_timeout_seconds` | `180` | — | `[drafts] compile_timeout_seconds` — hard ceiling on a LaTeX or pandoc run, so a `\loop` bomb in a model-written document dies instead of pinning a core. Three minutes rather than one: the first Markdown export on a machine also pays for fontspec building its font cache, and on a laptop that alone can run past a one-minute limit, which reads as a broken export button rather than a slow first run |
 | `pdf_margin` | `2cm` | — | `[drafts] pdf_margin` — page margin for Markdown → PDF export via pandoc |
 
 Two config helpers matter beyond `load_config()`:
@@ -1841,6 +1841,16 @@ maths reaches the PDF.
 **PDF export margin** comes from `[drafts] pdf_margin` (default `2cm`,
 passed as `-V geometry:margin=`). pandoc's own default leaves about an inch
 and a half on every side, wasting most of the page.
+
+**An export shows elapsed time, not a progress bar.** Neither pandoc nor the
+LaTeX engine reports how far through a document it is, so a bar would be an
+animation, not a measurement. Instead the PDF button is disabled for the
+duration — which also stops a second click stacking another LaTeX run on the
+first — and the editor bar counts the seconds beside it. Past
+`EXPORT_SLOW_AFTER_SECONDS` (20) the counter also names the usual reason a
+first export takes minutes: fontspec enumerating the system fonts. The counter
+is cleared in a `finally`, so a timeout or a dropped connection leaves the bar
+in the same state a finished export does.
 
 | `.tex` | `POST /compile` → `latexmk` → the PDF in an iframe (the browser's own viewer), with the log in a pane below when it fails | the compiled PDF |
 

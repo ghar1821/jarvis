@@ -2114,24 +2114,68 @@ async function compileDocument() {
   previewFrame.src = URL.createObjectURL(blob);
 }
 
+// An export runs pandoc and a whole LaTeX engine, and neither of them says
+// anything about how far along it is — there is no percentage to show without
+// inventing one. Elapsed seconds is the honest version: it says the export is
+// still alive, and after a while it says why it might be taking this long. The
+// first export on a machine pays for fontspec enumerating the system fonts,
+// which is minutes of work that has nothing to do with the document.
+const EXPORT_SLOW_AFTER_SECONDS = 20;
+
+let exportTicker = null;
+
+function startExportProgress() {
+  const startedAt = Date.now();
+  const status = document.getElementById('export-status');
+  // Disabled as much to say "this is running" as to stop a second export
+  // stacking another LaTeX run on top of the first.
+  document.getElementById('editor-export').disabled = true;
+  status.classList.remove('hidden');
+
+  const tick = () => {
+    const seconds = Math.round((Date.now() - startedAt) / 1000);
+    status.textContent = seconds < EXPORT_SLOW_AFTER_SECONDS
+      ? `exporting… ${seconds}s`
+      : `exporting… ${seconds}s — a first export builds a font cache, which can take minutes`;
+  };
+  tick();
+  exportTicker = setInterval(tick, 1000);
+}
+
+function stopExportProgress() {
+  clearInterval(exportTicker);
+  exportTicker = null;
+  document.getElementById('editor-export').disabled = false;
+  const status = document.getElementById('export-status');
+  status.classList.add('hidden');
+  status.textContent = '';
+}
+
 async function exportPdf() {
   if (!openDraft) return;
   await saveDraft({ silent: true });
-  const response = await fetch('/export', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ draft_id: openDraft.draft_id, file: openDraft.file }),
-  });
-  if (!response.ok) {
-    const { detail } = await response.json().catch(() => ({ detail: 'export failed' }));
-    alert(detail);
-    return;
+  startExportProgress();
+  try {
+    const response = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ draft_id: openDraft.draft_id, file: openDraft.file }),
+    });
+    if (!response.ok) {
+      const { detail } = await response.json().catch(() => ({ detail: 'export failed' }));
+      alert(detail);
+      return;
+    }
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = openDraft.file.replace(/\.[^.]+$/, '.pdf');
+    link.click();
+  } finally {
+    // Whatever happened — a PDF, a timeout, a dropped connection — the bar has
+    // to stop claiming an export is in flight.
+    stopExportProgress();
   }
-  const blob = await response.blob();
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = openDraft.file.replace(/\.[^.]+$/, '.pdf');
-  link.click();
 }
 
 // ── Scroll sync ──────────────────────────────────────────────────────────

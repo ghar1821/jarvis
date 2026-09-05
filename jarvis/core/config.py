@@ -73,7 +73,7 @@ Example ~/.jarvis/config.toml:
     gc_hour = 4                  # daily sweep slot
     latex_engine = "latexmk"     # "" disables .tex compilation
     pdf_engine = "xelatex"       # engine pandoc drives for Markdown -> PDF
-    compile_timeout_seconds = 60
+    compile_timeout_seconds = 180   # ceiling on one LaTeX/pandoc run
     pdf_margin = "2cm"           # margin for Markdown -> PDF export
 
     [openrouter]
@@ -196,7 +196,11 @@ class Config:
     # is why they are allowed on a private draft. "" hides the compile button.
     latex_engine: str = "latexmk"
     pdf_engine: str = "xelatex"
-    compile_timeout_seconds: int = 60
+    # Ceiling on one LaTeX or pandoc run. Three minutes rather than one because
+    # the first Markdown export on a machine pays for fontspec building its font
+    # cache, which on a laptop can take a couple of minutes on its own — a limit
+    # tight enough to kill that turns a slow first run into a broken feature.
+    compile_timeout_seconds: int = 180
     # Margin for Markdown -> PDF export. pandoc's default leaves an inch and a
     # half of white space on every side, which wastes most of the page.
     pdf_margin: str = "2cm"

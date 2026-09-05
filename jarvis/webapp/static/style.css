@@ -742,6 +742,9 @@ button:disabled { opacity: 0.45; cursor: default; }
 #editor-spacer { flex: 1; }
 #editor-filename { font-size: 0.85rem; color: var(--text-dim); }
 #editor-dirty { font-size: 0.75rem; color: var(--badge-text); }
+/* Elapsed time while a PDF export runs, styled like the unsaved badge: a
+   status note in the bar, not another control competing with the buttons. */
+#export-status { font-size: 0.75rem; color: var(--text-dim); }
 
 /* ── Editor tabs ─────────────────────────────────────────────────────────
    One row per open document. The strip scrolls sideways rather than wrapping,
