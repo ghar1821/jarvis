@@ -15,6 +15,7 @@ output/
 CLAUDE.md
 tests/.chroma/
 docs/ROADMAP.md
+docs/plans/
 
 # MkDocs build output
 site/

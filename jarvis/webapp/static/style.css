@@ -45,8 +45,6 @@ body {
   overflow-y: auto;
 }
 
-#new-chat-btn { width: 100%; }
-
 #session-list { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 
 .session-item {
@@ -85,17 +83,42 @@ body {
   white-space: nowrap;
 }
 .session-item .badge { flex-shrink: 0; font-size: 0.75rem; }
-.session-item .icon-btn {
+.icon-btn {
   flex-shrink: 0;
   background: none;
   border: none;
   color: var(--text-faint);
   padding: 0 2px;
   font-size: 0.8rem;
+  line-height: 1;
   cursor: pointer;
 }
-.session-item .icon-btn:hover { color: var(--text); }
-.session-item .icon-btn.pinned { color: var(--accent); }
+.icon-btn:hover { color: var(--text); }
+.icon-btn.pinned { color: var(--accent); }
+
+/* Row actions stay out of the way until you are on the row, so both lists read
+   as titles rather than as rows of controls.
+
+   `.pinned` is the deliberate exception: a pin marks a STATE, not an action,
+   and hiding it would mean you could only discover which chats and documents
+   are protected by hovering over each one in turn. */
+.session-item .icon-btn,
+.draft-item .icon-btn { opacity: 0; transition: opacity 0.12s; }
+
+.session-item:hover .icon-btn,
+.session-item.active .icon-btn,
+.draft-item:hover .icon-btn,
+.draft-item.active .icon-btn { opacity: 0.75; }
+
+.session-item .icon-btn.pinned,
+.draft-item .icon-btn.pinned { opacity: 1; }
+
+.session-item .icon-btn:hover,
+.draft-item .icon-btn:hover { opacity: 1; }
+
+/* Keyboard users never hover, so the actions have to appear on focus too. */
+.session-item .icon-btn:focus-visible,
+.draft-item .icon-btn:focus-visible { opacity: 1; }
 
 #main {
   flex: 1;
@@ -116,10 +139,68 @@ header {
   color: var(--text-dim);
   flex-shrink: 0;
 }
-#header-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The status line was one dim 0.82rem string of everything joined by dots,
+   which made the model — the part that changes per turn under a router — hard
+   to pick out. It is now two pieces with a deliberate hierarchy instead. */
+#header-text {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
 
-/* ── Header ⋮ menu ── */
-#menu-btn {
+/* A plain line-art brain — the generic "this is an AI model" mark, not tied
+   to any one provider's branding, since the session could be on Anthropic,
+   OpenAI, or a local Ollama model. */
+#header-icon {
+  flex: none;
+  display: flex;
+  color: var(--text-dim);
+}
+
+/* The model, at full contrast — the thing you actually look up here. */
+#header-model {
+  flex: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+/* What a router picked for the last turn, rendered as an arrow off the model
+   so it reads as "asked for X, got Y" rather than a second model. */
+#header-served {
+  flex: none;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+#header-served::before {
+  content: '→ ';
+  color: var(--text-dim);
+}
+#header-served.hidden { display: none; }
+
+/* Spend, as a chip — present only once it is non-zero, so an Ollama session
+   shows nothing rather than a fabricated $0.0000. */
+#header-cost {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: default;
+}
+#header-cost.hidden { display: none; }
+
+/* ── Header tools menu ── */
+/* The model picker button sits beside it and shares its styling. */
+#menu-btn,
+#model-btn {
   background: none;
   border: none;
   color: var(--text-dim);
@@ -129,7 +210,12 @@ header {
   cursor: pointer;
   border-radius: 6px;
 }
-#menu-btn:hover { background: var(--surface-2); color: var(--text); }
+#menu-btn:hover,
+#model-btn:hover { background: var(--surface-2); color: var(--text); }
+
+/* A plain line-art wrench, not a colour emoji, since this opens the tools
+   menu (switch model, edit prompts, show config, and so on). */
+#menu-btn { display: flex; align-items: center; }
 
 #header-menu {
   position: absolute;
@@ -159,6 +245,11 @@ header {
 #header-menu button:hover { background: var(--surface-3); }
 
 .hidden { display: none; }
+/* An id selector outranks a class one, so `#editor-view { display: flex }`
+   beat `.hidden` outright and the panel could not be hidden at all. The
+   .modal.hidden rule further down works around the same trap, so the same
+   compound-selector fix is used here rather than reaching for !important. */
+#editor-view.hidden { display: none; }
 
 #messages {
   flex: 1;
@@ -324,11 +415,18 @@ button {
 }
 button:disabled { opacity: 0.45; cursor: default; }
 
-/* Takes Send's place while a turn is in flight. Red so it reads as an
-   interruption rather than another way to submit. */
+/* Send and Stop share one slot and swap as the turn starts and ends. They sit
+   between the box and the DB-only toggle now, so they need a common width —
+   otherwise the toggle jumps sideways on every reply. */
+#send-btn,
+#stop-btn {
+  min-width: 92px;
+  flex-shrink: 0;
+}
+
+/* Red so it reads as an interruption rather than another way to submit. */
 #stop-btn {
   background: var(--danger);
-  flex-shrink: 0;
 }
 
 /* AI knowledge fallback toggle */
@@ -510,3 +608,751 @@ button:disabled { opacity: 0.45; cursor: default; }
   border-radius: 6px;
 }
 .papers-confirm-actions { display: flex; gap: 8px; margin-top: 8px; }
+
+/* ── Model picker ─────────────────────────────────────────────────────── */
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 50vh;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.9rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.model-row:hover:not(.disabled) { border-color: var(--accent); }
+.model-row.current { border-color: var(--accent); }
+
+/* Kept legible rather than nearly invisible: a greyed-out row still has to
+   explain why it is unavailable. */
+.model-row.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.model-tag {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.model-note {
+  padding: 8px 10px;
+  margin: 4px 0;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+
+/* ── Library kind switch ──────────────────────────────────────────────── */
+
+.library-kinds {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.kind-btn {
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.kind-btn:hover { color: var(--text); }
+.kind-btn.active {
+  color: var(--text);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+/* ── Workspace: chat, with the editor optionally beside it ────────────── */
+
+/* Editor above, chat below. Stacking them beats a side-by-side split here:
+   the editor's own panes are horizontal, so competing for width with the
+   conversation left everything cramped. */
+#workspace {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;   /* lets the panes scroll instead of pushing the layout */
+}
+
+/* The conversation and its composer travel together, so the composer stays
+   put when the editor opens next to them. */
+#chat-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+#editor-view {
+  display: flex;
+  /* The document gets the larger share — it is what you are working on. */
+  flex: 1.6;
+  min-height: 0;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Marks the panel as open, so the button reads as a state rather than an
+   action you cannot tell you have taken. */
+#view-btn.active {
+  color: var(--text);
+  background: var(--accent-dim);
+}
+
+
+
+
+#editor-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+
+#editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+#editor-spacer { flex: 1; }
+#editor-filename { font-size: 0.85rem; color: var(--text-dim); }
+#editor-dirty { font-size: 0.75rem; color: var(--badge-text); }
+/* Elapsed time while a PDF export runs, styled like the unsaved badge: a
+   status note in the bar, not another control competing with the buttons. */
+#export-status { font-size: 0.75rem; color: var(--text-dim); }
+
+/* ── Editor tabs ─────────────────────────────────────────────────────────
+   One row per open document. The strip scrolls sideways rather than wrapping,
+   so opening a seventh file never costs the editor a second row of height. */
+#editor-tabs {
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+#editor-tabs::-webkit-scrollbar { display: none; }
+#editor-tabs.hidden { display: none; }
+
+.editor-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px 5px 12px;
+  max-width: 220px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.editor-tab:hover { color: var(--text); }
+/* The active tab reads as the sheet in front: same ground as the editor, and
+   an accent edge along the top rather than a border all the way round. */
+.editor-tab.active {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.editor-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* One control carrying two meanings. A filled dot says there is something
+   unsaved; hovering turns it into the × it is about to behave as, so the
+   click that saves and closes still looks like a close. */
+.editor-tab-close {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-family: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  color: inherit;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.55;
+}
+.editor-tab-close::before { content: '\00d7'; }
+.editor-tab-close.unsaved::before { content: '\25cf'; font-size: 0.7rem; }
+.editor-tab-close.unsaved { opacity: 1; color: var(--accent); }
+.editor-tab-close:hover { opacity: 1; background: var(--surface-3, var(--border)); }
+.editor-tab-close.unsaved:hover::before { content: '\00d7'; font-size: 0.85rem; }
+
+#editor-bar button {
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+#editor-bar button:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+#editor-bar button:disabled { opacity: 0.4; cursor: default; }
+
+/* Close, in the usual place and the usual colour. Needs to out-specify
+   `#editor-bar button` (1-0-1) above, which would otherwise box it up like
+   the action buttons and drop the .icon-btn styling entirely. */
+#editor-bar #editor-close {
+  margin-left: 2px;
+  padding: 2px 7px;
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--error-text);
+  background: none;
+  border: 1px solid transparent;
+}
+#editor-bar #editor-close:hover {
+  color: #fff;
+  background: var(--error-border);
+  border-color: var(--error-border);
+}
+
+#editor-panes { display: flex; flex: 1; min-height: 0; }
+#editor-source { flex: 1; min-width: 0; overflow: hidden; }
+#editor-preview-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+}
+#preview-frame { flex: 1; width: 100%; border: none; background: var(--surface); }
+
+/* The compile log is the thing you actually need when LaTeX fails, so it gets
+   real room rather than a one-line toast. */
+#compile-log {
+  flex: 1;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--text-dim);
+  background: var(--code-bg);
+  white-space: pre-wrap;
+}
+
+/* CodeMirror. Token colours come from the vendored ayu-dark theme; only the
+   things that tie the editor to this app's layout are set here, so there is
+   no hand-maintained palette to drift out of step with the theme. */
+#editor-source .CodeMirror {
+  height: 100%;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+#editor-source .CodeMirror-gutters { border-right: 1px solid var(--border); }
+
+/* In editor view the composer becomes a docked side panel. */
+#input-bar.side { border-top: 1px solid var(--border); }
+
+/* ── Edit proposals ───────────────────────────────────────────────────── */
+
+.edit-proposal {
+  margin: 8px 0;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.edit-proposal-head { font-size: 0.9rem; color: var(--text); margin-bottom: 4px; }
+.edit-proposal-why { font-size: 0.82rem; color: var(--text-dim); margin-bottom: 6px; }
+
+/* Stated verbatim, and rendered distinctly, everywhere a write is proposed. */
+.edit-proposal-invariant {
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  font-size: 0.78rem;
+  color: var(--badge-text);
+  background: var(--badge-bg);
+  border: 1px solid var(--badge-border);
+  border-radius: 4px;
+}
+
+.hunk { margin-bottom: 8px; }
+.hunk-toggle {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-faint);
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+
+.hunk-diff {
+  margin: 0;
+  padding: 6px 8px;
+  overflow-x: auto;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  background: var(--code-bg);
+  border-radius: 4px;
+}
+.hunk-diff .add { color: #8fd98f; }
+.hunk-diff .del { color: #ff8f8f; }
+.hunk-diff .ctx { color: var(--text-faint); }
+
+.edit-proposal-actions { display: flex; gap: 8px; align-items: center; }
+.edit-proposal-actions button {
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.edit-proposal-actions button:hover:not(:disabled) { border-color: var(--accent); }
+.edit-proposal-actions button:disabled { opacity: 0.4; cursor: default; }
+.edit-proposal-done { font-size: 0.8rem; color: var(--text-dim); }
+
+/* Typing a model id the catalogue does not list. */
+.model-custom {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.model-custom input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  font-family: inherit;
+  font-size: 0.82rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.model-custom input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
+/* ── Config viewer ───────────────────────────────────────────────────────
+   A key/value dump, so the values line up in a column you can scan down. */
+#config-body {
+  max-height: 58vh;
+  overflow-y: auto;
+  margin: 4px 0 2px;
+}
+
+.config-section {
+  margin: 14px 0 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.config-section:first-child { margin-top: 4px; }
+
+.config-table {
+  display: grid;
+  grid-template-columns: minmax(140px, max-content) 1fr;
+  gap: 3px 16px;
+  font-size: 0.8rem;
+}
+.config-key { color: var(--text-dim); }
+.config-value {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+/* ── Prompt editor ───────────────────────────────────────────────────────
+   A prompt is a page of text, not a sentence, so this modal is wider than the
+   others and the textarea gets real room. */
+.modal-wide { width: min(780px, 92vw); }
+.modal-spacer { flex: 1; }
+
+#prompt-picker {
+  width: 100%;
+  padding: 7px 9px;
+  margin-bottom: 8px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+#prompt-picker:focus { outline: none; border-color: var(--accent); }
+
+#prompt-text {
+  width: 100%;
+  min-height: 46vh;
+  padding: 10px 12px;
+  /* Monospace: these carry {placeholders} and JSON the model must copy
+     exactly, and proportional text hides a missing brace. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+}
+#prompt-text:focus { outline: none; border-color: var(--accent); }
+
+.prompt-status {
+  margin: 6px 0 2px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+/* ── Modal notes ──────────────────────────────────────────────────────── */
+
+.modal-note {
+  padding: 8px 10px;
+  margin: 4px 0 8px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+
+/* ── File context menu ───────────────────────────────────────────────────
+   Right-clicking a document. Positioned at the pointer by script, so only
+   the look lives here. */
+#file-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+#file-menu.hidden { display: none; }
+#file-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#file-menu button:hover { background: var(--surface-3); }
+
+/* ── Drafts panel: a list of documents, not a stack of cards ───────────── */
+
+/* How many files this document is made of. Only on multi-file documents,
+   where it is the difference between "a file" and "a folder that compiles
+   as one thing". */
+.draft-count {
+  flex: none;
+  padding: 0 5px;
+  font-size: 0.65rem;
+  line-height: 1.5;
+  color: var(--text-dim);
+  background: var(--surface-3);
+  border-radius: 8px;
+}
+
+#draft-list { display: flex; flex-direction: column; }
+
+/* Deliberately the same row idiom as the session sidebar — this panel is a
+   list of documents, and a second visual language for the same job would only
+   make the app feel like two apps. */
+.draft-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  /* Compact on purpose: this is a file list, and the useful thing about a
+     file list is seeing many entries at once. */
+  padding: 3px 8px;
+  line-height: 1.5;
+  font-family: inherit;
+  font-size: 0.78rem;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.draft-item:hover { background: var(--surface-2); }
+.draft-item.active { background: var(--accent-dim); border-color: var(--accent); }
+
+.draft-item .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.draft-item .badge { flex-shrink: 0; font-size: 0.75rem; }
+
+/* Only shown in a draft's last week — see the comment where it is built. */
+.draft-expiring {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--badge-text);
+}
+
+.draft-keep {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+/* Sub-rows, only for a draft that actually has more than one file. */
+.draft-file {
+  width: 100%;
+  padding: 4px 8px 4px 22px;
+  font-family: inherit;
+  font-size: 0.75rem;
+  text-align: left;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.draft-file:hover { background: var(--surface-2); color: var(--text); }
+.draft-file.active { color: var(--text); background: var(--accent-dim); }
+
+/* The way from a chat reply to the document it just wrote. */
+.draft-jump {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.draft-jump button {
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.draft-jump button:hover { background: var(--accent-dim); }
+
+
+
+/* ── Sidebar sections: chats above, documents below ───────────────────── */
+
+#sidebar { display: flex; flex-direction: column; gap: 10px; }
+
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* Chats take the space they need; documents get what is left, so a long
+   session list never pushes the document list off screen entirely. */
+.sidebar-section:first-child { flex: 1.2; }
+#documents-section { flex: 1; border-top: 1px solid var(--border); padding-top: 8px; }
+
+/* A heading and its "new" action on one line, so both lists read the same
+   way and neither spends a whole row on a button. */
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  padding: 2px 4px 6px 8px;
+}
+.sidebar-heading .icon-btn { font-size: 1rem; padding: 0 4px; }
+.sidebar-heading .icon-btn:hover { color: var(--accent); }
+
+#session-list, #draft-list { overflow-y: auto; }
+
+/* ── Editor layout modes (Overleaf's three views) ─────────────────────── */
+
+#layout-modes { display: flex; gap: 2px; margin-right: 4px; }
+
+#editor-bar .mode-btn {
+  padding: 4px 8px;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--text-faint);
+  background: none;
+  border: 1px solid transparent;
+}
+#editor-bar .mode-btn:hover { color: var(--text); }
+#editor-bar .mode-btn.active {
+  color: var(--text);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+/* In single-pane modes the hidden side is collapsed rather than squeezed. */
+#editor-panes.mode-source #editor-preview-pane,
+#editor-panes.mode-source #editor-review { display: none; }
+#editor-panes.mode-output #editor-source { display: none; }
+
+
+/* ── Inline suggestion review (VS Code style) ─────────────────────────── */
+
+#review-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  background: var(--badge-bg);
+  border-bottom: 1px solid var(--badge-border);
+}
+#review-bar.hidden { display: none; }
+.review-spacer { flex: 1; }
+#review-rationale { color: var(--text); }
+#review-progress { color: var(--text-faint); font-size: 0.75rem; }
+#review-bar button {
+  padding: 3px 10px;
+  font-family: inherit;
+  font-size: 0.78rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+#review-bar button:hover { border-color: var(--accent); }
+
+/* The two versions, laid out in the document itself. Tinted backgrounds
+   rather than borders, so the line structure stays readable. */
+.cm-diff-del { background: rgba(255, 100, 100, 0.13); }
+.cm-diff-add { background: rgba(120, 220, 120, 0.13); }
+
+/* One control block per change, sitting above it in the text. */
+.hunk-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 3px 0;
+  padding: 3px 8px;
+  font-family: -apple-system, system-ui, sans-serif;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+}
+.hunk-label { flex-shrink: 0; }
+.hunk-controls button {
+  padding: 1px 8px;
+  font-family: inherit;
+  font-size: 0.72rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.hunk-accept:hover { border-color: #6bbf6b; color: #8fd98f; }
+.hunk-reject:hover { border-color: var(--error-border); color: var(--error-text); }
+
+.hunk-controls.decided-accept { border-left-color: #6bbf6b; color: #8fd98f; }
+.hunk-controls.decided-reject { border-left-color: var(--error-border); color: var(--error-text); }
+
+/* A replacement shown as two columns: what the file says, and what is
+   suggested. Additions and removals stay inline in the document, where they
+   read perfectly well on their own — only a replacement genuinely needs the
+   comparison, and only when there is width for both halves. */
+.hunk-split {
+  margin: 4px 0;
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.hunk-split .hunk-controls {
+  margin: 0;
+  border-left: none;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hunk-columns { display: flex; align-items: stretch; }
+.hunk-column {
+  flex: 1;
+  min-width: 0;          /* long lines scroll inside their column */
+  display: flex;
+  flex-direction: column;
+}
+.hunk-column + .hunk-column { border-left: 1px solid var(--border); }
+
+.hunk-column-label {
+  padding: 2px 8px;
+  font-family: -apple-system, system-ui, sans-serif;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+.hunk-old .hunk-column-label { color: var(--error-text); }
+.hunk-new .hunk-column-label { color: #8fd98f; }
+
+.hunk-column-body {
+  flex: 1;
+  margin: 0;
+  padding: 4px 8px 6px;
+  overflow-x: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  color: var(--text);
+}
+/* The tint marks the lines that change, not the whole column. A hunk carries
+   three lines of context on each side, and colouring those made a removal
+   look like it was taking its neighbours with it. */
+.hunk-line { padding: 0 4px; }
+.hunk-line-old { background: rgba(255, 100, 100, 0.18); }
+.hunk-line-new { background: rgba(120, 220, 120, 0.18); }

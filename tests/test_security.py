@@ -367,3 +367,108 @@ def test_truncate_middle_preserves_head_and_tail():
     assert out.count("…") == 1
     assert out.endswith("paper-name.pdf'")  # filename preserved at the tail
     assert out.startswith("'file:///Users")  # scheme preserved at the head
+
+
+# ── API keys must not survive into anything durable ──────────────────────────
+#
+# An SDK can quote the credential it just failed with. jarvis writes that text
+# to three durable places at once — the reply on screen, ~/.jarvis/logs/chat.log,
+# and the saved session, which is then indexed into the vector store as a chat
+# chunk. A key reaching any of them outlives the request that produced it.
+
+_CANARY = "sk-or-v1-CANARY000000000000000000000000"
+
+
+@pytest.fixture
+def canary_key(monkeypatch):
+    from jarvis.core.config import reset_config
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", _CANARY)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _CANARY)
+    reset_config()
+    yield _CANARY
+    reset_config()
+
+
+def test_a_provider_error_quoting_the_key_is_redacted(canary_key):
+    """The leak that started this: `LLMError(f"...: {exc}")` carried it through."""
+    from types import SimpleNamespace
+
+    from jarvis.core.llm import OpenRouterProvider
+
+    provider = OpenRouterProvider(model="openrouter/auto")
+
+    class Failing:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs):
+            raise RuntimeError(f"401 Unauthorized for key {canary_key}")
+
+    provider._client = Failing()
+
+    with pytest.raises(Exception) as caught:
+        provider.complete([{"role": "user", "content": "x"}])
+
+    assert canary_key not in str(caught.value)
+    assert "[REDACTED]" in str(caught.value)
+
+
+def test_redaction_covers_an_anthropic_key_given_only_as_an_env_var(monkeypatch):
+    """
+    `load_config` folds OPENROUTER_API_KEY into the Config but *not*
+    ANTHROPIC_API_KEY — that one is read straight from the environment when
+    the client is built. So a key supplied that way never appears in Config,
+    and redaction has to consult the environment as well or it misses it
+    entirely.
+    """
+    from jarvis.core.config import load_config, redact_secrets, reset_config
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _CANARY)
+    reset_config()
+
+    # The premise: it really is absent from the loaded config.
+    assert load_config(Path("/nonexistent/config.toml")).anthropic_api_key == ""
+
+    assert _CANARY not in redact_secrets(f"Anthropic auth failed with {_CANARY}")
+    reset_config()
+
+
+def test_redaction_does_not_blank_ordinary_text(canary_key):
+    from jarvis.core.config import redact_secrets
+
+    message = "Search failed: Error finding id 42"
+    assert redact_secrets(message) == message
+
+
+def test_a_short_secret_never_becomes_a_wildcard(monkeypatch):
+    """
+    A one- or two-character key would match almost any text. Below a sane
+    length it is ignored rather than blanking the whole message out.
+    """
+    from jarvis.core.config import redact_secrets, reset_config
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    reset_config()
+    assert redact_secrets("an ordinary explanatory sentence") == "an ordinary explanatory sentence"
+    reset_config()
+
+
+def test_redaction_never_breaks_error_reporting(monkeypatch):
+    """
+    If reading the config fails, the message still has to get through — a
+    scrubber that raises would turn every error into a different error.
+    """
+    from jarvis.core import config as config_module
+
+    monkeypatch.setattr(config_module, "get_config", lambda: (_ for _ in ()).throw(OSError("boom")))
+    assert config_module.redact_secrets("the original message") == "the original message"
+
+
+def test_the_config_view_never_serves_a_key(canary_key):
+    """The other place a key could be rendered: ⋮ → Show config…"""
+    from jarvis.core.config import describe
+
+    flat = " ".join(v["value"] for s in describe() for v in s["values"])
+    assert canary_key not in flat

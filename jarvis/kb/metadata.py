@@ -19,6 +19,10 @@ from pathlib import Path
 
 import pymupdf
 
+from jarvis.core.logs import get_logger
+
+log = get_logger(__name__)
+
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
 
 _EXTRACTION_PROMPT = (
@@ -49,7 +53,8 @@ def _parse_json_object(raw: str) -> dict:
         return {}
     try:
         return json.loads(match.group(0))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        log.warning("metadata inference returned unparseable JSON: %s", exc)
         return {}
 
 
@@ -69,7 +74,11 @@ def infer_pdf_metadata(pdf_path: Path, provider) -> dict:
     try:
         raw = provider.complete([{"role": "user", "content": prompt}], max_tokens=300)
         parsed = _parse_json_object(raw)
-    except Exception:
+    except Exception as exc:
+        # Best-effort by design — a failure here must not stop the add. But a
+        # paper landing with its filename as the title and no authors is
+        # otherwise unexplained, so the reason goes in the log.
+        log.warning("metadata inference failed, falling back to the filename: %s", exc)
         parsed = {}
 
     result: dict = {}

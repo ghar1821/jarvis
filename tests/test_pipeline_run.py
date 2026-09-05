@@ -272,3 +272,58 @@ def test_index_digest_file_stores_digest_doc_type(store, tmp_path, pipeline_conf
         assert meta["title"] == "Paper Digest — 2026-07-06"
         assert meta["file_path"] == str(output_path.resolve())
         assert meta["storage_mode"] == "full_text"
+
+
+# ── the digest opt-in gate ─────────────────────────────────────────────────────
+
+def test_main_does_nothing_when_digest_disabled(monkeypatch, capsys, pipeline_config):
+    """
+    With [digest] enabled = false (the default), `run-digest` explains how to
+    turn it on and fetches nothing. The fetch functions raise if reached.
+    """
+    monkeypatch.setattr(
+        run_module, "fetch_arxiv",
+        lambda *a, **k: pytest.fail("fetch_arxiv must not run while the digest is disabled"),
+    )
+
+    run_module.main([])
+
+    output = capsys.readouterr().out
+    assert "Paper digest is disabled" in output
+    assert "--force" in output
+
+
+def test_main_force_runs_while_disabled(monkeypatch, pipeline_config):
+    """
+    --force is the explicit human override: typing the command IS the request,
+    so it proceeds past the gate even with the feature switched off. Proven by
+    the fetch being reached (and then aborted, so no live network is touched).
+    """
+    class _Reached(Exception):
+        pass
+
+    def _fetch(*args, **kwargs):
+        raise _Reached()
+
+    monkeypatch.setattr(run_module, "fetch_arxiv", _fetch)
+    monkeypatch.setattr(run_module, "make_provider", lambda *a, **k: _NoCallProvider())
+
+    with pytest.raises(_Reached):
+        run_module.main(["--force"])
+
+
+def test_main_runs_without_force_when_enabled(monkeypatch, tmp_path):
+    """When the feature is switched on, no flag is needed."""
+    class _Reached(Exception):
+        pass
+
+    cfg = Config(rag_dir=tmp_path / "rag", digest_enabled=True)
+    monkeypatch.setattr("jarvis.digest.pipeline.run.get_config", lambda: cfg)
+    monkeypatch.setattr(run_module, "make_provider", lambda *a, **k: _NoCallProvider())
+    monkeypatch.setattr(
+        run_module, "fetch_arxiv",
+        lambda *a, **k: (_ for _ in ()).throw(_Reached()),
+    )
+
+    with pytest.raises(_Reached):
+        run_module.main([])

@@ -1,12 +1,12 @@
 """
-Tests for the chat agent's tools and terminal loop (jarvis/chat/chat.py).
+Tests for the chat agent's tools (jarvis/chat/chat.py).
 
 The bulk is chunk-first retrieval — the agent should be able to answer from
 search hits and the get_document tool without falling back to reading raw
 files.
 
 Covers:
-- _retrieve_papers / _search_notes now return the full chunk text (previously
+- _search_kb returns the full chunk text (previously
   truncated to 300 chars), so a long passage stays fully visible to the model.
 - _get_document: pagination (15 chunks/page), the header format, the
   summary-mode honesty note, and unknown-source handling.
@@ -16,9 +16,6 @@ Covers:
 - _add_document stages its whole document in memory and commits it in one
   write, so a stopped ingest leaves the knowledge base untouched rather than
   half-indexed.
-- run_session's Ctrl-C handling: an interrupt mid-turn drops the turn from the
-  session and exits, instead of dumping a traceback out of main().
-
 Privacy hard-stops for get_document are covered separately in
 test_privacy_guard.py.
 """
@@ -28,9 +25,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from jarvis.chat.chat import (
-    _add_document, _dispatch_tool, _get_document, _retrieve_papers, _search_notes,
-)
+from jarvis.chat.chat import _add_document, _dispatch_tool, _get_document, _search_kb
 from jarvis.chat.sessions import new_session
 from jarvis.core.cancel import CancelToken
 from jarvis.core.errors import TurnCancelled
@@ -39,10 +34,10 @@ from jarvis.kb.store import add_paper, add_texts, count
 
 # ── Full-text hits (no more 300-char truncation) ────────────────────────────────
 
-def test_retrieve_papers_returns_text_beyond_300_chars(store, monkeypatch):
+def test_search_kb_papers_returns_text_beyond_300_chars(store, monkeypatch):
     """
     A paper chunk longer than 300 characters must appear in full in
-    _retrieve_papers' output — the old behaviour truncated with "...".
+    _search_kb's output — the old behaviour truncated with "...".
 
     Input:  a paper summary >300 chars, indexed via add_paper
     Expected output: the full summary text is present, with no "..." elision
@@ -61,14 +56,14 @@ def test_retrieve_papers_returns_text_beyond_300_chars(store, monkeypatch):
     paper = {"link": "https://arxiv.org/abs/9999.00001", "title": "GNN for PPI Prediction"}
     add_paper(paper, dense_summary=long_summary, store=store)
 
-    result, _ = _retrieve_papers({"query": "protein interaction graph neural network"}, "ollama")
+    result, _ = _search_kb({"kinds": ["papers"], "query": "protein interaction graph neural network"}, "ollama")
     assert long_summary in result
     assert "..." not in result
 
 
-def test_search_notes_returns_text_beyond_300_chars(store, monkeypatch):
+def test_search_kb_notes_returns_text_beyond_300_chars(store, monkeypatch):
     """
-    Same contract for _search_notes: full chunk text visible, no truncation.
+    Same contract for notes: full chunk text visible, no truncation.
 
     Input:  a note chunk >300 chars
     Expected output: full text present, no "..." elision
@@ -87,12 +82,12 @@ def test_search_notes_returns_text_beyond_300_chars(store, monkeypatch):
               source="local", extra_metadata={"file_path": "wombats.md", "title": "Wombat census"},
               store=store)
 
-    result, _ = _search_notes({"query": "wombat burrow census transect"}, "ollama")
+    result, _ = _search_kb({"kinds": ["notes"], "query": "wombat burrow census transect"}, "ollama")
     assert long_note in result
     assert "..." not in result
 
 
-def test_search_notes_includes_section_breadcrumb_when_present(store, monkeypatch):
+def test_search_kb_notes_includes_section_breadcrumb_when_present(store, monkeypatch):
     """
     A hit under a markdown heading carries a "Section:" line naming the
     heading breadcrumb, giving the model context beyond raw chunk text.
@@ -105,7 +100,7 @@ def test_search_notes_includes_section_breadcrumb_when_present(store, monkeypatc
               doc_type="note", visibility="public", source="local",
               extra_metadata={"file_path": "survey.md", "title": "Survey"}, store=store)
 
-    result, _ = _search_notes({"query": "population estimate two hundred individuals"}, "ollama")
+    result, _ = _search_kb({"kinds": ["notes"], "query": "population estimate two hundred individuals"}, "ollama")
     assert "Section: Results" in result
 
 
@@ -210,6 +205,153 @@ def test_dispatch_get_document_wraps_output_and_flags_private_session(store, mon
     assert session.private is True
 
 
+# ── Draft tools: the model's entire write surface ─────────────────────────────
+
+@pytest.fixture
+def drafts(tmp_path, monkeypatch):
+    """An isolated drafts sandbox for the chat-tool layer."""
+    from jarvis.core.config import Config
+    from jarvis.drafts import workspace
+
+    cfg = Config(drafts_dir=tmp_path / "drafts", vault_path=tmp_path / "vault")
+    monkeypatch.setattr("jarvis.drafts.workspace.get_config", lambda: cfg)
+    workspace._proposals.clear()
+    return cfg
+
+
+def test_create_draft_tool_writes_into_the_sandbox_only(drafts, tmp_path):
+    """
+    The agent CAN write — that is the point of drafts — but only here. Nothing
+    lands in the vault.
+    """
+    from jarvis.chat.chat import _create_draft
+    from jarvis.drafts import list_drafts
+
+    result = _create_draft({"title": "My CV", "filename": "cv.md", "content": "# CV\n"})
+
+    assert "Created draft" in result
+    drafts_on_disk = list_drafts()
+    assert [d["title"] for d in drafts_on_disk] == ["My CV"]
+    # The vault was never created, let alone written to.
+    assert not (tmp_path / "vault").exists()
+
+
+def test_create_draft_inherits_a_private_session(drafts):
+    """A draft built while private content is in play is private itself."""
+    from types import SimpleNamespace
+
+    from jarvis.chat.chat import _create_draft
+    from jarvis.drafts import list_drafts
+
+    session = SimpleNamespace(id="s1", private=True)
+    _create_draft({"title": "Notes", "filename": "n.md", "content": "x\n"}, session)
+
+    assert list_drafts()[0]["visibility"] == "private"
+
+
+def test_read_draft_hard_stops_a_private_draft_under_a_cloud_provider(drafts):
+    from jarvis.chat.chat import _read_draft
+    from jarvis.core.errors import PrivacyError
+    from jarvis.drafts import create_draft
+
+    draft = create_draft("Private", "p.md", "sensitive\n", visibility="private")
+
+    text, saw_private = _read_draft({"draft_id": draft["id"]}, "ollama")
+    assert "sensitive" in text and saw_private is True
+
+    with pytest.raises(PrivacyError):
+        _read_draft({"draft_id": draft["id"]}, "anthropic")
+
+
+def test_propose_draft_edit_writes_nothing_and_defers(drafts):
+    """
+    Same shape as remove_document: the tool builds the change and hands it to a
+    human. A review channel that defers (the webapp) gets a "wait" message, and
+    the model is told not to claim the edit happened.
+    """
+    from jarvis.chat.chat import _propose_draft_edit
+    from jarvis.drafts import create_draft, read_draft
+
+    draft = create_draft("Doc", "doc.md", "one\ntwo\n")
+
+    result = _propose_draft_edit(
+        {"draft_id": draft["id"], "file": "doc.md", "new_text": "one\nTWO\n",
+         "rationale": "capitalise"},
+        request_edit_review=lambda proposal: None,
+    )
+
+    assert read_draft(draft["id"])["text"] == "one\ntwo\n"  # untouched
+    assert "Proposal only" in result
+    assert "do not say the file" in result.lower()
+
+
+def test_propose_draft_edit_reports_what_the_human_accepted(drafts):
+    """Only the review channel's answer writes anything."""
+    from jarvis.chat.chat import _propose_draft_edit
+    from jarvis.drafts import apply_hunks, create_draft, read_draft
+
+    draft = create_draft("Doc", "doc.md", "one\ntwo\n")
+
+    def accept_everything(proposal):
+        apply_hunks(proposal["token"])
+        return "The user accepted every change."
+
+    result = _propose_draft_edit(
+        {"draft_id": draft["id"], "file": "doc.md", "new_text": "one\nTWO\n"},
+        request_edit_review=accept_everything,
+    )
+
+    assert result == "The user accepted every change."
+    assert read_draft(draft["id"])["text"] == "one\nTWO\n"
+
+
+def test_an_identical_rewrite_produces_no_proposal(drafts):
+    from jarvis.chat.chat import _propose_draft_edit
+    from jarvis.drafts import create_draft
+
+    draft = create_draft("Doc", "doc.md", "same\n")
+    result = _propose_draft_edit(
+        {"draft_id": draft["id"], "file": "doc.md", "new_text": "same\n"},
+        request_edit_review=lambda p: pytest.fail("nothing should be reviewed"),
+    )
+    assert "identical" in result
+
+
+def test_draft_tools_refuse_paths_outside_the_sandbox(drafts):
+    """The containment policy reaches the tool layer, as an error not a crash."""
+    from jarvis.chat.chat import _create_draft
+
+    result = _create_draft({"title": "Escape", "filename": "../escape.md", "content": "x"})
+    assert result.startswith("[create_draft error:")
+
+
+def test_no_chat_tool_can_write_outside_the_drafts_root(drafts, tmp_path, monkeypatch):
+    """
+    The W1 guarantee, enforced the way the no-file-deletion one is: spy on the
+    write primitives and assert every path a tool dispatch writes to lands
+    inside the drafts sandbox.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    from jarvis.chat.chat import _create_draft
+
+    written: list[_Path] = []
+    real_replace = _os.replace
+
+    def spy_replace(src, dst, *args, **kwargs):
+        written.append(_Path(dst).resolve())
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "replace", spy_replace)
+
+    _create_draft({"title": "Doc", "filename": "doc.md", "content": "text\n"})
+
+    assert written
+    root = (tmp_path / "drafts").resolve()
+    for path in written:
+        assert root in path.parents, f"{path} is outside the drafts sandbox"
+
 # ── Staged ingest: a stopped add leaves nothing behind ─────────────────────────
 
 
@@ -293,93 +435,6 @@ def test_add_document_commits_body_and_annotations_together(store, tmp_path, mon
     )
     assert indexed["ids"], "the paper should be indexed"
     assert any("canned summary" in text.lower() for text in indexed["documents"])
-
-
-# ── Terminal loop: Ctrl-C mid-turn ─────────────────────────────────────────────
-
-
-def _drive_run_session(monkeypatch, session, agentic_turn):
-    """
-    Run one turn of the terminal loop with everything external stubbed: the
-    provider's agentic_turn is supplied by the caller, input() answers once,
-    and saves are recorded rather than written.
-    """
-    import jarvis.chat.chat as chat_module
-
-    class _Provider:
-        def __init__(self):
-            self.agentic_turn = agentic_turn
-
-        def complete(self, messages, max_tokens=2048, context_length=None, cancel=None):
-            return "unused"
-
-    saves = []
-    answers = iter(["a question"])
-
-    def one_question_then_eof(prompt=""):
-        # The second prompt raises EOFError — the Ctrl-D path — so a completed
-        # turn ends the loop instead of blocking on stdin.
-        try:
-            return next(answers)
-        except StopIteration:
-            raise EOFError
-
-    monkeypatch.setattr(chat_module, "make_provider", lambda spec: _Provider())
-    monkeypatch.setattr("builtins.input", one_question_then_eof)
-    monkeypatch.setattr("jarvis.chat.sessions.save_session", lambda s, store=None: saves.append(store))
-    monkeypatch.setattr("jarvis.chat.sessions.maybe_compact", lambda *a, **k: False)
-    monkeypatch.setattr("jarvis.chat.sessions.needs_compaction", lambda *a, **k: False)
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: "the-store")
-    chat_module.run_session(Path("/tmp"), kb_only=True, session=session)
-    return saves
-
-
-def test_cli_ctrl_c_mid_turn_drops_the_turn_and_exits(monkeypatch, capsys):
-    """
-    Ctrl-C while the agent is working means quit — but the abandoned turn must
-    not be left in the saved session, and the exit must be a clean 130 rather
-    than a traceback escaping main(). Earlier completed turns survive.
-    """
-    session = new_session("ollama")
-    session.turn_starts.append(0)
-    session.messages.append({"role": "user", "content": "earlier question"})
-    session.messages.append({"role": "assistant", "content": "earlier answer"})
-    session.display.append({"role": "user", "content": "earlier question"})
-    session.display.append({"role": "assistant", "content": "earlier answer"})
-
-    def interrupted_turn(messages, tools, dispatch_fn, system, cancel=None):
-        raise KeyboardInterrupt
-
-    with pytest.raises(SystemExit) as exit_info:
-        _drive_run_session(monkeypatch, session, interrupted_turn)
-    assert exit_info.value.code == 130
-
-    # The stopped turn left no trace; the earlier exchange is intact.
-    assert [t["content"] for t in session.display] == ["earlier question", "earlier answer"]
-    assert [m["content"] for m in session.messages] == ["earlier question", "earlier answer"]
-    assert session.turn_starts == [0]
-    assert "Stopped" in capsys.readouterr().out
-
-
-def test_cli_completed_turn_commits_the_message_copy(monkeypatch, capsys):
-    """
-    The happy path still works with the working-copy commit: whatever the
-    provider appended to the copy lands in the session once a reply arrives.
-    """
-    session = new_session("ollama")
-
-    def working_turn(messages, tools, dispatch_fn, system, cancel=None):
-        messages.append({"role": "assistant", "content": "the answer"})
-        return "the answer"
-
-    saves = _drive_run_session(monkeypatch, session, working_turn)
-
-    assert [t["content"] for t in session.display] == ["a question", "the answer"]
-    assert [m["content"] for m in session.messages] == ["a question", "the answer"]
-    # One save per completed turn, and it indexes. (The extra store-free save
-    # before the LLM call is a webapp-only thing — there it protects the
-    # question from a session switch mid-turn, which the CLI cannot do.)
-    assert saves == ["the-store"]
 
 
 def test_add_document_arxiv_summary_mode_indexes_the_paper(store, monkeypatch):

@@ -16,7 +16,7 @@ Sections
 2. search                    — visibility filter correctness
 3. search_with_privacy_check — cloud vs local provider access control
 4. delete_by_metadata        — chunk removal
-5. list_papers               — deduplication and chunk count
+5. list_documents            — deduplication and chunk count
 6. update_file_path          — in-place metadata update
 7. refresh_vault             — incremental vault sync (add / update / delete)
 8. embedding-model guard
@@ -49,7 +49,8 @@ from jarvis.kb.store import (
     delete_by_metadata,
     find_pdf_notes,
     get_document_chunks,
-    list_papers,
+    index_vault_file,
+    list_documents,
     reclassify_notes_as_papers,
     refresh_vault,
     search,
@@ -326,15 +327,15 @@ def test_delete_by_metadata_removes_only_matching_chunks(store):
 
 # ── 5. Listing ─────────────────────────────────────────────────────────────────
 
-def test_list_papers_deduplicates_and_reports_chunk_count(store):
+def test_list_documents_deduplicates_and_reports_chunk_count(store):
     """
-    list_papers() returns one entry per unique source URL regardless of how many
+    list_documents() returns one entry per unique source URL regardless of how many
     chunks that document was split into. The entry includes a chunk_count field
     that matches the actual number of stored chunks.
 
     Input:  a long summary that the splitter divides into multiple chunks
     Expected output:
-        exactly one entry for that source in list_papers()
+        exactly one entry for that source in list_documents()
         entry["chunk_count"] == number of IDs returned by add_paper()
     """
     paper = _paper(99)
@@ -343,7 +344,7 @@ def test_list_papers_deduplicates_and_reports_chunk_count(store):
     ids = add_paper(paper, dense_summary=long_summary, store=store)
     assert len(ids) > 1, "summary should have produced multiple chunks"
 
-    papers = list_papers(store=store)
+    papers = list_documents(store=store)
     matches = [p for p in papers if p["source"] == paper["link"]]
     assert len(matches) == 1
     assert matches[0]["chunk_count"] == len(ids)
@@ -1247,3 +1248,327 @@ def test_reclassify_notes_as_papers_flips_doc_type_only(store, tmp_path):
 def test_reclassify_notes_as_papers_empty_sources_is_a_noop(store):
     """An empty source list is a no-op, not an error."""
     assert reclassify_notes_as_papers([], store) == 0
+
+
+# ── Records: frontmatter indexing, filtered search, schema migration ───────────
+
+def _write_record(vault, rel_path, frontmatter, body):
+    path = vault / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\n{frontmatter}\n---\n\n{body}\n", encoding="utf-8")
+    return path
+
+
+def test_vault_note_frontmatter_becomes_filterable_metadata(store, tmp_path):
+    """
+    A record's frontmatter lands on every chunk as flat metadata, and the
+    frontmatter block itself is stripped from the indexed text.
+    """
+    vault = tmp_path / "vault"
+    path = _write_record(
+        vault, "records/acme.md",
+        "type: job_application\nentity: Acme Bio\nstatus: rejected\n"
+        "date: 2026-05-02\ntags: [remote, senior]\nvenue: NeurIPS",
+        "# Senior Bioinformatician\n\nRejected after the technical screen.",
+    )
+
+    index_vault_file(path, vault, store)
+
+    metadatas = store._collection.get(include=["metadatas"])["metadatas"]
+    assert metadatas
+    for meta in metadatas:
+        assert meta["category"] == "job_application"
+        assert meta["entity"] == "Acme Bio"
+        assert meta["status"] == "rejected"
+        assert meta["event_date"] == "2026-05-02"
+        assert meta["tags"] == "|remote|senior|"
+        assert meta["x_venue"] == "NeurIPS"
+        # Still a plain note as far as every existing privacy/delete path is
+        # concerned — records ride on doc_type, they don't replace it.
+        assert meta["doc_type"] == "note"
+        assert meta["visibility"] == "public"
+
+    documents = store._collection.get(include=["documents"])["documents"]
+    assert not any("type: job_application" in d for d in documents)
+
+
+def test_search_filters_narrow_by_record_fields(store, tmp_path):
+    """
+    category/status/entity filters select records; they fold into the same
+    where-clause as the privacy filter, so they can only ever narrow.
+    """
+    vault = tmp_path / "vault"
+    index_vault_file(
+        _write_record(vault, "a.md", "type: job_application\nentity: Acme Bio\nstatus: rejected",
+                      "# Acme\n\nBioinformatics role, technical screen."),
+        vault, store)
+    index_vault_file(
+        _write_record(vault, "b.md", "type: job_application\nentity: Beta Labs\nstatus: applied",
+                      "# Beta\n\nBioinformatics role, waiting to hear back."),
+        vault, store)
+    index_vault_file(
+        _write_record(vault, "c.md", "type: manuscript\nstatus: drafting",
+                      "# Paper\n\nBioinformatics methods manuscript."),
+        vault, store)
+
+    rejected = search("bioinformatics role", n_results=10, category="job_application",
+                      status="rejected", store=store)
+    assert {d.metadata["entity"] for d in rejected} == {"Acme Bio"}
+
+    applications = search("bioinformatics", n_results=10, category="job_application", store=store)
+    assert {d.metadata["entity"] for d in applications} == {"Acme Bio", "Beta Labs"}
+
+    manuscripts = search("bioinformatics", n_results=10, category="manuscript", store=store)
+    assert all(d.metadata["category"] == "manuscript" for d in manuscripts)
+
+
+def test_search_filters_on_a_custom_frontmatter_field(store, tmp_path):
+    """A key jarvis has never heard of is filterable without any code change."""
+    vault = tmp_path / "vault"
+    index_vault_file(
+        _write_record(vault, "a.md", "type: manuscript\nvenue: NeurIPS", "# A\n\nDraft about retrieval."),
+        vault, store)
+    index_vault_file(
+        _write_record(vault, "b.md", "type: manuscript\nvenue: ICML", "# B\n\nDraft about retrieval."),
+        vault, store)
+
+    results = search("retrieval draft", n_results=10, fields={"x_venue": "NeurIPS"}, store=store)
+    assert results
+    assert all(d.metadata["x_venue"] == "NeurIPS" for d in results)
+
+
+def test_tag_filter_requires_every_tag(store, tmp_path):
+    vault = tmp_path / "vault"
+    index_vault_file(
+        _write_record(vault, "a.md", "type: job_application\ntags: [remote, senior]",
+                      "# A\n\nA role with flexible hours."),
+        vault, store)
+    index_vault_file(
+        _write_record(vault, "b.md", "type: job_application\ntags: [remote]",
+                      "# B\n\nA role with flexible hours."),
+        vault, store)
+
+    both = search("flexible role", n_results=10, tags=["remote", "senior"], store=store)
+    assert {d.metadata["file_path"] for d in both} == {"a.md"}
+
+    either = search("flexible role", n_results=10, tags=["remote"], store=store)
+    assert {d.metadata["file_path"] for d in either} == {"a.md", "b.md"}
+
+
+def test_record_header_is_embedded_so_status_queries_match(store, tmp_path):
+    """
+    The record header rides in every chunk's embedded text, so a query phrased
+    in terms of the record's identity finds it even though the body never uses
+    those words. This is the reuse of the papers' embed_header mechanism.
+    """
+    vault = tmp_path / "vault"
+    index_vault_file(
+        _write_record(vault, "acme.md", "type: job_application\nentity: Acme Bio\nstatus: rejected",
+                      "# Senior Bioinformatician\n\nThey wanted more Rust experience."),
+        vault, store)
+
+    results = search("rejected job application", n_results=5, store=store)
+    assert any(d.metadata.get("entity") == "Acme Bio" for d in results)
+
+
+def test_refresh_vault_backfills_notes_indexed_under_an_older_schema(store, tmp_path):
+    """
+    A note whose meta_schema is behind is treated as changed, so the backfill
+    happens on the next daemon sweep with no user action and no migration
+    script — even though its content hash is unchanged.
+    """
+    from jarvis.kb.frontmatter import META_SCHEMA
+
+    vault = tmp_path / "vault"
+    path = _write_record(vault, "a.md", "type: job_application\nstatus: rejected", "# A\n\nBody.")
+    index_vault_file(path, vault, store)
+
+    # Stamp an older schema version on the stored chunks, standing in for a
+    # note indexed before record metadata existed. (Chroma's update merges
+    # metadata keys rather than replacing the dict, so the version marker is
+    # what the migration actually keys on — which is the point of having one.)
+    stored = store._collection.get(include=["metadatas"])
+    store._collection.update(
+        ids=stored["ids"],
+        metadatas=[{**meta, "meta_schema": 0} for meta in stored["metadatas"]],
+    )
+
+    added, updated, deleted = refresh_vault(vault, store)
+
+    assert (added, updated, deleted) == (0, 1, 0)
+    for meta in store._collection.get(include=["metadatas"])["metadatas"]:
+        assert meta["category"] == "job_application"
+        assert meta["meta_schema"] == META_SCHEMA
+
+
+def test_schema_migration_does_not_re_embed_a_note_without_frontmatter(store, tmp_path):
+    """
+    The common case: a plain note gains nothing from a re-index except the
+    schema marker, so it must be stamped in place. Re-embedding an entire
+    vault to record that most of it had nothing to record is pure cost — and
+    a delete-then-re-add leaves a window where the note is missing.
+
+    Proven by watching the chunk ids: a metadata-only update keeps them, a
+    delete-and-re-add cannot.
+    """
+    vault = tmp_path / "vault"
+    plain = vault / "plain.md"
+    plain.parent.mkdir(parents=True, exist_ok=True)
+    plain.write_text("# Plain\n\nNo frontmatter here.\n", encoding="utf-8")
+    index_vault_file(plain, vault, store)
+
+    before = store._collection.get(include=[])["ids"]
+    stored = store._collection.get(include=["metadatas"])
+    store._collection.update(
+        ids=stored["ids"],
+        metadatas=[{**m, "meta_schema": 0} for m in stored["metadatas"]],
+    )
+
+    assert refresh_vault(vault, store) == (0, 1, 0)
+
+    after = store._collection.get(include=["metadatas"])
+    assert sorted(after["ids"]) == sorted(before), "chunks were re-created, not stamped"
+    assert all(m["meta_schema"] == 1 for m in after["metadatas"])
+
+
+def test_schema_migration_re_indexes_a_note_that_has_frontmatter(store, tmp_path):
+    """
+    A note WITH frontmatter genuinely changes on re-index — the block is now
+    stripped from the indexed body and the record header joins the embedded
+    text — so this one has to be rebuilt rather than stamped.
+    """
+    vault = tmp_path / "vault"
+    path = _write_record(vault, "a.md", "type: manuscript\nstatus: drafting", "# A\n\nBody.")
+    index_vault_file(path, vault, store)
+
+    stored = store._collection.get(include=["metadatas"])
+    store._collection.update(
+        ids=stored["ids"],
+        metadatas=[
+            {**{k: v for k, v in m.items()}, "meta_schema": 0, "category": "stale"}
+            for m in stored["metadatas"]
+        ],
+    )
+
+    assert refresh_vault(vault, store) == (0, 1, 0)
+
+    for meta in store._collection.get(include=["metadatas"])["metadatas"]:
+        assert meta["category"] == "manuscript"   # re-read from the file
+        assert meta["meta_schema"] == 1
+    for document in store._collection.get(include=["documents"])["documents"]:
+        assert "type: manuscript" not in document   # block stripped from the body
+
+
+def test_refresh_vault_leaves_current_schema_notes_alone(store, tmp_path):
+    """
+    Every note carries meta_schema, frontmatter or not — otherwise a plain note
+    would look perpetually out of date and re-index on every single sweep.
+    """
+    vault = tmp_path / "vault"
+    plain = vault / "plain.md"
+    plain.parent.mkdir(parents=True, exist_ok=True)
+    plain.write_text("# Plain\n\nNo frontmatter here.\n", encoding="utf-8")
+    refresh_vault(vault, store)
+
+    assert refresh_vault(vault, store) == (0, 0, 0)
+
+
+def test_metadata_key_and_value_counts_expose_the_user_ontology(store, tmp_path):
+    """
+    `kb schema` exists so a typo in a status ("stauts") shows up as its own key
+    rather than silently never matching a filter.
+    """
+    from jarvis.kb.store import metadata_key_counts, metadata_value_counts
+
+    vault = tmp_path / "vault"
+    index_vault_file(
+        _write_record(vault, "a.md", "type: job_application\nstatus: rejected", "# A\n\nBody."),
+        vault, store)
+    index_vault_file(
+        _write_record(vault, "b.md", "type: job_application\nstauts: applied", "# B\n\nBody."),
+        vault, store)
+
+    keys = metadata_key_counts(store)
+    assert keys["category"] >= 2
+    assert "x_stauts" in keys  # the typo is visible, not silently ignored
+
+    statuses = metadata_value_counts("status", store)
+    assert set(statuses) == {"rejected"}
+
+
+# ── A stale view is not corruption ─────────────────────────────────────────────
+
+def test_search_reopens_and_retries_once_on_a_stale_view(monkeypatch, store):
+    """
+    The case that misdiagnosed itself in practice: a long-running reader (the
+    webapp) holds an open view of the index while the sync daemon writes to it
+    on a schedule. After a write the reader's view names ids that no longer
+    exist and the search fails — but nothing is damaged. Reopening and trying
+    once fixes it, so the user should never see a "corrupted, run reindex"
+    message for what a reopen resolves.
+    """
+    from jarvis.kb import store as store_module
+
+    add_texts(content="A document about wombat burrows.", doc_type="note",
+              visibility="public", source="stale-view", store=store)
+
+    calls = {"n": 0}
+    real_hybrid = store_module._hybrid_search
+
+    def flaky_hybrid(query, fetch_k, filter_dict, active_store):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Error executing plan: Internal error: Error finding id")
+        return real_hybrid(query, fetch_k, filter_dict, active_store)
+
+    monkeypatch.setattr(store_module, "_hybrid_search", flaky_hybrid)
+    monkeypatch.setattr(store_module, "get_store", lambda: store)
+
+    # store= is omitted deliberately: the retry path only applies to the
+    # singleton, which is what a long-running process actually uses.
+    results = store_module.search("wombat burrows", n_results=3)
+
+    assert calls["n"] == 2, "the search should have been retried against a reopened handle"
+    assert results, "the retry should have returned the document"
+
+
+def test_a_persistent_stale_id_is_still_reported_as_corruption(monkeypatch, store):
+    """
+    The retry must not hide a real problem: when reopening does not help, the
+    second failure is diagnosed as corruption with the rebuild command.
+    """
+    from jarvis.kb import store as store_module
+
+    def always_broken(query, fetch_k, filter_dict, active_store):
+        raise RuntimeError("Error executing plan: Internal error: Error finding id")
+
+    monkeypatch.setattr(store_module, "_hybrid_search", always_broken)
+    monkeypatch.setattr(store_module, "get_store", lambda: store)
+
+    with pytest.raises(KBCorruptionError) as caught:
+        store_module.search("anything", n_results=3)
+
+    message = str(caught.value)
+    assert "retried once" in message
+    assert "kb reindex" in message
+
+
+def test_an_explicit_store_argument_is_never_retried(monkeypatch, store):
+    """
+    A caller passing store= owns that handle — tests and one-shot scripts —
+    so silently swapping it for the singleton would be wrong.
+    """
+    from jarvis.kb import store as store_module
+
+    calls = {"n": 0}
+
+    def always_broken(query, fetch_k, filter_dict, active_store):
+        calls["n"] += 1
+        raise RuntimeError("Error executing plan: Internal error: Error finding id")
+
+    monkeypatch.setattr(store_module, "_hybrid_search", always_broken)
+
+    with pytest.raises(KBCorruptionError):
+        store_module.search("anything", n_results=3, store=store)
+
+    assert calls["n"] == 1

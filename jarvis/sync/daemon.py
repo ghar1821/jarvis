@@ -2,17 +2,19 @@
 jarvis-sync — supervised background daemon.
 
 Run directly in a terminal with `uv run jarvis-sync` — it stays in the
-foreground and owns four APScheduler jobs (everything is scheduled; there is
-no filesystem-event watcher and no worker thread):
+foreground and owns up to five APScheduler jobs (everything is scheduled;
+there is no filesystem-event watcher and no worker thread):
 
-  1. Weekly arXiv digest (cron trigger). Runs missed while asleep fire on
-     wake via misfire handling.
-  2. Digest catch-up (every 6 hours, and once at startup). Re-checks the
-     persistent last-success stamp against the cron schedule and runs the
-     digest if a slot was missed while the machine was powered off — so a
-     missed Monday no longer waits until the next Monday or a restart. A
-     non-blocking lock keeps the cron job and the catch-up job from ever
-     running the digest twice at once.
+  1. Weekly arXiv digest (cron trigger), only when [digest] enabled is true —
+     it is off by default. Runs missed while asleep fire on wake via misfire
+     handling.
+  2. Digest catch-up (every 6 hours, and once at startup), registered with
+     the digest job and skipped alongside it. Re-checks the persistent
+     last-success stamp against the cron schedule and runs the digest if a
+     slot was missed while the machine was powered off — so a missed Monday
+     no longer waits until the next Monday or a restart. A non-blocking lock
+     keeps the cron job and the catch-up job from ever running the digest
+     twice at once.
   3. Periodic PDF inbox scan (every pdf_watch_minutes). New/changed PDFs in
      cfg.pdf_watch_dir are indexed full-text as public papers, with
      annotations; byte-hash dedup makes the scan idempotent, so saving a
@@ -21,6 +23,10 @@ no filesystem-event watcher and no worker thread):
      deletes its KB entry.
   4. Periodic Obsidian vault refresh — the existing hash-based incremental
      sync in refresh_vault(), on an interval.
+  5. Daily draft retention sweep — removes drafts in the agent-writable
+     sandbox that nothing has touched for [drafts] retention_days. This is the
+     only scheduled job that deletes anything; kept drafts are exempt and
+     retention_days = 0 switches it off.
 
 Every job body catches its own exceptions and records the outcome in
 ~/.jarvis/state/sync_status.json (read by `kb sync-status`); one failing job
@@ -48,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.core.config import Config, get_config, warn_if_config_readable
-from jarvis.core.llm import active_model
+from jarvis.core.llm import active_model, is_cloud_provider
 
 STATE_DIR = Path.home() / ".jarvis" / "state"
 STATUS_FILE = STATE_DIR / "sync_status.json"
@@ -109,10 +115,14 @@ def _validate_sync_config(cfg: Config) -> list[str]:
             f"pdf_watch_dir does not exist: {cfg.pdf_watch_dir} "
             "(create it, or remove the key to disable the watcher)"
         )
-    if cfg.digest_day not in VALID_DIGEST_DAYS:
-        problems.append(f"digest_day must be one of {sorted(VALID_DIGEST_DAYS)}, got {cfg.digest_day!r}")
-    if not 0 <= cfg.digest_hour <= 23:
-        problems.append(f"digest_hour must be 0-23, got {cfg.digest_hour}")
+    # Only fatal when the digest actually runs — a stale digest_day left in the
+    # config of someone who has switched the feature off shouldn't stop the
+    # daemon from doing its other work.
+    if cfg.digest_enabled:
+        if cfg.digest_day not in VALID_DIGEST_DAYS:
+            problems.append(f"digest_day must be one of {sorted(VALID_DIGEST_DAYS)}, got {cfg.digest_day!r}")
+        if not 0 <= cfg.digest_hour <= 23:
+            problems.append(f"digest_hour must be 0-23, got {cfg.digest_hour}")
     if cfg.vault_refresh_minutes < 1:
         problems.append(f"vault_refresh_minutes must be >= 1, got {cfg.vault_refresh_minutes}")
     if cfg.pdf_watch_minutes < 1:
@@ -149,8 +159,8 @@ def _require_local_llm(cfg: Config) -> None:
     except requests.RequestException as exc:
         raise FetchError(
             f"Ollama is not reachable at {health_url}: {exc}. "
-            "Start it (the login-item app or `ollama serve`) or set "
-            "provider = \"anthropic\"."
+            "Start it (the login-item app or `ollama serve`) or switch to a "
+            "cloud provider in [chat]."
         ) from exc
 
 
@@ -168,12 +178,19 @@ def run_digest_job(status_file: Path = STATUS_FILE) -> bool:
         log.info("digest: starting")
         try:
             cfg = get_config()
-            if cfg.provider != "anthropic":
+            # Only the local provider needs a health probe; a cloud one fails
+            # on its own request with its own error. (Before OpenRouter this
+            # read `!= "anthropic"`, which would now probe Ollama pointlessly
+            # for an OpenRouter digest and fail the job before it started.)
+            if not is_cloud_provider(cfg.provider):
                 _require_local_llm(cfg)
             log.info("digest: using %s (model %s)", cfg.provider, active_model(cfg))
             from jarvis.digest.pipeline.run import main as run_digest
 
-            run_digest()
+            # Empty argv, not None: main() parses sys.argv when given None,
+            # which here would be the daemon's own command line. The job is
+            # only registered when the digest is enabled, so no --force.
+            run_digest([])
             record_job_status("digest", ok=True, status_file=status_file)
             log.info("digest: done")
             return True
@@ -434,14 +451,47 @@ def run_pdf_scan_job(
             )
 
 
+# ── Draft retention job ────────────────────────────────────────────────────────
+
+
+def run_draft_gc_job(status_file: Path = STATUS_FILE) -> int:
+    """
+    Remove drafts nothing has touched for `[drafts] retention_days`.
+
+    This is the only scheduled job in jarvis that deletes anything, and its
+    scope is fixed by prune_drafts(): drafts-root only, age-based, no path
+    argument to aim. Kept drafts are exempt and retention_days = 0 disables it
+    entirely. Every removal is logged with its age so a disappearance is never
+    a mystery.
+    """
+    try:
+        from jarvis.drafts import prune_drafts
+
+        removed = prune_drafts()
+        for draft in removed:
+            log.info(
+                "draft_gc: removed %s (%r), untouched for %.1f days",
+                draft["id"], draft.get("title", ""), draft.get("age_days", 0),
+            )
+        if not removed:
+            log.info("draft_gc: nothing to remove")
+        record_job_status("draft_gc", ok=True, status_file=status_file)
+        return len(removed)
+    except Exception as exc:
+        log.exception("draft retention sweep failed")
+        record_job_status("draft_gc", ok=False, error=str(exc), status_file=status_file)
+        return 0
+
+
 # ── Scheduler ────────────────────────────────────────────────────────────────
 
 
 def _build_scheduler(cfg: Config):
     """
-    Build the blocking scheduler with all four jobs: digest (weekly cron),
-    digest catch-up (6-hourly overdue re-check), vault refresh (interval),
-    and — only when a watch dir is configured — the PDF inbox scan (interval).
+    Build the blocking scheduler with whichever jobs are switched on: vault
+    refresh (interval) always, the PDF inbox scan (interval) only when a watch
+    dir is configured, and the two digest jobs — the weekly cron run and its
+    6-hourly overdue re-check — only when [digest] enabled is true.
 
     No timezone argument is passed on purpose. APScheduler resolves the real
     system zone through its tzlocal dependency when none is given. The earlier
@@ -456,28 +506,29 @@ def _build_scheduler(cfg: Config):
     from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = BlockingScheduler()
-    digest_trigger = CronTrigger(day_of_week=cfg.digest_day, hour=cfg.digest_hour)
-    scheduler.add_job(
-        run_digest_job,
-        digest_trigger,
-        id="digest",
-        coalesce=True,
-        misfire_grace_time=3600,
-        max_instances=1,
-    )
-    # Overdue re-check every 6 hours, so a digest slot missed while powered
-    # off fires within hours of the machine coming back — not at the next
-    # weekly slot or the next daemon restart. The digest lock keeps this job
-    # and the cron job from overlapping (separate ids, so max_instances=1
-    # alone would not).
-    scheduler.add_job(
-        run_digest_catchup_job,
-        IntervalTrigger(hours=6),
-        args=[digest_trigger],
-        id="digest_catchup",
-        coalesce=True,
-        max_instances=1,
-    )
+    if cfg.digest_enabled:
+        digest_trigger = CronTrigger(day_of_week=cfg.digest_day, hour=cfg.digest_hour)
+        scheduler.add_job(
+            run_digest_job,
+            digest_trigger,
+            id="digest",
+            coalesce=True,
+            misfire_grace_time=3600,
+            max_instances=1,
+        )
+        # Overdue re-check every 6 hours, so a digest slot missed while powered
+        # off fires within hours of the machine coming back — not at the next
+        # weekly slot or the next daemon restart. The digest lock keeps this job
+        # and the cron job from overlapping (separate ids, so max_instances=1
+        # alone would not).
+        scheduler.add_job(
+            run_digest_catchup_job,
+            IntervalTrigger(hours=6),
+            args=[digest_trigger],
+            id="digest_catchup",
+            coalesce=True,
+            max_instances=1,
+        )
     scheduler.add_job(
         run_vault_refresh_job,
         IntervalTrigger(minutes=cfg.vault_refresh_minutes),
@@ -490,6 +541,17 @@ def _build_scheduler(cfg: Config):
             run_pdf_scan_job,
             IntervalTrigger(minutes=cfg.pdf_watch_minutes),
             id="pdf_scan",
+            coalesce=True,
+            max_instances=1,
+        )
+    # The drafts sandbox is scratch space, so it is swept daily. Not registered
+    # at all when retention is disabled, so an empty schedule reads as the
+    # setting it is.
+    if cfg.drafts_retention_days > 0:
+        scheduler.add_job(
+            run_draft_gc_job,
+            CronTrigger(hour=cfg.drafts_gc_hour),
+            id="draft_gc",
             coalesce=True,
             max_instances=1,
         )
@@ -575,17 +637,23 @@ def main() -> None:
     from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
     scheduler = _build_scheduler(cfg)
-    digest_trigger = scheduler.get_job("digest").trigger
 
     _log_next_run_times(scheduler)
     scheduler.add_listener(
         lambda event: _log_job_outcome(scheduler, event), EVENT_JOB_EXECUTED | EVENT_JOB_ERROR
     )
 
-    # Catch-up at start: if the Mac was powered off across the scheduled
-    # slot, the cron trigger alone would silently wait a whole week. The same
-    # function also runs every 6 hours from the scheduler — one code path.
-    run_digest_catchup_job(digest_trigger)
+    digest_job = scheduler.get_job("digest")
+    if digest_job is None:
+        # Say so out loud: an empty digest schedule should read as a setting,
+        # not as something quietly broken.
+        log.info("digest: disabled ([digest] enabled = false)")
+    else:
+        # Catch-up at start: if the Mac was powered off across the scheduled
+        # slot, the cron trigger alone would silently wait a whole week. The
+        # same function also runs every 6 hours from the scheduler — one code
+        # path.
+        run_digest_catchup_job(digest_job.trigger)
 
     if cfg.pdf_watch_dir is not None:
         log.info(
@@ -601,13 +669,22 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    digest_schedule = (
+        f"digest {cfg.digest_day} {cfg.digest_hour:02d}:00"
+        if cfg.digest_enabled
+        else "digest off"
+    )
     log.info(
-        "scheduler starting (digest %s %02d:00, vault refresh every %d min)",
-        cfg.digest_day, cfg.digest_hour, cfg.vault_refresh_minutes,
+        "scheduler starting (%s, vault refresh every %d min)",
+        digest_schedule, cfg.vault_refresh_minutes,
     )
     # Run each periodic job once at startup rather than waiting a full interval.
     run_vault_refresh_job()
     run_pdf_scan_job()
+    if cfg.drafts_retention_days > 0:
+        run_draft_gc_job()
+    else:
+        log.info("draft_gc: disabled ([drafts] retention_days = 0)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "requests>=2.33.1",
     "anthropic>=0.46.0",
+    "openai>=1.60.0",
     "chromadb>=0.6.0",
     "sentence-transformers>=3.0.0",
     "langchain-chroma>=0.1.0",
@@ -18,6 +19,10 @@ dependencies = [
     "pymupdf4llm>=1.28.0",
     "pymupdf>=1.28.0",
     "tomlkit>=0.15.0",
+    "pyyaml>=6.0",
+    "markdown-it-py>=3.0",
+    "mdit-py-plugins>=0.4",
+    "latex2mathml>=3.77",
     "ollama>=0.6.2",
     "rank-bm25>=0.2.2",
 ]
@@ -33,7 +38,6 @@ include = ["jarvis*"]
 run-digest  = "jarvis.digest.pipeline.run:main"
 jarvis-sync = "jarvis.sync.daemon:main"
 convert-pdf = "jarvis.kb.convert:main"
-vault-chat  = "jarvis.chat.chat:main"
 kb          = "jarvis.kb.cli:main"
 webapp      = "jarvis.webapp.run:main"
 

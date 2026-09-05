@@ -7,17 +7,16 @@ turn to stop calls stop(), and the thread running the turn notices at its next
 check() and unwinds.
 
 The checks are placed so that two things are guaranteed once stop() returns:
-nothing further is ever SENT to the provider, and the session's message list is
-never mutated again. What makes the stop feel instant rather than merely
-eventual is that both providers stream their responses — check() runs between
-streamed events, and raising out of the streaming context manager closes the
-HTTP response, which is what tells the cloud or Ollama server to stop
-generating (neither has a cancel-this-request endpoint; disconnecting is the
-signal).
+nothing further is ever SENT to the provider, and the session's transcript is
+never touched — each adapter builds its turn in a local wire list and publishes
+it in one commit() at the return points, so raising in between leaves the
+transcript exactly as it was found. What makes the stop feel instant rather than merely
+eventual is that every provider streams its responses — check() runs between
+streamed events, and raising out of the stream closes the HTTP response, which
+is what tells the upstream server to stop generating (none of them has a
+cancel-this-request endpoint; disconnecting is the signal).
 
-Only the webapp needs this, because its turns run on a background thread. The
-terminal CLI runs the turn on the main thread, where Ctrl-C already delivers
-KeyboardInterrupt into the blocked call and unwinds the same way.
+Only the webapp needs this, because its turns run on a background thread.
 """
 
 import threading

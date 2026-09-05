@@ -12,53 +12,79 @@ import pytest
 
 from jarvis.core.config import Config
 from jarvis.core.errors import KBCorruptionError, RAGError
+import jarvis.kb.cli as cli
 from jarvis.kb.cli import _check_legacy_pdf_notes, _migrated_chunk_text, cmd_doctor, cmd_reindex
 
 
-def test_cmd_doctor_reports_healthy_store(store, monkeypatch, capsys):
-    """A store that opens, counts, and search-probes cleanly reports healthy."""
-    from jarvis.kb.store import add_texts
+# The probe now runs in a subprocess, because reading a damaged vector index
+# kills the process by signal rather than raising. `_run_doctor_probe` is
+# therefore the seam these tests patch: it stands in for "what the child
+# reported", and returning None stands in for "the child died".
 
-    add_texts(content="A healthy document.", doc_type="note",
-              visibility="public", source="doctor-ok", store=store)
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+
+def test_cmd_doctor_reports_healthy_store(monkeypatch, capsys):
+    """A store that opens, counts, and search-probes cleanly reports healthy."""
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None},
+    )
+    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: object())
 
     cmd_doctor()
 
     out = capsys.readouterr().out
     assert "Store opened" in out
-    assert "chunk(s) indexed" in out
+    assert "5 chunk(s) indexed" in out
     assert "Knowledge base is healthy." in out
 
 
-def test_cmd_doctor_exits_nonzero_on_corruption(monkeypatch, capsys):
-    """A corrupted index reports the diagnosis and exits non-zero, scriptably."""
-    class _StubStore:
-        pass
-
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: _StubStore())
-    monkeypatch.setattr("jarvis.kb.store.count", lambda store: 5)
-
-    def broken_search(*args, **kwargs):
-        raise KBCorruptionError("run `uv run kb reindex`")
-
-    monkeypatch.setattr("jarvis.kb.store.search", broken_search)
+def test_cmd_doctor_survives_an_index_that_kills_the_probe(monkeypatch, capsys):
+    """
+    The case that matters most: a damaged HNSW index terminates the child by
+    signal, so there is no exception to catch and nothing to report from
+    inside it. Doctor must survive, explain what happened, and name the
+    recovery command — rather than vanishing with no output, which is what it
+    used to do.
+    """
+    monkeypatch.setattr(cli, "_run_doctor_probe", lambda: None)
 
     with pytest.raises(SystemExit) as exc_info:
         cmd_doctor()
 
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
-    assert "corrupted" in err
+    assert "damaged beyond reading" in err
+    assert "kb reindex --from-storage" in err
+    # It must also say the documents are probably fine, or the message reads
+    # like total data loss when it is not.
+    assert "chroma.sqlite3" in err
+
+
+def test_cmd_doctor_exits_nonzero_on_corruption(monkeypatch, capsys):
+    """A corrupted index reports the diagnosis and exits non-zero, scriptably."""
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": True, "count": 5, "search_ok": False,
+                 "error": "run `uv run kb reindex`"},
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_doctor()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Search failed" in err
     assert "kb reindex" in err
 
 
 def test_cmd_doctor_exits_nonzero_when_store_fails_to_open(monkeypatch, capsys):
     """A RAGError opening the store (e.g. embed-model mismatch) also exits non-zero."""
-    def broken_get_store():
-        raise RAGError("Embedding model mismatch")
-
-    monkeypatch.setattr("jarvis.kb.store.get_store", broken_get_store)
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": False, "count": None, "search_ok": None,
+                 "error": "RAGError: Embedding model mismatch"},
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         cmd_doctor()
@@ -69,75 +95,16 @@ def test_cmd_doctor_exits_nonzero_when_store_fails_to_open(monkeypatch, capsys):
 
 def test_cmd_doctor_reports_empty_store_without_search_probe(monkeypatch, capsys):
     """An empty store is healthy by definition — no search probe is attempted."""
-    class _StubStore:
-        pass
-
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: _StubStore())
-    monkeypatch.setattr("jarvis.kb.store.count", lambda store: 0)
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("search() must not run against an empty store")
-
-    monkeypatch.setattr("jarvis.kb.store.search", fail_if_called)
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": True, "count": 0, "search_ok": None, "error": None},
+    )
 
     cmd_doctor()
 
     out = capsys.readouterr().out
-    assert "empty" in out.lower()
-
-
-# ── `kb reindex` embed-header migration ─────────────────────────────────────
-#
-# `kb reindex` re-embeds every stored chunk with the currently configured
-# embedding model. It must also backfill the title/authors embed-header onto
-# legacy paper chunks that predate it, so old papers become matchable by
-# author-name/acronym queries too — see _migrated_chunk_text.
-
-
-def test_migrated_chunk_text_prepends_header_to_headerless_paper_chunk():
-    """A header-less paper chunk gets 'title — authors' prepended."""
-    metadata = {"doc_type": "paper", "title": "Attention Is All You Need", "authors": "Vaswani et al."}
-    text = "The dominant sequence transduction models are based on..."
-
-    migrated = _migrated_chunk_text(text, metadata)
-
-    assert migrated.startswith("Attention Is All You Need — Vaswani et al.\n")
-    assert text in migrated
-
-
-def test_migrated_chunk_text_is_idempotent():
-    """Running the migration twice must not double-prepend the header."""
-    metadata = {"doc_type": "paper", "title": "Attention Is All You Need", "authors": "Vaswani et al."}
-    text = "The dominant sequence transduction models are based on..."
-
-    once = _migrated_chunk_text(text, metadata)
-    twice = _migrated_chunk_text(once, metadata)
-
-    assert once == twice
-
-
-def test_migrated_chunk_text_leaves_annotation_and_note_chunks_untouched():
-    """Annotation chunks and note chunks are never given a header."""
-    annotation_text = "Figure 2: architecture diagram."
-    annotation_meta = {
-        "doc_type": "paper", "annotation_kind": "figure",
-        "title": "Attention Is All You Need", "authors": "Vaswani et al.",
-    }
-    assert _migrated_chunk_text(annotation_text, annotation_meta) == annotation_text
-
-    note_text = "Meeting notes from Tuesday."
-    note_meta = {"doc_type": "note", "title": "Meeting notes from Tuesday.", "authors": ""}
-    assert _migrated_chunk_text(note_text, note_meta) == note_text
-
-
-def test_migrated_chunk_text_no_authors_uses_title_only_header():
-    """No authors on record — header is just the title, no trailing dash."""
-    metadata = {"doc_type": "paper", "title": "Untitled Draft", "authors": ""}
-    text = "Some legacy chunk text."
-
-    migrated = _migrated_chunk_text(text, metadata)
-
-    assert migrated == "Untitled Draft\nSome legacy chunk text."
+    assert "0 chunk(s) indexed" in out
+    assert "empty" in out
 
 
 def test_cmd_reindex_backfills_embed_header_end_to_end(tmp_path, monkeypatch, embeddings):

@@ -1,192 +1,146 @@
-# Changelog
+# Jarvis
 
-## PR #3 — Forceful stop
+### NEW FUNCTIONALITY
 
-A reply can now be stopped while it is being generated, and a stop leaves
-nothing behind — not in the session, and not in the knowledge base.
+- Added the ability to stop a reply while it is being generated (PR #3).
 
-**Stopping a reply**
+- `Ctrl-C` on `uv run webapp` now cancels every live turn on the way out
+  (PR #3).
 
-- Web UI: the Send button becomes a red **Stop** while a reply is in flight.
-  Clicking it returns control immediately.
-- Terminal: `Ctrl-C` during a turn cancels the request and exits, instead of
-  dumping a traceback out of `main()`.
-- Either way the upstream connection is closed, so Ollama or Anthropic actually
-  stops generating rather than being left to finish an answer nobody will read.
-  Measured against both live services, the worker dies within 0.1 s of the stop.
-- A stopped turn leaves **no trace**: the question returns to the input box,
-  nothing is written to the session history, and nothing is indexed as a chat
-  exchange. The next message can be sent straight away.
-- New `POST /chat/stop` endpoint. It cancels the turn and abandons it in the
-  same breath — ending the SSE stream and rolling the turn back itself rather
-  than waiting for the worker thread, because how long the worker takes to
-  notice is not under our control. (Testing against a real cold Ollama model
-  found this: the cancel check runs *between* streamed events, so a request
-  still waiting on its **first** event can sit there for 20+ seconds, which
-  under the earlier wait-for-the-worker design left the session busy and made
-  the next message 409 — exactly what the stop exists to prevent.)
-- `Ctrl-C` on `uv run webapp` now cancels every live turn on the way out.
+- Added an indicator for compaction, which used to happen invisibly (PR #3).
 
-**Both providers now stream**
+- Update Jarvis into a general assistant and introduced OpenRouter (PR #1):
+  - Added support to use OpenRouter instead of just Anthropic or Ollama.
+    Model can be switched mid conversation and a real time cost is shown.
+    The model picker reads the list of models from the config file.
+    Thus, new models can be added without restarting the webapp (PR #1).
+  - Added support to store schema for vault notes.
+  - Added support for agent to write documents into a folder outside of
+    the vault, and ui to reveal the location for user to manually copy to their
+    vault or wherever they want. 
+    Agents can suggest changes to the document which must be approved or rejected
+    by the user ala git diff style.
+  - Added a document (latex, md, txt, csv) editor to the webapp. Editor is
+    provided by CodeMirror API. Documents can be previewed in the webapp and 
+    exported into PDF file when needed.
+  - Added version history for documents. Every earlier version is kept and can
+    be restored from the editor. Restoring is itself undoable.
+  - Added automatic clean up of the draft folder. Documents untouched for 30
+    days are swept, unless marked to keep.
 
-- `OllamaProvider` and `AnthropicProvider` each make every request through a
-  single `_request()` helper using the streaming APIs. This is what makes a
-  turn interruptible: a blocking call offers no moment to bail out of, whereas
-  a stream can be checked between events and closed part-way — and closing the
-  connection is the only "stop generating" signal either service has.
-- Replies are still delivered whole; nothing about the output changed.
-- Consolidation, not just addition: `_request()` replaced four near-identical
-  `try/except → LLMError` blocks per provider, and assembling Ollama's message
-  from the stream removed the pydantic `model_dump` normalisation
-  (`_message_to_dict`) that kept session history JSON-serialisable.
+- Added new CLI commands to inspect what is indexed and what is available
+  (PR #1): `kb schema`, `kb list --notes`, `kb models`, `kb drafts`.
 
-**All-or-nothing knowledge-base writes**
+- Webapp prints its configuration on startup, and ⋮ → Show config… shows the
+  same thing in the UI. API keys show as set or not set, not their value (PR #1). 
 
-- Every `add_*` in `store.py` split into a `build_*` half that touches nothing
-  and one shared `commit_documents()` that performs the only write. The public
-  `add_texts` / `add_annotations` / `add_figures` / `add_paper` signatures and
-  all their callers are unchanged.
-- `add_document` now stages a whole paper — body, annotations, figure captions
-  — and commits it in a single atomic write. An add that is stopped or that
-  fails part-way leaves the knowledge base exactly as it was.
-- This also fixes a latent bug: a re-ingest used to delete the old entry
-  before indexing the new one's annotations, so a failure in between lost the
-  old entry's irreplaceable annotation chunks. The delete and the add now share
-  one commit.
-- Cancellation is never checked inside the commit — an interrupted ChromaDB
-  write is the corruption the staging exists to prevent.
+- Prompts used to instruct agent on how to behave and how to summarise and select
+  papers for paper digest are now editable from the UI. 
+  Default prompts now exist in the repo and are copied to
+  `~/.jarvis/prompts/` on first run. 
+  In the UI, ⋮ → Edit prompts… edits the copy, and a
+  revert button puts the default back (PR #1).
 
-**Compaction is visible**
+### BREAKING CHANGES
 
-- Compaction is a second LLM call made before the turn's own, and it used to
-  show nothing at all. The webapp now shows a pulsing "Compacting conversation
-  history..." indicator and the CLI prints the equivalent line. New
-  `needs_compaction()` predicate so the indicator only appears when compaction
-  is actually about to run.
+- Remove vault chat access via terminal to simplify codebase and deprecate 
+    features that are hardly used (PR #1).
 
-**Under the hood**
+- Chat tools renamed to make naming reflect more of a general assistant (PR #1):
+  - `retrieve_papers` + `search_notes` became one `search_kb`
+  - `list_papers` became `list_documents`. 
+  - Update `~/.jarvis/system_prompt.md` if you have one naming the old tools.
+    The built in prompt was rewritten but an override is left alone.
 
-- New `jarvis/core/cancel.py` (`CancelToken`) and `TurnCancelled`, which is
-  deliberately not an `LLMError` — the `LLMError` handlers save a "⚠️ …" reply
-  to the session, which is precisely the trace a stop must not leave.
-- `agentic_turn` is now given a *copy* of the session's messages, committed
-  back only once a reply arrives, so a cancelled turn has nothing to unwind.
-  Shared `rollback_turn()` drops the question from `messages`, `display`, and
-  `turn_starts` together.
-- Cancel checks are placed so that two things hold the moment a stop is
-  requested: nothing further is sent, and the message list is never appended to
-  again — an assistant `tool_use` block is never left without its matching
-  `tool_result` bundle, which would 400 the following turn.
-- `_session["running"]` in the webapp now holds a `RunningTurn` (live session,
-  cancel token, event queue, thread, commit lock) rather than a bare `Session`.
-  The lock is what keeps a stop and a just-landed reply from both writing: the
-  reply stands if it committed first, the worker stands down if the stop did.
-- 23 new tests: stream cancellation and connection close for both providers,
-  the `/chat/stop` lifecycle end to end including both sides of that race,
-  staged-write atomicity, a stopped ingest leaving the store untouched, and the
-  CLI's Ctrl-C rollback. Verified live against both providers as well: a
-  cancelled turn's thread dies within 0.1 s, `/chat/stop` returns in 0.02 s
-  with the session already clean, and a real SIGINT exits `vault-chat` in
-  0.5 s writing no session file.
-- Fixed a stub in `test_security.py` that had silently started exercising the
-  crash handler instead of the path it was testing (and writing tracebacks to
-  the real `~/.jarvis/logs/chat.log`) once `agentic_turn` gained its `cancel`
-  parameter.
-- Dropped the stale `docs/TODO.md` / `docs/ROADMAP.md` references from
-  `DESIGN.md`'s repository tree; neither file exists.
+- Webapp routes renamed (PR #1):
+  - `/papers`, `/papers/meta`, `/papers/remove` became 
+    `/documents*`, with `?kind=notes`. This will break any bookmarks if any.
 
-## 2026-09-02 — where the project stands
+- Removed skills as nothing was using it (PR #1). 
 
-This file was reset on 2026-09-02. The entry below is a snapshot of what jarvis
-does today rather than a retelling of how it got here — the commit-by-commit
-detail is in `git log`.
+### MAJOR CHANGES
 
+- All three providers now stream every request This is what makes a
+  turn interruptible, since closing the connection is the only stop generating
+  signal Ollama, Anthropic and OpenRouter offer (PR #3). 
 
-### Paper discovery
+- Knowledge base writes are now all or nothing (PR #3). 
 
-- Weekly digest pulls from arXiv (per-category limits) and bioRxiv (real
-  categories server-side, free-text keywords for topics with no category), with
-  the same paper arriving twice deduplicated by title.
-- Papers are scored against a custom relevance prompt by the configured LLM and
-  written as a tiered Markdown digest to `[digest] output_dir`.
-- Indexing follows the tier: score ≥ 9 is stored full text (PDF downloaded and
-  chunked), 8–8.9 reuses the digest's own summary text, and the digest file
-  itself is indexed so papers below the threshold are still findable.
-- `jarvis-sync` schedules the run (default Monday 05:00). A run missed while the
-  Mac slept fires on wake; one missed while it was off is caught by an overdue
-  re-check at start and every 6 hours. `kb sync-status` reports daemon health
-  and recent job outcomes.
-- A PDF dropped into `[sync] pdf_watch_dir` is indexed within `pdf_watch_minutes`
-  (default 30). Re-saving a PDF with new annotations re-indexes it via byte-hash
-  detection; the folder is an inbox, not a mirror, so removing a file never
-  deletes its knowledge base entry.
+- Paper digest are turned off by default in a switch to make Jarvis more general
+  assistant. Feature can be turned back on through config file (PR #1).
 
-### Knowledge base
+- Sessions store conversation transcript in a model agnostic format (PR #1).
+  This enable model switching within each session without losing context.
+  When switching model within a session, the existing one is converted to
+  the format accepted by the model before loaded. 
 
-- One local ChromaDB collection holds papers, Obsidian vault notes, indexed past
-  conversations, and digest files. Embedding runs on the machine — no external
-  calls.
-- Papers are stored either as an LLM summary (~1000 words) or as fully chunked
-  text for paragraph-level querying.
-- Retrieval fuses BGE dense embeddings with BM25 keyword ranking by reciprocal
-  rank fusion, over section-aware chunks, then re-ranks with a cross-encoder.
-  `[rag] hybrid = false` takes the dense-only path.
-- Highlights and typed notes in an annotated PDF become their own searchable
-  chunks (`[HIGHLIGHT p.N]`, `[USER NOTE p.N]`). Freehand ink is stroke
-  geometry, not text, and is not extracted.
-- Figure captioning by a vision model produces `[FIGURE p.N]` chunks. Off by
-  default since every figure costs a call — opt in per document with
-  `kb add --figures` or by asking the agent to add it "with figures".
-- Title, authors, and DOI are inferred for local PDFs; `kb set-meta` or the
-  agent's `update_document_metadata` corrects whatever the inference got wrong.
-- `kb doctor` diagnoses index health, `kb reindex` re-embeds every chunk without
-  any LLM calls.
+- Functions that do privacy checks now no longer checking whether provider is
+  Anthropic. A new generic `is_cloud_provider` function replaces it. 
+  An unknown provider is by default treated as a cloud provider (PR #1). 
 
-### Chat agent
+- Introduced new config to support changes introduced for making Jarvis more of
+  a general assistant (PR #1): `[drafts]`, `[openrouter]`, 
+  `[models]`, `[chat]`, `[auth]`.
 
-- Terminal (`vault-chat`) and browser (`webapp`, localhost only) run the same
-  agent and the same tools.
-- Provider is Ollama locally or Anthropic Claude, switchable per session.
-- Tools cover retrieval across papers, notes, and past chats; reading a stored
-  document or vault file in full; adding papers by arXiv URL or local PDF;
-  metadata corrections; vault indexing; stats; and requesting removals.
-- DB-only is on by default. Switching it off lets the model fall back to its
-  training knowledge, and it calls `use_own_knowledge` first so the fallback is
-  visible rather than silent.
-- Sessions persist to `~/.jarvis/sessions/` and can be resumed, renamed, pinned,
-  deleted, and searched. The 50 most recent unpinned are kept; pinned ones are
-  exempt. Long sessions compact themselves, keeping recent turns verbatim.
-- The webapp runs sessions genuinely in parallel — each turn has its own thread
-  and event stream, and a message is addressed to the session it was typed into
-  even if you switch away mid-send.
-- A papers manager in the header menu lists every indexed paper, narrows as you
-  type, and allows in-place metadata edits and removals.
-- Replies copy out as raw Markdown, so pasting into Obsidian keeps its
-  formatting. Skills under `~/.jarvis/skills/<name>/SKILL.md` are advertised by
-  name and description and loaded on demand.
+- Simplify changelog (PR #2).
 
-### Privacy and safety
+### MINOR CHANGES
 
-- Vault folders listed in `[chat] private_vault_dirs` are visible to the local
-  model only. The check resolves symlinks, so a link in a public folder cannot
-  reach into a private one.
-- A cloud provider that touches private content stops the turn with a
-  `PrivacyError` instead of working around it — private notes never reach a
-  cloud model, even indirectly.
-- Papers are always public. Only vault notes can be private, which is what makes
-  the cloud summary path safe.
-- A session that ever touches private content is flagged private permanently and
-  cannot be resumed under Anthropic.
-- Deletion always needs a human. The agent can only request one; confirmation
-  happens out of band (terminal y/N or a webapp dialog), and only database
-  entries are ever removed. There is no code path in jarvis that deletes a file
-  on disk.
+- PDF export from the editor no longer gives up after a minute. The ceiling on
+  one LaTeX or pandoc run (`[drafts] compile_timeout_seconds`) is now 180
+  seconds, since the first Markdown export on a machine spends minutes building
+  a font cache before it even starts on the document (PR #1).
 
-### Project infrastructure
+- The PDF button now shows how long an export has been running, and is disabled
+  while it runs so a second click cannot stack another LaTeX run on the first.
+  After 20 seconds the counter also says why a first export can take minutes
+  (PR #1).
 
-- The Markdown in `docs/` is published to <https://ghar1821.github.io/jarvis/>
-  on every push to `main`, with the README itself as the home page so the site
-  and the repository cannot disagree. The build is `--strict`, so a broken link
-  fails CI.
-- CI runs the unit suite (`pytest -m "not integration"`) on pushes to `main` and
-  on pull requests targeting it.
+- Fix a test in `test_security.py` that had quietly stopped testing anything.
+  Its fake provider did not accept the new `cancel` argument, so the webapp
+  caught the `TypeError` in its crash handler and the test carried on passing
+  (PR #3).
+
+- Dropped the stale `docs/TODO.md` and `docs/ROADMAP.md` references from the
+  repository tree in `DESIGN.md` (PR #3).
+
+- Change the header bar on the UI so it is more readable (PR #1).
+  The header now shows which model is currently used by the session.
+  If `openrouter/auto` model is used, then the model name that is handling
+  the prompt is showed (PR #1).
+
+- Further UI polish (PR #1):
+  - Dropped the vault path from the header.
+  - The header's ⋮ button is replaced with a plain wrench icon.
+  - Dropped the trailing "…" from every item in the ⋮ menu.
+  - The editor toggle button now reads "Show editor" / "Hide editor"
+    instead of "Editor" / "Hide editor".
+  - Remove some captions from the prompt editor page.
+  - Add icons to the UI header's next to cost and model name.
+  - Add explicit "USD" next to cost.
+
+### BUG FIXES
+
+- Fix re-adding a document leaving you with nothing when the add process failed 
+  part way. Re-adding deletes the old entry and indexes the new one, and
+  those used to be two separate writes, so a failure or a stop in between wiped
+  the old entry without putting the new one in. They now happen in 
+  one write (PR #3).
+
+- Fix errors being silently swallowed in thirteen places. Exceptions were
+  caught but not logged, making troubleshooting almost impossible.
+  Introduced a logger in `~/.jarvis/logs/jarvis.log` and printing errors out
+  now to help troubleshooting (PR #1).
+
+- Fix a stale database index reported as index corruption. This used to tell 
+  the user to rebuild the whole database when in actual fact an `index-vault`
+  to update it is all that is needed (PR #1). 
+
+- Fix `kb reindex` could not run on a database store that is too corrupt to 
+  read. New `kb reindex --from-storage` was introduced to fix corrupt HNSW index
+  by using the chunked text (either full doc or LLM summary) stored in sqlite.
+  That way, the rechunking or the expensive LLM summary doesn't need to be
+  repeated when reindexing (PR #1).
+
+- Fix `kb doctor` died without output instead of diagnosing when the index was badly
+  corrupt (PR #1). 

@@ -23,18 +23,6 @@ def test_prompt_without_style_adds_nothing():
     assert "Response style" not in build_system_prompt(response_style="   ")
 
 
-def test_prompt_lists_skills():
-    """Skills appear as name + description lines with the read_skill hint."""
-    prompt = build_system_prompt(
-        skills=[("paper-review", "Checklist for reviewing a methods paper")]
-    )
-    assert "read_skill" in prompt
-    assert "- paper-review: Checklist for reviewing a methods paper" in prompt
-    assert "Available skills" not in build_system_prompt(skills=[])
-
-
-# ── Config write-back ──────────────────────────────────────────────────────────
-
 def test_set_config_value_preserves_comments_and_other_keys(tmp_path):
     """
     Writing one key must round-trip everything else byte-for-byte —

@@ -11,9 +11,11 @@ All tests call load_config() with an explicit config_file path so the real
 any environment variables changed during a test.
 """
 
+from pathlib import Path
+
 import pytest
 
-from jarvis.core.config import load_config
+from jarvis.core.config import Config, load_config
 
 
 def test_defaults_when_no_config_file(tmp_path):
@@ -31,8 +33,10 @@ def test_defaults_when_no_config_file(tmp_path):
         rerank_model    == "cross-encoder/ms-marco-MiniLM-L6-v2"
         rerank_top_n    == 25
         figure_captions == False   (off by default — vision calls cost per figure)
+        digest_enabled  == False   (off by default — jarvis is a general assistant)
     """
     cfg = load_config(tmp_path / "nonexistent.toml")
+    assert cfg.digest_enabled is False
     assert cfg.ollama_model == "qwen3-vl:30b"
     assert cfg.provider == "ollama"
     assert cfg.chunk_size == 1024
@@ -308,3 +312,160 @@ def test_api_key_loaded_from_auth_section(tmp_path):
     config_file.write_text('[auth]\napi_key = "sk-ant-test"\n')
     cfg = load_config(config_file)
     assert cfg.anthropic_api_key == "sk-ant-test"
+
+
+def test_digest_enabled_read_from_digest_section(tmp_path):
+    """
+    The digest is opt-in: [digest] enabled = true switches it back on, and
+    anything else leaves it off.
+
+    Input:  config.toml with [digest] enabled = true
+    Expected output:
+        digest_enabled is True
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[digest]\nenabled = true\nmax_results = 5\n')
+    cfg = load_config(config_file)
+    assert cfg.digest_enabled is True
+    assert cfg.max_results == 5
+
+    config_file.write_text('[digest]\nenabled = false\n')
+    assert load_config(config_file).digest_enabled is False
+
+
+# ── The README's setup instructions ───────────────────────────────────────────
+#
+# Someone following the README on a fresh machine has nothing else to go on, so
+# a renamed config key that nobody updates the README for is a setup that
+# silently does the wrong thing — the file parses, and the setting is ignored.
+
+
+def test_the_readme_openrouter_config_actually_works(tmp_path):
+    """
+    The copy-pasteable OpenRouter block in README.md must produce the config it
+    claims to. Extracted from the README itself rather than duplicated here, or
+    the test would drift from the thing it is checking.
+    """
+    import re
+
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    match = re.search(r'```toml\n(\[chat\]\nprovider = "openrouter".*?)```', readme, re.S)
+    assert match, "the README no longer has an OpenRouter config block to check"
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(match.group(1))
+    cfg = load_config(config_file)
+
+    assert cfg.provider == "openrouter"
+    assert cfg.openrouter_model, "provider without a model fails at startup"
+    assert cfg.openrouter_api_key, "the [auth] key name must match what config reads"
+    # A literal "~" here would be a path that never resolves.
+    assert cfg.vault_path.is_absolute()
+    assert cfg.models.get("openrouter"), "the [models] catalogue feeds the picker"
+
+
+def test_the_readme_names_commands_that_exist():
+    """
+    Every `uv run <entry-point>` the README tells a new user to type has to be
+    a real entry point in pyproject.toml.
+    """
+    import re
+    import tomllib
+
+    root = Path(__file__).parent.parent
+    readme = (root / "README.md").read_text()
+    with open(root / "pyproject.toml", "rb") as handle:
+        scripts = set(tomllib.load(handle)["project"]["scripts"])
+
+    named = set(re.findall(r"uv run ([a-z][a-z-]+)", readme)) - {"pytest", "python"}
+    assert named <= scripts, f"README names commands that do not exist: {sorted(named - scripts)}"
+
+
+# ── describe(): the config as shown at startup and in the UI ─────────────────
+
+
+def test_describe_never_renders_an_api_key(tmp_path):
+    """
+    The one property that matters here. This is printed to a terminal someone
+    may be screen-sharing and rendered into a browser tab, so the key itself
+    must not appear anywhere in the output.
+    """
+    from jarvis.core.config import describe
+
+    secret = "sk-or-v1-9f3c2a-DO-NOT-LEAK"
+    cfg = Config(anthropic_api_key=secret, openrouter_api_key=secret)
+
+    rendered = describe(cfg)
+    flat = " ".join(
+        f"{value['key']} {value['value']}"
+        for section in rendered
+        for value in section["values"]
+    )
+
+    assert secret not in flat
+    assert "DO-NOT-LEAK" not in flat
+
+
+def test_describe_says_whether_each_key_is_set(tmp_path):
+    """Redacted, but still answering the question you came to ask."""
+    from jarvis.core.config import describe
+
+    cfg = Config(anthropic_api_key="something", openrouter_api_key="")
+    creds = {
+        value["key"]: value["value"]
+        for section in describe(cfg)
+        if section["section"] == "Credentials"
+        for value in section["values"]
+    }
+
+    assert creds["anthropic_api_key"] == "set"
+    assert creds["openrouter_api_key"] == "not set"
+
+
+def test_describe_redacts_a_secret_that_leaks_into_another_field(tmp_path):
+    """
+    The backstop. If a field is ever added to a group raw, or a key ends up
+    pasted into some other setting, it still must not render.
+    """
+    from jarvis.core.config import describe
+
+    secret = "sk-or-v1-abcdef123456"
+    cfg = Config(openrouter_api_key=secret, response_style=f"use {secret} please")
+
+    flat = " ".join(
+        value["value"] for section in describe(cfg) for value in section["values"]
+    )
+
+    assert secret not in flat
+
+
+def test_describe_reports_resolved_values_not_the_file(tmp_path, monkeypatch):
+    """
+    "Why isn't my setting working" is usually an env var winning over the
+    file, so this has to show what is in effect, not what the file says.
+    """
+    from jarvis.core.config import describe, load_config
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[chat]\nprovider = "ollama"\n')
+    monkeypatch.setenv("CHAT_PROVIDER", "anthropic")
+
+    cfg = load_config(config_file)
+    chat = {
+        value["key"]: value["value"]
+        for section in describe(cfg)
+        if section["section"] == "Chat"
+        for value in section["values"]
+    }
+
+    assert chat["provider"] == "anthropic", "the env var is what is in effect"
+
+
+def test_format_describe_is_printable_text(tmp_path):
+    """What the webapp prints at startup."""
+    from jarvis.core.config import format_describe
+
+    text = format_describe(Config(anthropic_api_key="secret-value"))
+
+    assert "Chat" in text and "provider" in text
+    assert "secret-value" not in text

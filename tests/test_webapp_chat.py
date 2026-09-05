@@ -48,6 +48,7 @@ import jarvis.chat.chat as chat_module
 import jarvis.webapp.app as appmod
 from jarvis.chat.sessions import new_session
 from jarvis.core.cancel import CancelToken
+from jarvis.core.config import Config
 from jarvis.core.errors import LLMError
 
 
@@ -73,13 +74,28 @@ class FakeProvider:
     token where a streamed response would) reads provider.cancel.
     """
 
-    def __init__(self, behavior):
+    def __init__(self, behavior, usage=None):
         self.behavior = behavior
+        self.usage = usage
         self.cancel = None
 
     def agentic_turn(self, messages, tools, dispatch_fn, system, cancel=None):
         self.cancel = cancel
         return self.behavior(messages, tools, dispatch_fn, system)
+
+    def pop_usage(self):
+        usage, self.usage = self.usage, None
+        return usage
+
+
+def install_provider(session, provider):
+    """
+    Put a fake into the webapp's real per-spec provider cache, under the spec
+    the session will resolve. Using the production structure (rather than
+    patching the lookup) keeps these tests honest about how a turn finds its
+    provider.
+    """
+    appmod._session["providers"][session.model_spec] = provider
 
 
 def _fake_running_turn(session):
@@ -98,7 +114,7 @@ def _parse_sse(text: str) -> list[dict]:
     for block in text.split("\n\n"):
         for line in block.splitlines():
             if line.startswith("data: "):
-                events.append(json.loads(line[len("data: "):]))
+                events.append(json.loads(line[len("data: ") :]))
     return events
 
 
@@ -107,22 +123,52 @@ def wired_session(monkeypatch):
     """
     A real Session installed as the webapp's active session, with maybe_compact
     and get_store stubbed so run_agent's turn is free of real KB/compaction
-    side effects. Tests still set appmod._session["provider"] to their own
-    FakeProvider and monkeypatch appmod.save_session with their own recorder.
+    side effects. Tests install their own FakeProvider with install_provider()
+    and monkeypatch appmod.save_session with their own recorder.
     """
-    session = new_session(appmod.cfg.provider)
+    # An explicit local spec rather than appmod.cfg.provider: these tests must
+    # not depend on whatever provider the developer's own config names.
+    session = new_session("ollama:test-model")
     appmod._session["session"] = session
     appmod._session["running"] = {}
     appmod._session["pending_actions"] = {}
+    appmod._session["providers"] = {}
     monkeypatch.setattr(appmod, "maybe_compact", lambda *a, **k: False)
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: "the-store")
+
+    # Resolving a spec no test installed would build a REAL provider client and
+    # hit the network. Fail loudly instead — a test must pin every session it
+    # creates to a spec it has installed a fake for.
+    def strict_provider_for(spec):
+        provider = appmod._session["providers"].get(spec)
+        if provider is None:
+            pytest.fail(
+                f"no fake provider installed for {spec!r} — use install_provider(), "
+                "and create test sessions with an explicit spec"
+            )
+        return provider
+
+    monkeypatch.setattr(appmod, "_provider_for", strict_provider_for)
+
+    # /models and /model re-read config.toml so a refresh shows up without a
+    # restart. In a test that would be the developer's own file, making the
+    # result depend on whose machine it runs on — pin it to a known one.
+    test_config = Config(
+        provider="ollama",
+        ollama_model="test-model",
+        models={"ollama": ["test-model", "another-local"]},
+    )
+    monkeypatch.setattr(appmod, "cfg", test_config)
+    monkeypatch.setattr(appmod, "_live_config", lambda: test_config)
     return session
 
 
 # ── save -> turn -> save ordering ────────────────────────────────────────────
 
 
-def test_early_save_persists_user_message_before_the_llm_call(wired_session, monkeypatch):
+def test_early_save_persists_user_message_before_the_llm_call(
+    wired_session, monkeypatch
+):
     """
     The first save_session call must already show the user's turn on disk —
     this is what keeps the question from disappearing if the browser switches
@@ -131,13 +177,20 @@ def test_early_save_persists_user_message_before_the_llm_call(wired_session, mon
     save_calls = []
 
     def fake_save_session(session, store=None):
-        save_calls.append({"display": [dict(turn) for turn in session.display], "store": store})
+        save_calls.append(
+            {"display": [dict(turn) for turn in session.display], "store": store}
+        )
 
     monkeypatch.setattr(appmod, "save_session", fake_save_session)
-    appmod._session["provider"] = FakeProvider(lambda messages, tools, dispatch_fn, system: "hello back")
+    install_provider(
+        wired_session,
+        FakeProvider(lambda messages, tools, dispatch_fn, system: "hello back"),
+    )
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/chat", json={"message": "hi there", "session_id": wired_session.id})
+    response = client.post(
+        "/chat", json={"message": "hi there", "session_id": wired_session.id}
+    )
     assert response.status_code == 200
 
     assert len(save_calls) == 2
@@ -184,7 +237,9 @@ def test_busy_guard_blocks_second_chat_and_session_delete(wired_session):
 # ── crash path ──────────────────────────────────────────────────────────────
 
 
-def test_uncaught_exception_still_replies_and_terminates_stream(wired_session, monkeypatch, caplog, isolated_log):
+def test_uncaught_exception_still_replies_and_terminates_stream(
+    wired_session, monkeypatch, caplog, isolated_log
+):
     """
     A bug in the tool loop (anything not an LLMError) must not hang the SSE
     stream forever — it should log the full traceback, persist the error
@@ -192,15 +247,17 @@ def test_uncaught_exception_still_replies_and_terminates_stream(wired_session, m
     the browser's "Working..." placeholder clears.
     """
     save_calls = []
-    monkeypatch.setattr(appmod, "save_session", lambda session, store=None: save_calls.append(store))
+    monkeypatch.setattr(
+        appmod, "save_session", lambda session, store=None: save_calls.append(store)
+    )
 
     def behavior(messages, tools, dispatch_fn, system):
         raise RuntimeError("kaboom")
 
-    appmod._session["provider"] = FakeProvider(behavior)
+    install_provider(wired_session, FakeProvider(behavior))
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         response = client.post(
             "/chat", json={"message": "trigger a crash", "session_id": wired_session.id}
         )
@@ -225,19 +282,25 @@ def test_uncaught_exception_still_replies_and_terminates_stream(wired_session, m
 # ── LLMError path ─────────────────────────────────────────────────────────────
 
 
-def test_llm_error_replies_logs_and_saves(wired_session, monkeypatch, caplog, isolated_log):
+def test_llm_error_replies_logs_and_saves(
+    wired_session, monkeypatch, caplog, isolated_log
+):
     """An LLMError is an expected provider failure: log it, reply with a warning, still save."""
     save_calls = []
-    monkeypatch.setattr(appmod, "save_session", lambda session, store=None: save_calls.append(store))
+    monkeypatch.setattr(
+        appmod, "save_session", lambda session, store=None: save_calls.append(store)
+    )
 
     def behavior(messages, tools, dispatch_fn, system):
         raise LLMError("rate limited")
 
-    appmod._session["provider"] = FakeProvider(behavior)
+    install_provider(wired_session, FakeProvider(behavior))
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
-        response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
+        response = client.post(
+            "/chat", json={"message": "hi", "session_id": wired_session.id}
+        )
 
     events = _parse_sse(response.text)
     reply_events = [e for e in events if e["type"] == "reply"]
@@ -271,7 +334,7 @@ def test_resume_of_busy_session_installs_live_object(wired_session, monkeypatch)
         assert release_turn.wait(timeout=10), "test never released the blocked turn"
         return "the finished reply"
 
-    appmod._session["provider"] = FakeProvider(blocking_behavior)
+    install_provider(wired_session, FakeProvider(blocking_behavior))
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
 
@@ -298,7 +361,10 @@ def test_resume_of_busy_session_installs_live_object(wired_session, monkeypatch)
     body = resume_response.json()
     assert body["busy"] is True
     assert appmod._session["session"] is wired_session
-    assert appmod._session["session"] is appmod._session["running"][wired_session.id].session
+    assert (
+        appmod._session["session"]
+        is appmod._session["running"][wired_session.id].session
+    )
 
     # Let the turn finish and the stream drain.
     release_turn.set()
@@ -325,10 +391,15 @@ def test_two_parallel_turns(wired_session, monkeypatch):
     monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
 
     session_a = wired_session  # already installed as the active session
-    session_b = new_session(appmod.cfg.provider)
+    session_b = new_session(
+        "ollama:test-model"
+    )  # same spec, so it resolves the same fake
     monkeypatch.setattr(
-        appmod, "load_session",
-        lambda session_id: session_b if session_id == session_b.id else pytest.fail(session_id),
+        appmod,
+        "load_session",
+        lambda session_id: (
+            session_b if session_id == session_b.id else pytest.fail(session_id)
+        ),
     )
 
     a_started = threading.Event()
@@ -344,7 +415,7 @@ def test_two_parallel_turns(wired_session, monkeypatch):
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
 
-    appmod._session["provider"] = FakeProvider(behavior_a)
+    install_provider(wired_session, FakeProvider(behavior_a))
     stream_result = {}
 
     def post_a():
@@ -359,13 +430,15 @@ def test_two_parallel_turns(wired_session, monkeypatch):
     # A is now blocked mid-turn (its user turn is on session_a.display, no
     # assistant reply yet). Sending to B — a different, non-active session —
     # must succeed immediately rather than 409ing on A's busy state.
-    appmod._session["provider"] = FakeProvider(behavior_b)
+    install_provider(wired_session, FakeProvider(behavior_b))
     response_b = client.post(
         "/chat", json={"message": "question for B", "session_id": session_b.id}
     )
     assert response_b.status_code == 200
 
-    assert [t["role"] for t in session_a.display] == ["user"]  # still blocked, no reply yet
+    assert [t["role"] for t in session_a.display] == [
+        "user"
+    ]  # still blocked, no reply yet
     assert [t["role"] for t in session_b.display] == ["user", "assistant"]
     assert session_b.display[-1]["content"] == "reply for B"
     # B already popped, A still running
@@ -399,7 +472,8 @@ def test_stop_ends_the_stream_and_leaves_no_trace(wired_session, monkeypatch):
     """
     save_calls = []
     monkeypatch.setattr(
-        appmod, "save_session",
+        appmod,
+        "save_session",
         lambda session, store=None: save_calls.append(store),
     )
 
@@ -416,14 +490,15 @@ def test_stop_ends_the_stream_and_leaves_no_trace(wired_session, monkeypatch):
         pytest.fail("the turn was never cancelled")
 
     provider.behavior = blocking_behavior
-    appmod._session["provider"] = provider
+    install_provider(wired_session, provider)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     stream_result = {}
 
     def post_chat():
         stream_result["response"] = client.post(
-            "/chat", json={"message": "a runaway question", "session_id": wired_session.id}
+            "/chat",
+            json={"message": "a runaway question", "session_id": wired_session.id},
         )
 
     post_thread = threading.Thread(target=post_chat)
@@ -473,7 +548,7 @@ def test_stop_frees_the_session_for_the_next_message(wired_session, monkeypatch)
         pytest.fail("the turn was never cancelled")
 
     provider.behavior = blocking_behavior
-    appmod._session["provider"] = provider
+    install_provider(wired_session, provider)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     post_thread = threading.Thread(
@@ -487,8 +562,9 @@ def test_stop_frees_the_session_for_the_next_message(wired_session, monkeypatch)
     client.post("/chat/stop", json={"session_id": wired_session.id})
     post_thread.join(timeout=10)
 
-    appmod._session["provider"] = FakeProvider(
-        lambda messages, tools, dispatch_fn, system: "the second reply"
+    install_provider(
+        wired_session,
+        FakeProvider(lambda messages, tools, dispatch_fn, system: "the second reply"),
     )
     second = client.post(
         "/chat", json={"message": "second question", "session_id": wired_session.id}
@@ -497,11 +573,14 @@ def test_stop_frees_the_session_for_the_next_message(wired_session, monkeypatch)
 
     # Only the second exchange survives; the stopped one left nothing behind.
     assert [t["content"] for t in wired_session.display] == [
-        "second question", "the second reply"
+        "second question",
+        "the second reply",
     ]
 
 
-def test_stop_landing_as_the_reply_commits_leaves_the_reply_standing(wired_session, monkeypatch):
+def test_stop_landing_as_the_reply_commits_leaves_the_reply_standing(
+    wired_session, monkeypatch
+):
     """
     A stop and a finished reply can land in the same instant. If the reply won,
     it has already been committed and saved, and rolling the turn back would
@@ -514,7 +593,9 @@ def test_stop_landing_as_the_reply_commits_leaves_the_reply_standing(wired_sessi
     wired_session.turn_starts.append(0)
     wired_session.messages.append({"role": "user", "content": "a question"})
     wired_session.display.append({"role": "user", "content": "a question"})
-    wired_session.display.append({"role": "assistant", "content": "the answer", "tool_calls": []})
+    wired_session.display.append(
+        {"role": "assistant", "content": "the answer", "tool_calls": []}
+    )
     appmod._session["running"] = {wired_session.id: _fake_running_turn(wired_session)}
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
@@ -547,15 +628,20 @@ def test_worker_stands_down_when_a_stop_beats_its_commit(wired_session, monkeypa
         return "a reply nobody asked for any more"
 
     provider.behavior = stopped_before_committing
-    appmod._session["provider"] = provider
+    install_provider(wired_session, provider)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+    response = client.post(
+        "/chat", json={"message": "hi", "session_id": wired_session.id}
+    )
 
     # No reply event, and the reply never reached the session.
     events = _parse_sse(response.text)
     assert [e["type"] for e in events] == []
-    assert all(t["content"] != "a reply nobody asked for any more" for t in wired_session.display)
+    assert all(
+        t["content"] != "a reply nobody asked for any more"
+        for t in wired_session.display
+    )
     # Only the early save ran; the indexed save on the success path did not.
     assert save_calls == [None]
     assert appmod._session["running"] == {}
@@ -592,7 +678,7 @@ def test_stop_clears_only_its_own_sessions_pending_dialogs(wired_session, monkey
         pytest.fail("the turn was never cancelled")
 
     provider.behavior = blocking_behavior
-    appmod._session["provider"] = provider
+    install_provider(wired_session, provider)
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
     post_thread = threading.Thread(
@@ -604,8 +690,14 @@ def test_stop_clears_only_its_own_sessions_pending_dialogs(wired_session, monkey
     assert turn_started.wait(timeout=10)
 
     appmod._session["pending_actions"] = {
-        "mine": {"session_id": wired_session.id, "action": {"ids": [], "title": "mine"}},
-        "theirs": {"session_id": "another-session", "action": {"ids": [], "title": "theirs"}},
+        "mine": {
+            "session_id": wired_session.id,
+            "action": {"ids": [], "title": "mine"},
+        },
+        "theirs": {
+            "session_id": "another-session",
+            "action": {"ids": [], "title": "theirs"},
+        },
     }
 
     client.post("/chat/stop", json={"session_id": wired_session.id})
@@ -624,12 +716,15 @@ def test_compaction_emits_a_status_event(wired_session, monkeypatch):
     monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
     monkeypatch.setattr(appmod, "needs_compaction", lambda session, cfg: True)
     monkeypatch.setattr(appmod, "maybe_compact", lambda *a, **k: True)
-    appmod._session["provider"] = FakeProvider(
-        lambda messages, tools, dispatch_fn, system: "compacted then answered"
+    install_provider(
+        wired_session,
+        FakeProvider(lambda messages, tools, dispatch_fn, system: "compacted then answered"),
     )
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    response = client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+    response = client.post(
+        "/chat", json={"message": "hi", "session_id": wired_session.id}
+    )
 
     events = _parse_sse(response.text)
     states = [e["state"] for e in events if e["type"] == "status"]
@@ -657,13 +752,19 @@ def test_chat_delivers_to_addressed_session_not_active(wired_session, monkeypatc
     contamination via the old mutable-global design).
     """
     monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
-    other_session = new_session(appmod.cfg.provider)
+    other_session = new_session(
+        "ollama:test-model"
+    )  # same spec, so it resolves the same fake
     monkeypatch.setattr(
-        appmod, "load_session",
-        lambda session_id: other_session if session_id == other_session.id else pytest.fail(session_id),
+        appmod,
+        "load_session",
+        lambda session_id: (
+            other_session if session_id == other_session.id else pytest.fail(session_id)
+        ),
     )
-    appmod._session["provider"] = FakeProvider(
-        lambda messages, tools, dispatch_fn, system: "reply for other"
+    install_provider(
+        wired_session,
+        FakeProvider(lambda messages, tools, dispatch_fn, system: "reply for other"),
     )
 
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
@@ -682,18 +783,341 @@ def test_validation_error_is_logged_and_returns_readable_detail(caplog, isolated
     A request FastAPI rejects at validation time (e.g. a stale browser tab
     posting the pre-parallel-sessions /chat shape without session_id) never
     reaches a route body — the exception handler must log it to the
-    vault-chat logger so it is diagnosable from chat.log, and return the
+    jarvis.chat logger so it is diagnosable from chat.log, and return the
     standard 422 detail list.
     """
     client = TestClient(appmod.app, base_url="http://127.0.0.1")
-    with caplog.at_level(logging.ERROR, logger="vault-chat"):
+    with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
         response = client.post("/chat", json={"message": "no session id here"})
 
     assert response.status_code == 422
     detail = response.json()["detail"]
     assert detail[0]["loc"] == ["body", "session_id"]
 
-    validation_logs = [r for r in caplog.records if "request validation failed" in r.message]
+    validation_logs = [
+        r for r in caplog.records if "request validation failed" in r.message
+    ]
     assert len(validation_logs) == 1
     assert "/chat" in validation_logs[0].message
     assert "session_id" in validation_logs[0].message
+
+
+# ── Model switching ────────────────────────────────────────────────────────────
+
+
+def test_models_route_lists_the_catalogue_without_touching_the_network(
+    wired_session, monkeypatch
+):
+    """
+    The picker reads config only. Opening the UI must make no outbound
+    request — refreshing the OpenRouter list is a separate, explicit
+    `kb models --refresh`.
+    """
+
+    def explode(*args, **kwargs):
+        pytest.fail("/models must not make a network request")
+
+    monkeypatch.setattr("requests.get", explode)
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    body = client.get("/models").json()
+
+    assert body["current"] == wired_session.model_spec
+    assert body["private"] is False
+    assert any(entry["spec"] == wired_session.model_spec for entry in body["models"])
+    # Every entry says whether it runs locally, which is what the privacy
+    # rule keys on.
+    assert all("local" in entry for entry in body["models"])
+
+
+def test_model_switch_applies_from_the_next_turn(wired_session, monkeypatch):
+    """A switch records the new model on the session and persists it."""
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.cfg, "openrouter_api_key", "sk-or-test", raising=False)
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(
+        "/model",
+        json={"session_id": wired_session.id, "spec": "openrouter:openai/gpt-5"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["spec"] == "openrouter:openai/gpt-5"
+    assert wired_session.provider == "openrouter"
+    assert wired_session.model == "openai/gpt-5"
+
+
+def test_model_switch_refused_for_a_private_session(wired_session, monkeypatch):
+    """
+    Once private content is in the transcript, the transcript itself is
+    private — moving it to a model that sends content off the machine is
+    refused outright, not warned about.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.cfg, "openrouter_api_key", "sk-or-test", raising=False)
+    wired_session.private = True
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(
+        "/model",
+        json={"session_id": wired_session.id, "spec": "openrouter:openai/gpt-5"},
+    )
+
+    assert response.status_code == 409
+    assert "private" in response.json()["detail"].lower()
+    assert wired_session.provider == "ollama"  # unchanged
+
+
+def test_model_switch_rejects_an_unknown_provider(wired_session, monkeypatch):
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(
+        "/model", json={"session_id": wired_session.id, "spec": "not-a-provider:x"}
+    )
+    assert response.status_code == 400
+
+
+def test_model_switch_refused_while_a_turn_is_in_flight(wired_session, monkeypatch):
+    """Swapping the model out from under a running turn would be incoherent."""
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    appmod._session["running"][wired_session.id] = wired_session
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(
+        "/model", json={"session_id": wired_session.id, "spec": "ollama:other-model"}
+    )
+    assert response.status_code == 409
+
+
+def test_turn_records_openrouter_cost_on_the_session(wired_session, monkeypatch):
+    """
+    Spend reported by the provider lands on the session and is reported to the
+    browser in the reply event.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    install_provider(
+        wired_session,
+        FakeProvider(
+            lambda messages, tools, dispatch_fn, system: "done",
+            usage={"usd": 0.0042, "requests": 3},
+        ),
+    )
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    response = client.post(
+        "/chat", json={"message": "hi", "session_id": wired_session.id}
+    )
+    reply = [e for e in _parse_sse(response.text) if e["type"] == "reply"][0]
+
+    assert wired_session.cost == {
+        wired_session.model_spec: {"usd": 0.0042, "requests": 3}
+    }
+    assert reply["cost_usd"] == 0.0042
+    assert reply["model"] == wired_session.model_spec
+
+
+def test_a_local_turn_records_no_cost(wired_session, monkeypatch):
+    """
+    A provider that reports nothing leaves the session with no cost entry at
+    all — not a fabricated zero.
+    """
+    monkeypatch.setattr(appmod, "save_session", lambda *a, **k: None)
+    install_provider(
+        wired_session,
+        FakeProvider(lambda messages, tools, dispatch_fn, system: "done"),
+    )
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    client.post("/chat", json={"message": "hi", "session_id": wired_session.id})
+
+    assert wired_session.cost == {}
+
+
+def test_a_model_can_be_switched_to_without_being_in_the_catalogue(wired_session):
+    """
+    The picker's list comes from config, but the catalogue is a convenience
+    list rather than an allowlist — the browser's text box posts an arbitrary
+    spec, and the server must accept one it never offered. This is how
+    `openrouter/auto`, or anything released since the last refresh, is reached
+    without editing config first.
+    """
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    catalogue = client.get("/models").json()["models"]
+    assert "ollama:never-listed" not in {entry["spec"] for entry in catalogue}
+
+    response = client.post(
+        "/model", json={"session_id": wired_session.id, "spec": "ollama:never-listed"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["spec"] == "ollama:never-listed"
+
+
+def test_an_unlisted_model_still_obeys_the_privacy_rule(wired_session, monkeypatch):
+    """
+    Typing a spec must not be a way around the rule the list enforces: a
+    session holding private content can only ever run locally.
+    """
+    import jarvis.webapp.app as appmod_local
+    from jarvis.core.config import Config
+
+    # A key has to be present, or the switch is refused for the mundane reason
+    # before the privacy rule is ever reached — and it is the privacy rule that
+    # this is about.
+    monkeypatch.setattr(
+        appmod_local,
+        "_live_config",
+        lambda: Config(
+            provider="ollama",
+            ollama_model="test-model",
+            openrouter_model="some-unlisted-model",
+            openrouter_api_key="sk-test",
+        ),
+    )
+    wired_session.private = True
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    response = client.post(
+        "/model",
+        json={"session_id": wired_session.id, "spec": "openrouter:some-unlisted-model"},
+    )
+
+    assert response.status_code == 409
+    assert "private" in response.json()["detail"].lower()
+
+
+def test_the_picker_reflects_a_config_edit_without_a_restart(
+    wired_session, monkeypatch
+):
+    """
+    `kb models --refresh` writes into config.toml. Serving the Config this
+    process started with meant the new models were invisible until the webapp
+    was restarted, which is a confusing thing to have to know.
+    """
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    before = {entry["spec"] for entry in client.get("/models").json()["models"]}
+    assert "ollama:added-later" not in before
+
+    monkeypatch.setattr(
+        appmod,
+        "_live_config",
+        lambda: Config(
+            provider="ollama",
+            ollama_model="test-model",
+            models={"ollama": ["test-model", "added-later"]},
+        ),
+    )
+
+    after = {entry["spec"] for entry in client.get("/models").json()["models"]}
+    assert "ollama:added-later" in after
+
+
+def test_info_reports_the_routed_model_and_the_per_model_breakdown(wired_session):
+    """
+    The header reads /info on load and after every session switch, so the
+    routed pick and the spend breakdown have to be there — not only on the
+    reply event, which a page refresh never sees.
+    """
+    from jarvis.chat.sessions import record_usage
+
+    record_usage(
+        wired_session,
+        wired_session.model_spec,
+        {
+            "usd": 0.004,
+            "requests": 2,
+            "model": "openrouter:anthropic/claude-sonnet-4.6",
+        },
+    )
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    info = client.get("/info").json()
+
+    assert info["served"] == "openrouter:anthropic/claude-sonnet-4.6"
+    assert info["cost_usd"] == 0.004
+    assert (
+        info["cost_by_model"]["openrouter:anthropic/claude-sonnet-4.6"]["requests"] == 2
+    )
+    # The requested spec is still reported separately — the header shows both.
+    assert info["provider"] == wired_session.model_spec
+
+
+def test_info_leaves_served_empty_for_an_ordinary_model(wired_session):
+    """Nothing to disambiguate means nothing shown, not a repeated name."""
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    assert client.get("/info").json()["served"] == ""
+
+
+def test_config_summary_route_reports_the_loaded_config(wired_session, monkeypatch):
+    """The ⋮ → Show config… view. Grouped, resolved, and never showing a key."""
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    secret = "sk-or-v1-NEVER-RENDER-THIS"
+    monkeypatch.setattr(
+        appmod,
+        "_live_config",
+        lambda: Config(
+            provider="openrouter",
+            openrouter_model="anthropic/claude-sonnet-4.6",
+            openrouter_api_key=secret,
+        ),
+    )
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+
+    sections = client.get("/config/summary").json()["sections"]
+    flat = " ".join(v["value"] for s in sections for v in s["values"])
+
+    assert secret not in flat, "the route must never serve an API key"
+    assert "set" in {
+        v["value"]
+        for s in sections
+        if s["section"] == "Credentials"
+        for v in s["values"]
+    }
+    chat = {
+        v["key"]: v["value"]
+        for s in sections
+        if s["section"] == "Chat"
+        for v in s["values"]
+    }
+    assert chat["provider"] == "openrouter"
+    assert chat["openrouter_model"] == "anthropic/claude-sonnet-4.6"
+
+
+def test_config_summary_is_read_fresh(wired_session, monkeypatch):
+    """An edited config shows up without restarting, same as the picker."""
+    import jarvis.webapp.app as appmod
+    from jarvis.core.config import Config
+
+    client = TestClient(appmod.app, base_url="http://127.0.0.1")
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(provider="ollama"))
+    before = client.get("/config/summary").json()
+
+    monkeypatch.setattr(appmod, "_live_config", lambda: Config(provider="anthropic"))
+    after = client.get("/config/summary").json()
+
+    provider = lambda body: next(
+        v["value"]
+        for s in body["sections"]
+        if s["section"] == "Chat"
+        for v in s["values"]
+        if v["key"] == "provider"
+    )
+    assert provider(before) == "ollama"
+    assert provider(after) == "anthropic"
+
+
+def test_no_chat_tool_can_read_the_config():
+    """
+    The config names paths and, indirectly, whether keys exist. Reading it is
+    a human action; a tool for it is one more thing an injection could aim at.
+    """
+    from jarvis.chat.chat import TOOLS
+
+    names = {tool["function"]["name"] for tool in TOOLS}
+    assert not [n for n in names if "config" in n]

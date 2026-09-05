@@ -1,12 +1,13 @@
 """Main pipeline: fetch → deduplicate → score → write digest → index knowledge base."""
 
+import argparse
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
-from jarvis.core.config import get_config
+from jarvis.core.config import CONFIG_FILE, get_config
 from jarvis.core.errors import ConversionError
 from jarvis.core.llm import active_model, make_provider
 
@@ -16,7 +17,14 @@ from ..biorxiv.fetch import fetch_biorxiv, fetch_biorxiv_keywords
 from .format import format_digest
 from .score import filter_and_score
 
-PROMPT_PATH = Path(__file__).parent / "prompts" / "prompt_filter_score.md"
+
+def scoring_prompt_path():
+    """The user's editable scoring prompt, created from the default if absent."""
+    from jarvis.core.prompts import load, user_path
+
+    load("digest_scoring")          # seeds the copy on first run
+    return user_path("digest_scoring")
+
 
 
 def _summary_fallback(paper: dict, selected: dict, store) -> str:
@@ -180,8 +188,31 @@ def index_digest_file(digest_text: str, output_path: Path, today: datetime, stor
     )
 
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Run the weekly paper digest once (off by default; see [digest] enabled)."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="run even when [digest] enabled is false",
+    )
+    args = parser.parse_args(argv)
+
     cfg = get_config()
+    # Typing `run-digest` is a human asking for a digest, so --force is all it
+    # takes — but do not fetch behind the back of someone who switched the
+    # feature off.
+    if not cfg.digest_enabled and not args.force:
+        print(
+            "Paper digest is disabled.\n"
+            "  Run it once now:   uv run run-digest --force\n"
+            "  Turn it on:        set [digest] enabled = true in "
+            f"{CONFIG_FILE}",
+            flush=True,
+        )
+        return
+
     today = datetime.today()
     datetime_str = today.strftime("%Y-%m-%d_%H-%M")
 
@@ -206,7 +237,7 @@ def main() -> None:
     print(f"  {len(all_papers)} unique papers", flush=True)
 
     print("Asking LLM to filter and score...", flush=True)
-    result = filter_and_score(all_papers, provider, cfg.max_results, PROMPT_PATH)
+    result = filter_and_score(all_papers, provider, cfg.max_results, scoring_prompt_path())
     selected = result["selected"]
     print(f"  {len(selected)} papers selected", flush=True)
 

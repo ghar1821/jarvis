@@ -2,12 +2,12 @@
 kb — local knowledge base manager.
 
 Manages a local vector database of research papers and Obsidian vault notes
-that vault-chat draws on during conversations.
+that the webapp agent draws on during conversations.
 
 Subcommands:
   add <url|path>    Add a paper by arXiv URL or local PDF path
   add-digest <path> Import papers from digest Markdown file(s)
-  list              List indexed papers
+  list              List indexed papers (--notes lists vault notes/records)
   stats             Show document and chunk counts
   remove <source>   Remove a document by source URL (database entry only — never touches files)
   clear             Delete all documents (prompts for confirmation)
@@ -16,6 +16,9 @@ Subcommands:
   index-vault       Incrementally update vault index; --force clears first
   reindex           Re-embed all chunks with the configured embed_model
   doctor            Diagnose knowledge base health (embed model, corruption)
+  models            List the switchable models your config offers
+  schema            Show which metadata keys/values exist (your record ontology)
+  drafts            List drafts; --prune removes stale ones
   sync-status       Show jarvis-sync daemon health and last job outcomes
 
 Usage examples:
@@ -24,6 +27,11 @@ Usage examples:
   uv run kb add paper.pdf --provider anthropic
   uv run kb add-digest ~/Documents/papers/digest/
   uv run kb list
+  uv run kb list --notes --category job_application --status rejected
+  uv run kb schema
+  uv run kb schema status
+  uv run kb drafts
+  uv run kb drafts --prune --dry-run
   uv run kb stats
   uv run kb remove https://arxiv.org/abs/2301.07041
   uv run kb set-meta https://arxiv.org/abs/2301.07041 --authors "Ada Lovelace"
@@ -31,6 +39,7 @@ Usage examples:
   uv run kb index-vault --force
   uv run kb reindex
   uv run kb doctor
+  uv run kb models
 """
 
 import argparse
@@ -270,21 +279,44 @@ def cmd_add(args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    from .store import get_store, list_papers
+    """List indexed papers, or vault notes/records with --notes."""
+    from .store import get_store, list_documents
 
-    papers = list_papers(limit=args.limit, store=get_store())
-    if not papers:
-        print("No papers in knowledge base.")
+    doc_type = "note" if args.notes else "paper"
+    documents = list_documents(
+        limit=args.limit,
+        doc_type=doc_type,
+        category=args.category,
+        status=args.status,
+        entity=args.entity,
+        store=get_store(),
+    )
+    if not documents:
+        print(f"No matching {'notes' if args.notes else 'papers'} in knowledge base.")
         return
-    for p in papers:
-        chunks = p.get("chunk_count", "?")
-        mode = p.get("storage_mode", "summary" if chunks in ("?", 1, 2) else "full_text")
-        print(f"[{p.get('score', '?')}/10] {p.get('title', 'untitled')}  [{mode}, {chunks} chunks]")
-        print(f"  {p.get('source', 'no source')}  ·  {p.get('date_added', 'N/A')[:10]}")
-        if p.get("authors"):
-            print(f"  Authors: {p['authors']}")
-        if p.get("doi"):
-            print(f"  DOI: {p['doi']}")
+
+    for d in documents:
+        chunks = d.get("chunk_count", "?")
+        if doc_type == "paper":
+            mode = d.get("storage_mode", "summary" if chunks in ("?", 1, 2) else "full_text")
+            print(f"[{d.get('score', '?')}/10] {d.get('title', 'untitled')}  [{mode}, {chunks} chunks]")
+            print(f"  {d.get('source', 'no source')}  ·  {d.get('date_added', 'N/A')[:10]}")
+            if d.get("authors"):
+                print(f"  Authors: {d['authors']}")
+            if d.get("doi"):
+                print(f"  DOI: {d['doi']}")
+        else:
+            record = " · ".join(
+                str(d[field]) for field in ("category", "entity", "status") if d.get(field)
+            )
+            print(f"{d.get('title', 'untitled')}  [{chunks} chunks]")
+            print(f"  {d.get('file_path', 'unknown')}  ·  {d.get('date_added', 'N/A')[:10]}")
+            if record:
+                print(f"  {record}")
+            if d.get("event_date"):
+                print(f"  Date: {d['event_date']}")
+            if d.get("tags"):
+                print(f"  Tags: {d['tags'].strip('|').replace('|', ', ')}")
         print()
 
 
@@ -316,8 +348,11 @@ def cmd_stats() -> None:
             )
             for src in private_sources:
                 print(f"   - {src}")
-    except Exception:
-        pass
+    except Exception as exc:
+        # This check is advisory, so a failure should not take `kb stats`
+        # down — but it must say it did not run, or a silent skip reads as
+        # "you have no legacy private papers".
+        print(f"\n⚠️  Could not check for legacy private papers: {exc}", file=sys.stderr)
 
 
 def _resolve_local_file(source: str, meta: dict) -> "Path | None":
@@ -413,8 +448,14 @@ def cmd_index_vault(args: argparse.Namespace) -> None:
             if ids_to_delete:
                 store.delete(ids_to_delete)
                 print(f"  Cleared {len(ids_to_delete)} chunks", flush=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # --force promises a clean rebuild. Indexing on top of a store we
+            # failed to clear gives the opposite — the stale chunks the user
+            # asked to be rid of, silently kept. Stop instead.
+            print(f"\n✗ Could not clear the existing vault index: {exc}", file=sys.stderr)
+            print("  --force cannot rebuild cleanly on top of this. Run "
+                  "`uv run kb doctor` to diagnose the store first.", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Indexing vault: {vault}", flush=True)
     added, updated, deleted = refresh_vault(vault, store)
@@ -443,7 +484,81 @@ def _migrated_chunk_text(text: str, metadata: dict) -> str:
     return f"{header}\n{text}"
 
 
-def cmd_reindex(args: argparse.Namespace) -> None:
+def _chunks_from_sqlite(rag_dir: Path) -> tuple[list[str], list[str], list[dict]]:
+    """
+    Read every stored chunk straight out of ChromaDB's SQLite file, bypassing
+    the collection API entirely. Returns (ids, documents, metadatas).
+
+    This exists because the normal reindex path cannot always run. Chunk text
+    and metadata live in SQLite, but vectors live in HNSW files, and a damaged
+    HNSW header makes hnswlib try to map an absurd allocation — the kernel
+    kills the process with SIGBUS before any Python exception can be raised.
+    At that point `collection.get()` is unusable, and it is the very call the
+    ordinary reindex depends on. Reading the tables directly sidesteps the
+    broken index and recovers everything, because nothing of value was ever
+    stored in it: the vectors are derived data and this rebuilds them.
+    """
+    import sqlite3
+
+    from jarvis.core.errors import RAGError
+
+    from .store import COLLECTION_NAME
+
+    database = rag_dir / "chroma.sqlite3"
+    if not database.exists():
+        raise RAGError(f"No ChromaDB file at {database}")
+
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        # The live collection's METADATA segment owns the rows we want; an
+        # orphaned collection from an earlier reindex may still be present.
+        segment = connection.execute(
+            """
+            SELECT s.id FROM segments s
+            JOIN collections c ON c.id = s.collection
+            WHERE c.name = ? AND s.scope = 'METADATA'
+            """,
+            (COLLECTION_NAME,),
+        ).fetchone()
+        if segment is None:
+            raise RAGError(f"No '{COLLECTION_NAME}' collection in {database}")
+
+        rows = connection.execute(
+            """
+            SELECT e.embedding_id, m.key,
+                   m.string_value, m.int_value, m.float_value, m.bool_value
+            FROM embeddings e
+            JOIN embedding_metadata m ON m.id = e.id
+            WHERE e.segment_id = ?
+            ORDER BY e.id
+            """,
+            (segment[0],),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    # One row per (chunk, metadata key); fold them back into per-chunk dicts.
+    documents: dict[str, str] = {}
+    metadatas: dict[str, dict] = {}
+    order: list[str] = []
+    for chunk_id, key, string_value, int_value, float_value, bool_value in rows:
+        if chunk_id not in metadatas:
+            metadatas[chunk_id] = {}
+            order.append(chunk_id)
+        if key == "chroma:document":
+            documents[chunk_id] = string_value or ""
+            continue
+        for value in (string_value, int_value, float_value, bool_value):
+            if value is not None:
+                metadatas[chunk_id][key] = value
+                break
+
+    # A chunk with no text cannot be re-embedded into anything useful.
+    ids = [chunk_id for chunk_id in order if documents.get(chunk_id)]
+    return ids, [documents[i] for i in ids], [metadatas[i] for i in ids]
+
+
+def cmd_reindex(args: "argparse.Namespace | None" = None) -> None:
     """
     Re-embed every stored chunk with the currently configured embedding model.
 
@@ -461,19 +576,29 @@ def cmd_reindex(args: argparse.Namespace) -> None:
     cfg = get_config()
     reindex_name = f"{COLLECTION_NAME}_reindex"
 
-    # Read the old collection directly, bypassing get_store()'s model-mismatch
-    # guard — the mismatch is exactly what we are here to resolve.
     client = chromadb.PersistentClient(path=str(cfg.rag_dir))
-    try:
-        old_collection = client.get_collection(COLLECTION_NAME)
-    except Exception:
-        print(f"No '{COLLECTION_NAME}' collection found — nothing to reindex.")
-        return
 
-    stored = old_collection.get(include=["documents", "metadatas"])
-    ids = stored["ids"]
-    documents = stored["documents"]
-    metadatas = stored["metadatas"]
+    # Tolerate being called without parsed args (tests, and any programmatic
+    # caller that just wants the ordinary rebuild).
+    if getattr(args, "from_storage", False):
+        # Recovery path: the vector index is too damaged to read through, so
+        # take the chunks from SQLite instead. See _chunks_from_sqlite.
+        print("Reading chunks directly from storage (bypassing the vector index)...", flush=True)
+        ids, documents, metadatas = _chunks_from_sqlite(cfg.rag_dir)
+    else:
+        # Read the old collection directly, bypassing get_store()'s
+        # model-mismatch guard — the mismatch is exactly what we are here to
+        # resolve.
+        try:
+            old_collection = client.get_collection(COLLECTION_NAME)
+        except Exception:
+            print(f"No '{COLLECTION_NAME}' collection found — nothing to reindex.")
+            return
+
+        stored = old_collection.get(include=["documents", "metadatas"])
+        ids = stored["ids"]
+        documents = stored["documents"]
+        metadatas = stored["metadatas"]
     if not ids:
         print("Knowledge base is empty — nothing to reindex.")
         return
@@ -517,61 +642,209 @@ def cmd_reindex(args: argparse.Namespace) -> None:
     print(f"Done — reindexed {len(ids)} chunks with '{cfg.embed_model}'.")
     print(
         "NOTE: the swap gives the collection a new identity, so any jarvis "
-        "process that was already running (webapp, jarvis-sync, vault-chat) "
+        "process that was already running (the webapp or jarvis-sync) "
         "now holds a stale handle — restart those processes before using them."
     )
 
 
+def cmd_drafts(args: argparse.Namespace) -> None:
+    """
+    List drafts, or sweep the stale ones.
+
+    Drafts are scratch space and expire, so the list always shows how long each
+    has left — a removal should never be a surprise. `--prune --dry-run` prints
+    exactly what a sweep would take without touching anything.
+    """
+    from jarvis.core.config import get_config
+    from jarvis.drafts import list_drafts, prune_drafts
+
+    retention = get_config().drafts_retention_days
+
+    if args.prune:
+        removed = prune_drafts(dry_run=args.dry_run)
+        if not removed:
+            print("Nothing to remove." if not args.dry_run else "Nothing would be removed.")
+            return
+        verb = "Would remove" if args.dry_run else "Removed"
+        for draft in removed:
+            print(f"{verb} {draft['id']}  {draft['title']!r}  "
+                  f"(untouched for {draft['age_days']:.1f} days)")
+        return
+
+    drafts = list_drafts()
+    if not drafts:
+        print("No drafts yet.")
+        return
+    for draft in drafts:
+        files = ", ".join(draft.get("files", []))
+        if draft.get("keep"):
+            expiry = "kept (never expires)"
+        elif retention <= 0:
+            expiry = "retention disabled"
+        else:
+            remaining = retention - draft.get("age_days", 0)
+            expiry = (
+                f"expires in {remaining:.1f} days" if remaining > 0 else "expires on the next sweep"
+            )
+        print(f"{draft['title']}  ({draft['id']})")
+        print(f"  files: {files}")
+        print(f"  {draft.get('visibility', 'public')} · {expiry}")
+        print()
+
+
+def cmd_schema(args: argparse.Namespace) -> None:
+    """
+    Show the metadata keys present in the store, or one key's distinct values.
+
+    This exists to make your own ontology visible. Jarvis enforces no
+    vocabulary for record types or statuses, which means a typo
+    ("stauts: rejected") becomes its own key that silently never matches a
+    filter — listing what is actually there is how you catch that.
+    """
+    from .store import get_store, metadata_key_counts, metadata_value_counts
+
+    store = get_store()
+    if args.key:
+        values = metadata_value_counts(args.key, store)
+        if not values:
+            print(f"No chunks carry the metadata key {args.key!r}.")
+            return
+        print(f"{args.key}:")
+        for value, count in sorted(values.items(), key=lambda pair: -pair[1]):
+            print(f"  {count:6d}  {value}")
+        return
+
+    counts = metadata_key_counts(store)
+    if not counts:
+        print("Knowledge base is empty.")
+        return
+    print("Metadata keys (chunk counts). Run `kb schema <key>` to see its values.\n")
+    for key, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])):
+        marker = "  (custom frontmatter)" if key.startswith("x_") else ""
+        print(f"  {count:6d}  {key}{marker}")
+
+
+def cmd_models(args: argparse.Namespace) -> None:
+    """
+    Show the switchable model catalogue as the config defines it.
+
+    Makes no network call, so it doubles as the quickest check that the config
+    file is being read at all, and which providers have credentials.
+    """
+    from jarvis.chat.models import list_catalogue
+    from jarvis.core.config import get_config
+
+    cfg = get_config()
+    entries = list_catalogue(cfg)
+    if not entries:
+        print("No models configured. Add them under [models] in ~/.jarvis/config.toml,")
+        return
+    for entry in entries:
+        where = "local" if entry["local"] else "cloud"
+        note = "" if entry["available"] else "  (no API key)"
+        print(f"  {entry['spec']}  [{where}]{note}")
+
+
+# Everything that touches the vector index runs here, in a child process.
+# Reading a damaged index does not raise — it terminates the process by signal
+# (SIGBUS from a corrupt HNSW header, SIGSEGV from a bad pointer), which no
+# Python handler can intercept. Running it in a child is what turns "the
+# command vanished with no output" into a diagnosis the user can act on.
+_DOCTOR_PROBE = """
+import json
+from jarvis.core.errors import KBCorruptionError, RAGError
+from jarvis.kb.store import count, get_store, search
+
+result = {"opened": False, "count": None, "search_ok": None, "error": None}
+try:
+    store = get_store()
+    result["opened"] = True
+    result["count"] = count(store)
+    if result["count"]:
+        try:
+            search("diagnostic probe query", n_results=1, store=store, rerank=False)
+            result["search_ok"] = True
+        except (KBCorruptionError, RAGError) as exc:
+            result["search_ok"] = False
+            result["error"] = str(exc)
+except (RAGError, Exception) as exc:
+    result["error"] = f"{type(exc).__name__}: {exc}"
+print("DOCTOR_RESULT " + json.dumps(result))
+"""
+
+_INDEX_UNREADABLE = """\
+✗ The vector index is damaged beyond reading.
+  Probing it killed a child process outright (signal {signal}), which means the
+  index file itself is unreadable — not a Python-level error that could be
+  caught and reported.
+
+  Your documents are almost certainly fine. Chunk text and metadata live in
+  chroma.sqlite3; only the vectors live in the damaged index, and those are
+  derived data that can be rebuilt.
+
+  Recover with:
+      uv run kb reindex --from-storage
+
+  That reads the chunks straight from SQLite, re-embeds them, and swaps in a
+  fresh index. No LLM calls, nothing re-downloaded."""
+
+
+def _run_doctor_probe() -> "dict | None":
+    """Run the probe in a child. Returns its result, or None if the child died."""
+    import json
+    import subprocess
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _DOCTOR_PROBE], capture_output=True, text=True
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith("DOCTOR_RESULT "):
+            return json.loads(line[len("DOCTOR_RESULT "):])
+    # No result line: the child died before it could report. A negative
+    # returncode is the signal that killed it.
+    print(f"   (probe exited with code {completed.returncode})", file=sys.stderr)
+    if completed.stderr.strip():
+        print("   " + completed.stderr.strip().splitlines()[-1], file=sys.stderr)
+    return None
+
+
 def cmd_doctor() -> None:
     """
-    Diagnose knowledge base health: open the store (exercises the
-    embed-model guard), count chunks, then probe a real search (exercises
-    corruption detection). Exits non-zero on any failure so this is
-    scriptable. No automatic startup probe elsewhere — this is opt-in so a
-    healthy launch never pays the cost.
+    Diagnose knowledge base health: open the store (exercises the embed-model
+    guard), count chunks, then probe a real search (exercises corruption
+    detection). Exits non-zero on any failure so this is scriptable.
 
-    Note: on a badly corrupted store, even count() can hard-segfault the
-    process (a Rust-side ChromaDB crash, uncatchable in Python). If this
-    command dies abruptly with no output beyond "Checking knowledge base...",
-    that abrupt death is itself the diagnosis — run `kb reindex` blind.
-
-    Once the store is confirmed healthy, also checks for legacy PDF notes
-    (see _check_legacy_pdf_notes) — a one-time migration for entries added
-    before local PDFs became always-public papers.
+    The probe runs in a subprocess — see _DOCTOR_PROBE for why that is not
+    optional. Once the store is confirmed healthy, this also checks for legacy
+    PDF notes (see _check_legacy_pdf_notes), a one-time migration for entries
+    added before local PDFs became always-public papers.
     """
-    from jarvis.core.errors import KBCorruptionError, RAGError
-    from .store import count, get_store, search
+    print("Checking knowledge base...", flush=True)
+    result = _run_doctor_probe()
 
-    print("Checking knowledge base...")
-    try:
-        store = get_store()
-    except RAGError as exc:
-        print(f"✗ Failed to open store: {exc}", file=sys.stderr)
+    if result is None:
+        signal_name = "SIGBUS/SIGSEGV"
+        print(_INDEX_UNREADABLE.format(signal=signal_name), file=sys.stderr)
+        sys.exit(1)
+
+    if not result["opened"]:
+        print(f"✗ Failed to open store: {result['error']}", file=sys.stderr)
         sys.exit(1)
     print("✓ Store opened (embedding model matches)")
 
-    try:
-        n = count(store)
-    except Exception as exc:
-        print(f"✗ Failed to count chunks: {exc}", file=sys.stderr)
-        sys.exit(1)
-    print(f"✓ {n} chunk(s) indexed")
-
-    if n == 0:
+    print(f"✓ {result['count']} chunk(s) indexed")
+    if not result["count"]:
         print("Knowledge base is empty — nothing to search-probe.")
         return
 
-    try:
-        search("diagnostic probe query", n_results=1, store=store, rerank=False)
-    except KBCorruptionError as exc:
-        print(f"✗ Search index is corrupted:\n  {exc}", file=sys.stderr)
-        sys.exit(1)
-    except RAGError as exc:
-        print(f"✗ Search failed: {exc}", file=sys.stderr)
+    if result["search_ok"] is False:
+        print(f"✗ Search failed:\n  {result['error']}", file=sys.stderr)
         sys.exit(1)
     print("✓ Search probe succeeded\n\nKnowledge base is healthy.")
 
-    _check_legacy_pdf_notes(store)
+    from .store import get_store
+
+    _check_legacy_pdf_notes(get_store())
 
 
 def _check_legacy_pdf_notes(store) -> None:
@@ -694,8 +967,12 @@ def main() -> None:
                         help="Only import papers with score >= N (default: 0)")
 
     # list / stats / remove / clear
-    p_list = sub.add_parser("list", help="List indexed papers")
+    p_list = sub.add_parser("list", help="List indexed papers, or notes/records with --notes")
     p_list.add_argument("--limit", type=int, default=20)
+    p_list.add_argument("--notes", action="store_true", help="List vault notes/records instead of papers")
+    p_list.add_argument("--category", help="Filter notes by record type, e.g. job_application")
+    p_list.add_argument("--status", help="Filter notes by status, e.g. rejected")
+    p_list.add_argument("--entity", help="Filter notes by organisation or person")
     sub.add_parser("stats", help="Show document and chunk counts")
     p_remove = sub.add_parser("remove", help="Remove a document by source URL")
     p_remove.add_argument("source", help="Source URL of the document to remove")
@@ -719,10 +996,34 @@ def main() -> None:
     p_idx.add_argument("--force", action="store_true", help="Clear existing vault note index first")
 
     # reindex
-    sub.add_parser("reindex", help="Re-embed all chunks with the configured embed_model (no LLM calls)")
+    p_reindex = sub.add_parser(
+        "reindex", help="Re-embed all chunks with the configured embed_model (no LLM calls)"
+    )
+    p_reindex.add_argument(
+        "--from-storage",
+        action="store_true",
+        dest="from_storage",
+        help=(
+            "Read chunks straight from SQLite instead of through the vector index. "
+            "Use when the index is so damaged that kb doctor dies without output."
+        ),
+    )
 
     # doctor
     sub.add_parser("doctor", help="Diagnose knowledge base health (embed model, corruption)")
+
+    # models
+    p_models = sub.add_parser("models", help="List the switchable models your config offers")
+
+    # drafts
+    p_drafts = sub.add_parser("drafts", help="List drafts; --prune sweeps stale ones")
+    p_drafts.add_argument("--prune", action="store_true", help="Remove drafts past the retention window")
+    p_drafts.add_argument("--dry-run", action="store_true", dest="dry_run",
+                          help="With --prune: print what would be removed, remove nothing")
+
+    # schema
+    p_schema = sub.add_parser("schema", help="Show which metadata keys and values exist in the store")
+    p_schema.add_argument("key", nargs="?", help="Show the distinct values of one key")
 
     # sync-status
     sub.add_parser("sync-status", help="Show jarvis-sync daemon health and last job outcomes")
@@ -740,6 +1041,9 @@ def main() -> None:
         "index-vault": lambda: cmd_index_vault(args),
         "reindex":     lambda: cmd_reindex(args),
         "doctor":      cmd_doctor,
+        "models":      lambda: cmd_models(args),
+        "schema":      lambda: cmd_schema(args),
+        "drafts":      lambda: cmd_drafts(args),
         "sync-status": cmd_sync_status,
     }
     dispatch[args.command]()

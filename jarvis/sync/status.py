@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+from jarvis.core.config import get_config
+
 from .daemon import STATUS_FILE, read_status
 
 
@@ -27,8 +29,16 @@ def cmd_sync_status() -> None:
     state = f"running (pid {pid})" if alive else "NOT RUNNING"
     print(f"Daemon:   {state}, started {daemon.get('started_at', '?')}")
 
-    for job in ("digest", "vault_refresh", "pdf_ingest"):
+    digest_enabled = get_config().digest_enabled
+    for job in ("digest", "vault_refresh", "pdf_ingest", "draft_gc"):
         entry = status.get("jobs", {}).get(job)
+        if job == "draft_gc" and get_config().drafts_retention_days <= 0:
+            print(f"{job:14s} disabled ([drafts] retention_days = 0)")
+            continue
+        if job == "digest" and not digest_enabled:
+            # Distinguish "switched off" from "never got around to running".
+            print(f"{job:14s} disabled ([digest] enabled = false)")
+            continue
         if not entry:
             print(f"{job:14s} never run")
             continue

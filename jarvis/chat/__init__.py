@@ -1,3 +1,1 @@
-from .chat import main
-
-__all__ = ["main"]
+"""Chat tools and the agentic loop, driven by the webapp."""
