@@ -1106,13 +1106,16 @@ def _remove_document(args: dict, vault: Path, request_confirmation=None) -> str:
         return f"[remove_document error: {exc}]"
 
 
-def _list_documents(args: dict) -> str:
+def _list_documents(args: dict, provider_str: str) -> str:
     try:
         from jarvis.kb.store import get_store, list_documents
 
         kind = args.get("kind", "papers")
         doc_type = "note" if kind == "notes" else "paper"
         limit = min(int(args.get("limit", 10)), 50)
+        # A private note's title and path are private too, so a cloud
+        # provider only ever gets a listing of public documents.
+        visibility = "public" if is_cloud_provider(provider_str) else None
         documents = list_documents(
             limit=limit,
             doc_type=doc_type,
@@ -1120,6 +1123,7 @@ def _list_documents(args: dict) -> str:
             status=args.get("status"),
             entity=args.get("entity"),
             store=get_store(),
+            visibility=visibility,
         )
         if not documents:
             return f"[No matching {kind} in the knowledge base.]"
@@ -1153,7 +1157,7 @@ def _list_documents(args: dict) -> str:
         return f"[list_documents error: {exc}]"
 
 
-def _kb_stats() -> str:
+def _kb_stats(provider_str: str) -> str:
     try:
         from jarvis.kb.store import (
             count,
@@ -1173,9 +1177,11 @@ def _kb_stats() -> str:
         ]
         # The record vocabulary is the user's, not jarvis's, so list what
         # actually exists — otherwise the model can only guess filter values
-        # for search_kb and quietly get nothing back.
+        # for search_kb and quietly get nothing back. A cloud provider only
+        # sees values used by public notes; the counts above are just numbers.
+        visibility = "public" if is_cloud_provider(provider_str) else None
         for field, label in (("category", "Record types"), ("status", "Statuses")):
-            values = metadata_value_counts(field, store)
+            values = metadata_value_counts(field, store, visibility=visibility)
             if values:
                 shown = sorted(values, key=lambda v: -values[v])[:15]
                 lines.append(f"  {label}: {', '.join(shown)}")
@@ -1530,9 +1536,9 @@ def _dispatch_tool(
     if name == "propose_draft_edit":
         return _propose_draft_edit(arguments, request_edit_review)
     if name == "list_documents":
-        return _list_documents(arguments)
+        return _list_documents(arguments, provider_str)
     if name == "kb_stats":
-        return _kb_stats()
+        return _kb_stats(provider_str)
     if name == "update_file_path":
         return _update_file_path(arguments)
     if name == "update_document_metadata":

@@ -2,6 +2,12 @@
 
 ### NEW FUNCTIONALITY
 
+- Added `jarvis-mcp`, an MCP server that gives Claude Desktop read-only
+  access to your notes and papers (search, read a paper or note, list,
+  counts). Claude Desktop is treated as a cloud model, so private notes are
+  never returned. Setup is in the README under "Use it from Claude Desktop"
+  (PR #5).
+
 - Added `uv run kb server`, which now owns and manages the knowledge base.
   It must be run alongside `jarvis-sync` and the webapp.
   The `kb` commands do not need it as they read the index directly from the database.
@@ -134,6 +140,11 @@
   - Add explicit "USD" next to cost.
 
 ### BUG FIXES
+
+- Fixed private notes leaking to cloud models through listings. The chat
+  `list_documents` tool showed private note titles and paths, and
+  `kb_stats` named the record types and statuses of private notes, to any
+  provider. Both now show cloud models public notes only (PR #5).
 
 - Fix re-adding a document leaving you with nothing when the add process failed 
   part way. Re-adding deletes the old entry and indexes the new one, and

@@ -337,6 +337,40 @@ only) and never writes to your vault.
 
 ---
 
+## Use it from Claude Desktop
+
+`jarvis-mcp` is an MCP server that gives Claude Desktop read-only access to
+your notes and papers: search, read a paper or note in full, list documents,
+and see counts. Claude Desktop sends everything to Anthropic, so it gets
+the same treatment as any cloud model. Notes in your private folders never
+come back, and no setting changes that.
+
+`uv run kb server` has to be running, the same as for the webapp. Then add
+this to `~/Library/Application Support/Claude/claude_desktop_config.json`
+and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "jarvis": {
+      "command": "/absolute/path/to/uv",
+      "args": ["--directory", "/absolute/path/to/jarvis", "run", "jarvis-mcp"]
+    }
+  }
+}
+```
+
+Use the full path to `uv` (`which uv` prints it). Claude Desktop starts
+servers with a minimal `PATH` and won't find it otherwise. Claude Desktop
+starts and stops `jarvis-mcp` itself, so you don't run it by hand. If a tool
+says the knowledge-base server isn't running, start `uv run kb server`. Server
+logs are in `~/Library/Logs/Claude/mcp-server-jarvis.log`.
+
+There are no tools for adding or removing anything. Use the webapp or `kb`
+for that.
+
+---
+
 ## Jarvis sync and index refresh
 
 ```bash
@@ -396,6 +430,7 @@ asleep, it catches up automatically. Run one by hand with
 uv run kb server               # the knowledge base (webapp and sync need it)
 uv run webapp                  # the UI
 uv run jarvis-sync             # background sync
+# jarvis-mcp is started by Claude Desktop, not by hand (see above)
 
 # Knowledge base
 uv run kb index-vault          # re-index your notes (--force for a clean rebuild)

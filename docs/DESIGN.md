@@ -61,6 +61,9 @@ A personal knowledge base and assistant that:
 │   │   ├── paper_summary.md
 │   │   └── digest_scoring.md
 │   │
+│   ├── mcp/
+│   │   └── server.py                # `jarvis-mcp`: read-only MCP server for Claude Desktop
+│   │
 │   ├── drafts/                      # The agent-writable sandbox
 │   │   ├── workspace.py             # Containment policy, drafts, proposals, versions, retention
 │   │   └── render.py                # Markdown preview, LaTeX compile, PDF export (sandboxed)
@@ -98,6 +101,7 @@ A personal knowledge base and assistant that:
 | `jarvis/drafts/workspace.py` | The sandbox: one containment policy for every read and write, drafts, proposals, `.versions/`, retention |
 | `jarvis/drafts/render.py` | Markdown preview, sandboxed LaTeX compilation, PDF export |
 | `jarvis/webapp/` | The UI: FastAPI routes, SSE stream, session state, editor, frontend |
+| `jarvis/mcp/server.py` | `jarvis-mcp`: the read-only chat tools exposed over MCP for Claude Desktop, always as a cloud client |
 | `jarvis/core/llm.py` | Shared: LLM provider abstraction (Ollama, Anthropic, OpenRouter) |
 | `jarvis/core/transcript.py` | Shared: the provider-neutral message format that makes mid-conversation model switching possible |
 | `jarvis/core/config.py` | Shared: central configuration |
@@ -127,6 +131,7 @@ A personal knowledge base and assistant that:
 | `requests` | HTTP client (arXiv PDF download, bioRxiv API, Ollama health check) |
 | `fastapi` | Web framework for the browser UI (`jarvis/webapp/`) |
 | `uvicorn` | ASGI server that runs the FastAPI app |
+| `mcp` | Official MCP Python SDK (2.x, `MCPServer`), used by `jarvis-mcp` over stdio |
 
 ---
 
@@ -141,6 +146,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | `uv run kb` | `jarvis.kb.cli:main` | Manage the knowledge base (CLI), including `kb models` |
 | `uv run convert-pdf` | `jarvis.kb.convert:main` | Convert a PDF to Markdown (standalone) |
 | `uv run webapp` | `jarvis.webapp.run:main` | Start the web UI at `http://127.0.0.1:8080` |
+| `uv run jarvis-mcp` | `jarvis.mcp.server:main` | MCP server over stdio. Claude Desktop launches it; it isn't meant to be run by hand |
 
 ---
 
@@ -361,6 +367,9 @@ values instead of guessing.
 | `"public"` | ✓ | ✓ |
 | `"private"` | ✓ | Raises `PrivacyError`; tool loop terminates immediately |
 
+Claude Desktop, through `jarvis-mcp`, is always in the cloud column. See
+"MCP server" below.
+
 The split is decided by `is_cloud_provider()` (`jarvis/core/llm.py`), a single
 predicate rather than a vendor name, so a newly added provider is covered
 without a code change and an unknown name fails closed.
@@ -425,8 +434,8 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 | `build_text_documents(...)` · `build_annotation_documents(...)` · `build_figure_documents(...)` · `build_paper_documents(...)` | The build half of each `add_*`: turn input into `Document`s, touching nothing (see Staged writes) |
 | `commit_documents(documents, store, replace_source="")` | The only write. Optional delete of a replaced source plus the add, inside one write lock |
 | `search(query, n_results, visibility, doc_type, annotation_kind, rerank=True, category, status, entity, fields, tags)` | Hybrid (dense+BM25, gated by `[rag] hybrid`) or dense-only search with filters, then optional cross-encoder re-ranking; `doc_type` accepts one type or a list (`$in` filter, e.g. `["paper", "digest"]`); raises `KBCorruptionError` on a stale-id failure. Record filters (`category`/`status`/`entity`, plus `fields` for any `x_` key) fold into the **same** `where` clause as the visibility filter, so they can only narrow the already-privacy-filtered pool — privacy holds by construction, not by a second check. `tags` is the exception: with no substring operator in ChromaDB it filters the returned metadata **after** re-ranking, so ask for a larger `n_results` when tag-filtering |
-| `list_documents(limit, doc_type, category, status, entity)` | De-duplicated document list with chunk counts. Papers key on `source`; notes share `source="local"` so they key on `file_path` instead |
-| `metadata_key_counts()` · `metadata_value_counts(key)` | `kb schema` — which metadata keys and values actually exist |
+| `list_documents(limit, doc_type, category, status, entity, visibility)` | De-duplicated document list with chunk counts. Papers key on `source`; notes share `source="local"` so they key on `file_path` instead. Cloud callers pass `visibility="public"`, since a private note's title and path are private too |
+| `metadata_key_counts()` · `metadata_value_counts(key, visibility)` | `kb schema` — which metadata keys and values actually exist. `kb_stats` passes `visibility="public"` under a cloud provider so a private note's category/status isn't shown |
 | `search_with_privacy_check(query, provider, ...)` | Provider-aware; returns `(results, has_private_hits)` |
 | `delete_by_metadata(key, value)` | Delete all chunks matching key=value |
 | `update_paper_metadata(source, title, authors, doi)` | Metadata-only correction of a paper's title/authors/doi |
@@ -1275,8 +1284,8 @@ cues, not answer material.
 | `update_file_path` | Update stored path for a local document without re-embedding | Any |
 | `update_document_metadata` | Set verified title/authors/doi for a paper, metadata-only | Any |
 | `remove_document` | One call: immediately shows a **human** confirmation prompt; only that human answer executes the removal — database entry only, files on disk are never touched (see Security) | Any |
-| `list_documents` | List indexed papers, or notes/records filtered by category/status/entity | Any |
-| `kb_stats` | Document and chunk counts, plus the record types and statuses that actually exist — so the model filters with real values instead of guessing | Any |
+| `list_documents` | List indexed papers, or notes/records filtered by category/status/entity | Public documents only — a private note's title and path never reach a cloud model |
+| `kb_stats` | Document and chunk counts, plus the record types and statuses that actually exist — so the model filters with real values instead of guessing | Counts include everything; record types and statuses come from public notes only |
 | `index_vault` | Incremental vault sync (new/changed/deleted files). No `force` option — the destructive clean rebuild is CLI-only (`kb index-vault --force`) | Any |
 | `use_own_knowledge` | Pseudo-tool called by the LLM before answering from training knowledge; dispatch returns an acknowledgement string; only included in the tools list when `kb_only=False` | Any |
 
@@ -1342,6 +1351,42 @@ a file, so the scary case — "did it just delete my PDF?" — is made
 impossible rather than better-worded.
 
 ---
+
+## MCP server — `jarvis/mcp/server.py` (`jarvis-mcp`)
+
+Gives Claude Desktop read access to the knowledge base over MCP (stdio),
+built on the official SDK's `MCPServer`.
+
+**Always a cloud client.** Claude Desktop sends every tool result to
+Anthropic, so the server calls the chat tool functions with the fixed
+provider string `"anthropic"`. That routes every call through
+`is_cloud_provider` and the existing `PrivacyError` stops. There is no second
+privacy policy here to drift out of sync, and no setting that lets private
+notes through.
+
+**Read-only by design.** Five tools: `search_kb`, `get_document`,
+`read_note` (the chat `read_file`), `list_documents`, `kb_stats`, all
+annotated `read_only_hint`. Write tools were left out: a paper's text is
+untrusted input to the model reading it, and `remove_document`'s human
+confirmation has no out-of-band channel in MCP.
+
+**Thin wrappers, not new logic.** The SDK builds each tool's input schema
+from its Python signature, while the chat functions take an untyped `args`
+dict and return `(text, saw_private)`. Each wrapper supplies typed
+parameters, drops `saw_private` (no session to flag), applies
+`_wrap_retrieved`, and turns a `PrivacyError` into a `ToolError`. The client
+then gets `is_error=True` carrying only the static message. That's the
+nearest MCP equivalent to the webapp ending the turn. `get_document` refuses
+`source="local"` (shared by every vault note) and points at `read_note`.
+
+**Process shape.** The server is long-lived, because Claude Desktop keeps it running,
+so it never calls `allow_direct_index_access()`. It connects to `kb server`,
+and when that's down the tools relay the usual "start `uv run kb server`"
+message. Importing the module never imports `jarvis.kb.store`, so the
+handshake is fast and the embedding models load on the first tool call.
+stdout is the JSON-RPC channel: the start-up config warning is redirected to
+stderr, and while serving, the SDK points fd 1 at stderr, so stray `print`s
+from library code (e.g. "Loading embedding model...") can't corrupt the stream.
 
 ## Sessions — `jarvis/chat/sessions.py`
 

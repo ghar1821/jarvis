@@ -1194,12 +1194,23 @@ def metadata_key_counts(store: Chroma | None = None) -> dict[str, int]:
     return counts
 
 
-def metadata_value_counts(key: str, store: Chroma | None = None) -> dict[str, int]:
-    """Distinct values of one metadata key with their chunk counts."""
+def metadata_value_counts(
+    key: str,
+    store: Chroma | None = None,
+    visibility: str | None = None,
+) -> dict[str, int]:
+    """
+    Distinct values of one metadata key with their chunk counts.
+
+    Pass visibility="public" when the answer goes to a cloud model, since a
+    private note's category or status says something about it on its own.
+    """
     s = store or get_store()
     counts: dict[str, int] = {}
+    # ChromaDB rejects an empty where dict, so only pass one when filtering.
+    where_kwargs = {"where": {"visibility": {"$eq": visibility}}} if visibility else {}
     try:
-        result = s._collection.get(include=["metadatas"])
+        result = s._collection.get(include=["metadatas"], **where_kwargs)
     except Exception as exc:
         raise _diagnose_kb_error(exc, f"Failed to read metadata: {exc}") from exc
     for meta in result["metadatas"] or []:
@@ -1385,6 +1396,7 @@ def list_documents(
     status: str | None = None,
     entity: str | None = None,
     store: Chroma | None = None,
+    visibility: str | None = None,
 ) -> list[dict]:
     """
     De-duplicated list of indexed documents as metadata dicts, most recently
@@ -1396,6 +1408,10 @@ def list_documents(
 
     The default limit returns every document in a single-user KB in one call;
     callers wanting a short preview pass their own smaller limit.
+
+    `visibility` narrows the listing in the same where-clause as the other
+    filters. A cloud caller passes "public": a private note's title and path
+    are private information too, not just its text.
     """
     s = store or get_store()
     conditions: list[dict] = []
@@ -1403,7 +1419,9 @@ def list_documents(
         conditions.append({"doc_type": {"$eq": doc_type}})
     else:
         conditions.append({"doc_type": {"$in": list(doc_type)}})
-    for field, value in (("category", category), ("status", status), ("entity", entity)):
+    for field, value in (
+        ("category", category), ("status", status), ("entity", entity), ("visibility", visibility),
+    ):
         if value:
             conditions.append({field: {"$eq": value}})
     where = conditions[0] if len(conditions) == 1 else {"$and": conditions}

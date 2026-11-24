@@ -25,6 +25,7 @@ dependencies = [
     "latex2mathml>=3.77",
     "ollama>=0.6.2",
     "rank-bm25>=0.2.2",
+    "mcp>=2.3",
 ]
 
 [build-system]
@@ -40,6 +41,7 @@ jarvis-sync = "jarvis.sync.daemon:main"
 convert-pdf = "jarvis.kb.convert:main"
 kb          = "jarvis.kb.cli:main"
 webapp      = "jarvis.webapp.run:main"
+jarvis-mcp  = "jarvis.mcp.server:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

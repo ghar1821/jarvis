@@ -19,7 +19,7 @@ import pytest
 from jarvis.core.config import Config
 from jarvis.core.errors import PrivacyError
 from jarvis.kb.store import add_texts
-from jarvis.chat.chat import _get_document, _search_kb, read_file
+from jarvis.chat.chat import _get_document, _kb_stats, _list_documents, _search_kb, read_file
 
 
 @pytest.fixture
@@ -334,3 +334,64 @@ def test_record_filters_still_exclude_private_from_mixed_results(store, monkeypa
     assert "Acme Bio" not in result
     assert "excluded" in result
     assert saw_private is False
+
+
+# ── Listings and stats must not leak private titles or vocabulary ──────────────
+
+def _add_public_and_private_records(store):
+    """One public and one private note, each with its own title and record values."""
+    for visibility, path, title, category, status in (
+        ("public", "records/beta.md", "Beta Labs application", "job_application", "drafting"),
+        ("private", "private/acme.md", "Acme secret offer", "salary_negotiation", "offer"),
+    ):
+        add_texts(
+            content=f"{title} notes.",
+            doc_type="note", visibility=visibility, source="local",
+            extra_metadata={
+                "file_path": path, "title": title,
+                "category": category, "status": status,
+            },
+            store=store,
+        )
+
+
+def test_list_documents_hides_private_notes_from_a_cloud_provider(store, monkeypatch):
+    """
+    Listing notes under a cloud provider must not reveal a private note's
+    title or path; the local provider still sees both.
+
+    Input:  one public and one private note, kind="notes"
+    Expected output: anthropic lists only the public note; ollama lists both
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    _add_public_and_private_records(store)
+
+    cloud_listing = _list_documents({"kind": "notes"}, "anthropic")
+    assert "Beta Labs application" in cloud_listing
+    assert "Acme secret offer" not in cloud_listing
+    assert "private/acme.md" not in cloud_listing
+
+    local_listing = _list_documents({"kind": "notes"}, "ollama")
+    assert "Beta Labs application" in local_listing
+    assert "Acme secret offer" in local_listing
+
+
+def test_kb_stats_hides_private_record_vocabulary_from_a_cloud_provider(store, monkeypatch):
+    """
+    kb_stats lists record types and statuses so the model can filter with real
+    values. Under a cloud provider those values must come from public notes
+    only — a private note's category is itself private information.
+
+    Input:  public note (job_application/drafting), private note (salary_negotiation/offer)
+    Expected output: anthropic stats name only the public values; ollama names all four
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: store)
+    _add_public_and_private_records(store)
+
+    cloud_stats = _kb_stats("anthropic")
+    assert "job_application" in cloud_stats and "drafting" in cloud_stats
+    assert "salary_negotiation" not in cloud_stats
+    assert "offer" not in cloud_stats
+
+    local_stats = _kb_stats("ollama")
+    assert "salary_negotiation" in local_stats and "offer" in local_stats

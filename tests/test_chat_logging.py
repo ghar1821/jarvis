@@ -46,7 +46,7 @@ def test_kb_stats_failure_is_logged_with_traceback(monkeypatch, caplog, isolated
     monkeypatch.setattr("jarvis.kb.store.get_store", broken_get_store)
 
     with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
-        result = _kb_stats()
+        result = _kb_stats("ollama")
 
     assert result == "[kb_stats error: simulated database failure]"
     assert len(caplog.records) == 1
@@ -63,7 +63,7 @@ def test_list_documents_failure_is_logged(monkeypatch, caplog, isolated_log):
     monkeypatch.setattr("jarvis.kb.store.list_documents", broken_list_documents)
 
     with caplog.at_level(logging.ERROR, logger="jarvis.chat"):
-        result = _list_documents({})
+        result = _list_documents({}, "ollama")
 
     assert result == "[list_documents error: boom]"
     assert any("list_documents tool failed" in r.message for r in caplog.records)
