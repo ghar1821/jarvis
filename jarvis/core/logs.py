@@ -1,15 +1,13 @@
 """
 One place that gives every module somewhere to report a failure to.
 
-Only `chat.py` and the sync daemon used to have a logger, which is why the
-library modules — the vector store, session loading, metadata inference —
-swallowed their exceptions: there was nowhere to send them. A caught error
-with no handler is indistinguishable from no error at all, and the whole
+Library modules — the vector store, the mirror sync, metadata lookup — used
+to swallow their exceptions because there was nowhere to send them. A caught
+error with no handler is indistinguishable from no error at all, and the whole
 reason `~/.jarvis/logs/` exists is to tell those two apart after the fact.
 
 Handlers attach to the `jarvis` logger, so every `jarvis.*` child inherits
-one. `jarvis.chat` keeps its own file and does not propagate, so chat turns
-stay in `chat.log` where they have always been.
+one.
 """
 
 import logging

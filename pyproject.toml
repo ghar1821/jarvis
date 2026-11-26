@@ -1,30 +1,21 @@
 [project]
 name = "jarvis"
 version = "0.1.0"
-description = "Personal knowledge base with arXiv paper digest and LLM agent"
+description = "Your vault and papers as a read-only knowledge base for MCP clients"
 requires-python = ">=3.12"
 dependencies = [
     "requests>=2.33.1",
-    "anthropic>=0.46.0",
-    "openai>=1.60.0",
     "chromadb>=0.6.0",
     "sentence-transformers>=3.0.0",
     "langchain-chroma>=0.1.0",
     "langchain-huggingface>=0.1.0",
     "langchain-text-splitters>=0.3.0",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
-    "apscheduler>=3.10,<4",
     "arxiv>=4.0.0",
     "pymupdf4llm>=1.28.0",
     "pymupdf>=1.28.0",
-    "tomlkit>=0.15.0",
     "pyyaml>=6.0",
-    "markdown-it-py>=3.0",
-    "mdit-py-plugins>=0.4",
-    "latex2mathml>=3.77",
-    "ollama>=0.6.2",
     "rank-bm25>=0.2.2",
+    "mcp>=2.3",
 ]
 
 [build-system]
@@ -35,11 +26,8 @@ build-backend = "setuptools.build_meta"
 include = ["jarvis*"]
 
 [project.scripts]
-run-digest  = "jarvis.digest.pipeline.run:main"
-jarvis-sync = "jarvis.sync.daemon:main"
-convert-pdf = "jarvis.kb.convert:main"
 kb          = "jarvis.kb.cli:main"
-webapp      = "jarvis.webapp.run:main"
+jarvis-mcp  = "jarvis.mcp.server:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
@@ -47,4 +35,4 @@ docs = ["mkdocs-material>=9.6,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: requires live services (Anthropic API key, running Ollama server)"]
+markers = ["real_settle: run the real file-settle poll instead of the instant stub"]

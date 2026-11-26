@@ -1,5 +1,5 @@
 """
-Tests for jarvis/digest/arxiv/fetch.py — arXiv retrieval via the `arxiv` package.
+Tests for jarvis/feeds/arxiv.py — arXiv retrieval via the `arxiv` package.
 
 The arxiv.Client is a genuine network boundary (live HTTP to export.arxiv.org),
 so these tests stub `_client.results` and construct arxiv.Result objects
@@ -14,9 +14,9 @@ from datetime import datetime, timezone
 import arxiv
 import pytest
 
-import jarvis.digest.arxiv.fetch as fetch_mod
+import jarvis.feeds.arxiv as fetch_mod
 import jarvis.core.errors
-from jarvis.digest.arxiv.fetch import _to_paper, deduplicate, fetch_arxiv, fetch_arxiv_paper
+from jarvis.feeds.arxiv import _to_paper, deduplicate, fetch_arxiv
 from jarvis.core.errors import FetchError
 
 
@@ -147,39 +147,6 @@ def test_fetch_arxiv_wraps_library_errors_as_fetch_error(monkeypatch):
     monkeypatch.setattr(fetch_mod._client, "results", broken_results)
     with pytest.raises(FetchError, match="cs.LG"):
         fetch_arxiv("cs.LG", 5)
-
-
-def test_fetch_arxiv_paper_by_id(monkeypatch):
-    """
-    Single-paper fetch strips the version suffix and derives source from the
-    primary category.
-
-    Input:  '2301.07041v2', client stub returning one cs.CL Result
-    Expected output: paper dict with source 'arXiv:cs.CL'; the id_list the
-            client saw contains the version-stripped id
-    """
-    seen_searches = []
-
-    def capture_results(search):
-        seen_searches.append(search)
-        return iter([_make_result(primary_category="cs.CL")])
-
-    monkeypatch.setattr(fetch_mod._client, "results", capture_results)
-    paper = fetch_arxiv_paper("2301.07041v2")
-    assert paper["source"] == "arXiv:cs.CL"
-    assert seen_searches[0].id_list == ["2301.07041"]
-
-
-def test_fetch_arxiv_paper_unknown_id_raises(monkeypatch):
-    """
-    No entry for the given ID surfaces as FetchError after retries.
-
-    Input:  client stub returning no results
-    Expected output: FetchError mentioning the ID
-    """
-    monkeypatch.setattr(fetch_mod._client, "results", lambda search: iter([]))
-    with pytest.raises(FetchError, match="2301.99999"):
-        fetch_arxiv_paper("2301.99999")
 
 
 def test_deduplicate_by_title_case_insensitive():

@@ -7,8 +7,6 @@ delay arXiv's terms of use ask for. The @with_retries layer on top covers
 whole-search failures (connection resets, persistent empty feeds).
 """
 
-import re
-
 import arxiv
 import requests
 
@@ -48,28 +46,6 @@ def fetch_arxiv(cat: str, max_results: int) -> list[dict]:
     if not results:
         raise FetchError(f"arXiv returned no entries for {cat} (transient empty feed?)")
     return [_to_paper(r, f"arXiv:{cat}") for r in results]
-
-
-@with_retries(max_attempts=4, backoff=3.0, exceptions=(FetchError,))
-def fetch_arxiv_paper(arxiv_id: str) -> dict:
-    """
-    Fetch metadata for a single paper by arXiv ID (e.g. '2301.07041').
-
-    Returns a paper dict in the same format as fetch_arxiv().
-    The 'source' field is derived from the entry's primary category
-    (e.g. 'arXiv:cs.LG'), not from the ID prefix.
-    """
-    clean_id = re.sub(r"v\d+$", "", arxiv_id)
-    search = arxiv.Search(id_list=[clean_id])
-    try:
-        results = list(_client.results(search))
-    except (arxiv.ArxivError, requests.RequestException) as exc:
-        raise FetchError(f"arXiv fetch failed for ID {arxiv_id}: {exc}") from exc
-    if not results:
-        raise FetchError(f"No paper found for arXiv ID: {arxiv_id}")
-    result = results[0]
-    source = f"arXiv:{result.primary_category or 'unknown'}"
-    return _to_paper(result, source)
 
 
 def deduplicate(papers: list[dict]) -> list[dict]:

@@ -1,29 +1,15 @@
 """
-Tests for jarvis/kb/store.py — knowledge base operations.
+Tests for jarvis/kb/store.py — storing chunks and searching them.
 
 All tests receive an isolated ChromaDB collection via the `store` fixture
 (see conftest.py) and pass it explicitly using the store= parameter that
 every KB function accepts. The process-wide get_store() singleton is never
-touched here.
+touched here, except by the tests of get_store() itself.
 
 Real HuggingFace embeddings are used throughout — see conftest.py for the
 rationale. Semantically distinct content is used so similarity search returns
-meaningful results.
-
-Sections
---------
-1. add_texts / add_paper     — indexing and idempotency
-2. search                    — visibility filter correctness
-3. search_with_privacy_check — cloud vs local provider access control
-4. delete_by_metadata        — chunk removal
-5. list_documents            — deduplication and chunk count
-6. update_file_path          — in-place metadata update
-7. refresh_vault             — incremental vault sync (add / update / delete)
-8. embedding-model guard
-9. re-ranking
-10. chunk metadata
-11. PDF annotations
-12. corruption detection / hybrid retrieval / verified-metadata loop
+meaningful results. Which files get indexed, and when, is tested in
+test_mirror.py.
 """
 
 import uuid
@@ -37,42 +23,20 @@ from jarvis.core.errors import KBCorruptionError, RAGError
 from jarvis.kb.store import (
     _check_embedding_model_matches,
     _reciprocal_rank_fusion,
-    _title_exists,
     add_annotations,
-    add_figures,
-    add_paper,
-    add_papers_batch,
     add_texts,
     build_text_documents,
     commit_documents,
     count,
     delete_by_metadata,
-    find_pdf_notes,
     get_document_chunks,
-    index_vault_file,
     list_documents,
-    reclassify_notes_as_papers,
-    refresh_vault,
     search,
-    search_with_privacy_check,
     update_file_path,
-    update_paper_metadata,
-    update_visibility,
 )
 
 # Same gitignored store directory the shared fixtures use (see conftest.py).
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _paper(n: int) -> dict:
-    """Minimal paper dict accepted by add_paper()."""
-    return {
-        "link": f"https://arxiv.org/abs/2301.{n:05d}",
-        "title": f"Test Paper {n}",
-        "authors": "Test Author",
-    }
 
 
 # ── 0. Staged writes ───────────────────────────────────────────────────────────
@@ -167,27 +131,6 @@ def test_add_texts_returns_ids_and_increases_count(store):
     assert count(store=store) == before + len(ids)
 
 
-def test_add_paper_is_idempotent(store):
-    """
-    Calling add_paper() twice with the same source URL must not create duplicate
-    entries. The second call returns an empty list and the chunk count is unchanged.
-
-    Input:  the same paper dict passed to add_paper() twice
-    Expected output:
-        first call  → returns non-empty list of IDs
-        second call → returns []
-        count after second call == count after first call
-    """
-    paper = _paper(1)
-    first = add_paper(paper, dense_summary="A study on attention mechanisms.", store=store)
-    assert len(first) > 0
-
-    count_after_first = count(store=store)
-    second = add_paper(paper, dense_summary="A study on attention mechanisms.", store=store)
-    assert second == []
-    assert count(store=store) == count_after_first
-
-
 # ── 2. Search ──────────────────────────────────────────────────────────────────
 
 def test_search_visibility_filter_excludes_private_docs(store):
@@ -221,71 +164,6 @@ def test_search_visibility_filter_excludes_private_docs(store):
     sources = {doc.metadata["source"] for doc in results}
     assert "public-doc" in sources
     assert "private-doc" not in sources
-
-
-# ── 3. Privacy check ───────────────────────────────────────────────────────────
-
-def test_privacy_check_cloud_provider_sees_public_only_and_reports_private_hit(store):
-    """
-    search_with_privacy_check() for a cloud provider ("anthropic") must return
-    only public documents and set has_private_hits=True when private documents
-    also matched the query.
-
-    Input:
-        doc A — visibility="public",  source="pub"
-        doc B — visibility="private", source="priv"
-        provider = "anthropic"
-    Expected output:
-        results contain "pub", not "priv"
-        has_private_hits == True
-    """
-    content = "Contrastive learning creates representations without explicit labels."
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="pub", store=store)
-    add_texts(content=content, doc_type="note", visibility="private",
-              source="priv", store=store)
-
-    results, has_private = search_with_privacy_check(
-        "contrastive learning representations",
-        provider="anthropic",
-        n_results=10,
-        store=store,
-    )
-    sources = {doc.metadata["source"] for doc in results}
-    assert "pub" in sources
-    assert "priv" not in sources
-    assert has_private is True
-
-
-def test_privacy_check_local_provider_sees_all_docs(store):
-    """
-    search_with_privacy_check() for a local provider ("ollama") must return
-    all documents regardless of visibility, and always set has_private_hits=False.
-
-    Input:
-        doc A — visibility="public",  source="pub2"
-        doc B — visibility="private", source="priv2"
-        provider = "ollama"
-    Expected output:
-        results contain both "pub2" and "priv2"
-        has_private_hits == False
-    """
-    content = "Diffusion models learn to reverse a gradual noising process."
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="pub2", store=store)
-    add_texts(content=content, doc_type="note", visibility="private",
-              source="priv2", store=store)
-
-    results, has_private = search_with_privacy_check(
-        "diffusion models denoising",
-        provider="ollama",
-        n_results=10,
-        store=store,
-    )
-    sources = {doc.metadata["source"] for doc in results}
-    assert "pub2" in sources
-    assert "priv2" in sources
-    assert has_private is False
 
 
 # ── 4. Deletion ────────────────────────────────────────────────────────────────
@@ -336,16 +214,17 @@ def test_list_documents_deduplicates_and_reports_chunk_count(store):
     Input:  a long summary that the splitter divides into multiple chunks
     Expected output:
         exactly one entry for that source in list_documents()
-        entry["chunk_count"] == number of IDs returned by add_paper()
+        entry["chunk_count"] == number of IDs returned by add_texts()
     """
-    paper = _paper(99)
+    source = "file:///papers/attention.pdf"
     # Repeat a sentence to exceed the default chunk_size and force multiple chunks
-    long_summary = "Self-attention computes pairwise interactions between all tokens. " * 200
-    ids = add_paper(paper, dense_summary=long_summary, store=store)
-    assert len(ids) > 1, "summary should have produced multiple chunks"
+    long_text = "Self-attention computes pairwise interactions between all tokens. " * 200
+    ids = add_texts(content=long_text, doc_type="paper", visibility="public",
+                    source=source, extra_metadata={"title": "Attention"}, store=store)
+    assert len(ids) > 1, "the text should have produced multiple chunks"
 
     papers = list_documents(store=store)
-    matches = [p for p in papers if p["source"] == paper["link"]]
+    matches = [p for p in papers if p["source"] == source]
     assert len(matches) == 1
     assert matches[0]["chunk_count"] == len(ids)
 
@@ -450,127 +329,6 @@ def test_get_document_chunks_unknown_source_returns_empty_list(store):
     Expected output: []
     """
     assert get_document_chunks("file:///does/not/exist.pdf", store=store) == []
-
-
-# ── 7. Vault sync ──────────────────────────────────────────────────────────────
-
-def test_refresh_vault_adds_new_files(tmp_path, store):
-    """
-    On first run against a vault, refresh_vault indexes every .md file it finds.
-
-    Input:  two .md files in the vault root, empty store
-    Expected output: (added=2, updated=0, deleted=0)
-    """
-    (tmp_path / "note_a.md").write_text("# Note A\nContent about machine learning.")
-    (tmp_path / "note_b.md").write_text("# Note B\nContent about bioinformatics.")
-
-    added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
-    assert added == 2
-    assert updated == 0
-    assert deleted == 0
-
-
-def test_refresh_vault_reindexes_changed_files(tmp_path, store):
-    """
-    On a subsequent run, refresh_vault detects files whose SHA-256 hash has
-    changed and re-indexes them. Unchanged files are skipped.
-
-    Input:  vault indexed once; one file is then modified
-    Expected output: second run returns (added=0, updated=1, deleted=0)
-    """
-    note = tmp_path / "note.md"
-    note.write_text("# Note\nOriginal content about neural networks.")
-    refresh_vault(vault_root=tmp_path, store=store)
-
-    note.write_text("# Note\nCompletely rewritten — now about genomics instead.")
-    added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
-    assert added == 0
-    assert updated == 1
-    assert deleted == 0
-
-
-def test_refresh_vault_removes_deleted_files(tmp_path, store):
-    """
-    When a previously indexed .md file no longer exists on disk, refresh_vault
-    removes its chunks from the store.
-
-    Input:  vault indexed once; one file is then deleted from disk
-    Expected output: second run returns (added=0, updated=0, deleted=1)
-    """
-    note = tmp_path / "note.md"
-    note.write_text("# Note\nContent that will be removed from the vault.")
-    refresh_vault(vault_root=tmp_path, store=store)
-
-    note.unlink()
-    added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
-    assert added == 0
-    assert updated == 0
-    assert deleted == 1
-
-
-def test_refresh_vault_updates_visibility_when_config_reclassifies_dir(
-    tmp_path, store, monkeypatch
-):
-    """
-    A note whose content and path are unchanged must still get its visibility
-    metadata re-checked: when private_vault_dirs gains the note's folder, the
-    stored chunks flip to private without re-embedding.
-
-    Input:  vault with confidential/note.md indexed while private_vault_dirs
-            is ["private"]; config then changes to ["private", "confidential"]
-    Expected output: second refresh reports updated=1 and the stored chunk's
-            visibility is "private"
-    """
-    monkeypatch.setattr(
-        "jarvis.kb.store.get_config",
-        lambda: Config(private_vault_dirs=["private"]),
-    )
-    (tmp_path / "confidential").mkdir()
-    note = tmp_path / "confidential" / "note.md"
-    note.write_text("# Secret plans\nContent that should become private.")
-    refresh_vault(vault_root=tmp_path, store=store)
-
-    stored = store._collection.get(
-        where={"file_path": {"$eq": "confidential/note.md"}}, include=["metadatas"]
-    )
-    assert stored["metadatas"][0]["visibility"] == "public"
-
-    monkeypatch.setattr(
-        "jarvis.kb.store.get_config",
-        lambda: Config(private_vault_dirs=["private", "confidential"]),
-    )
-    added, updated, deleted = refresh_vault(vault_root=tmp_path, store=store)
-    assert (added, updated, deleted) == (0, 1, 0)
-
-    stored = store._collection.get(
-        where={"file_path": {"$eq": "confidential/note.md"}}, include=["metadatas"]
-    )
-    assert all(m["visibility"] == "private" for m in stored["metadatas"])
-
-
-def test_update_visibility_updates_metadata_only(store):
-    """
-    update_visibility rewrites the visibility field for every chunk of a note
-    and leaves content untouched.
-
-    Input:  a public note with one chunk; update_visibility(..., "private")
-    Expected output: returns 1; chunk metadata now private; document text unchanged
-    """
-    add_texts(content="A note about lab meetings.", doc_type="note",
-              visibility="public", source="local",
-              extra_metadata={"file_path": "meetings.md"}, store=store)
-
-    changed = update_visibility("meetings.md", "private", store)
-    assert changed == 1
-
-    stored = store._collection.get(
-        where={"file_path": {"$eq": "meetings.md"}},
-        include=["metadatas", "documents"],
-    )
-    assert stored["metadatas"][0]["visibility"] == "private"
-    assert stored["documents"][0] == "A note about lab meetings."
-
-    assert update_visibility("no-such-file.md", "private", store) == 0
 
 
 # ── 8. Embedding-model guard ────────────────────────────────────────────────────
@@ -810,58 +568,12 @@ def test_search_annotation_kind_filter(store, tmp_path):
     assert all(doc.metadata["annotation_kind"] == "highlight" for doc in results)
 
 
-# ── Title-based dedup ───────────────────────────────────────────────────────────
-
-def test_title_exists_normalises_case_and_whitespace(store):
-    """
-    _title_exists matches on the normalised title (lowercased, whitespace
-    collapsed), so a paper arriving via a second source is recognised.
-    """
-    add_paper(_paper(1), dense_summary="A summary.", store=store)  # title "Test Paper 1"
-    assert _title_exists("Test Paper 1", store) is True
-    assert _title_exists("  test   paper 1 ", store) is True  # case + whitespace
-    assert _title_exists("Some Other Paper", store) is False
-    assert _title_exists("", store) is False
-
-
-def test_add_paper_skips_on_title_match_from_different_source(store):
-    """
-    A paper with a new source URL but a title already in the KB is skipped —
-    this is what stops arXiv+bioRxiv duplicates of the same paper.
-    """
-    add_paper(_paper(2), dense_summary="First copy.", store=store)
-    same_title_new_source = {
-        "link": "https://doi.org/10.1101/duplicate",  # different URL
-        "title": "Test Paper 2",                       # same title
-        "authors": "Test Author",
-    }
-    assert add_paper(same_title_new_source, dense_summary="Second copy.", store=store) == []
-
-
-def test_add_paper_allow_duplicate_forces_the_add(store):
-    """allow_duplicate bypasses both the source and title guards."""
-    add_paper(_paper(3), dense_summary="Original.", store=store)
-    forced = add_paper(_paper(3), dense_summary="Forced.", store=store, allow_duplicate=True)
-    assert forced  # non-empty: it really added
-
-
-def test_add_papers_batch_reports_added_and_skipped(store):
-    """add_papers_batch returns (added, skipped); a repeat title counts as skipped."""
-    entries = [
-        (_paper(10), {"summary": "s", "why": "w", "score": 9, "track": "T"}),
-        (_paper(10), {"summary": "s", "why": "w", "score": 9, "track": "T"}),  # dup
-    ]
-    added, skipped = add_papers_batch(entries, store=store)
-    assert added == 1
-    assert skipped == 1
-
-
 # ── 12. Corruption detection ────────────────────────────────────────────────────
 
 def test_search_raises_kb_corruption_error_on_id_lookup_failure(store, monkeypatch):
     """
     A ChromaDB "Error finding id" failure (a stale HNSW reference to a deleted
-    chunk) must surface as KBCorruptionError naming `kb reindex` as the fix —
+    chunk) must surface as KBCorruptionError naming `kb rebuild` as the fix —
     not a generic RAGError the LLM would paraphrase into something useless.
     """
     monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
@@ -871,7 +583,7 @@ def test_search_raises_kb_corruption_error_on_id_lookup_failure(store, monkeypat
 
     monkeypatch.setattr(store, "similarity_search", broken_similarity_search)
 
-    with pytest.raises(KBCorruptionError, match="kb reindex"):
+    with pytest.raises(KBCorruptionError, match="kb rebuild"):
         search("anything", store=store, rerank=False)
 
 
@@ -909,17 +621,17 @@ def test_search_raises_kb_corruption_error_on_hybrid_path(store, monkeypatch):
 
     monkeypatch.setattr(store._collection, "query", broken_query)
 
-    with pytest.raises(KBCorruptionError, match="kb reindex"):
+    with pytest.raises(KBCorruptionError, match="kb rebuild"):
         search("anything", store=store, rerank=False)
 
 
-def test_search_diagnoses_stale_collection_handle_after_reindex(store, monkeypatch):
+def test_search_diagnoses_stale_collection_handle_after_rebuild(store, monkeypatch):
     """
-    `kb reindex` swaps in a rebuilt collection with a new UUID; a process that
+    `kb rebuild` swaps in a rebuilt collection with a new UUID; a process that
     was already running still holds the old handle, and every operation then
     fails with "Collection [...] does not exist". That must surface as a
     diagnosis naming the fix (restart the process) — not as a generic
-    RAGError, and definitely not as advice to run reindex again.
+    RAGError, and definitely not as advice to run a rebuild again.
     """
     monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
 
@@ -935,9 +647,9 @@ def test_search_diagnoses_stale_collection_handle_after_reindex(store, monkeypat
         search("anything", store=store, rerank=False)
 
 
-def test_add_texts_diagnoses_stale_collection_handle_after_reindex(store, monkeypatch):
+def test_add_texts_diagnoses_stale_collection_handle_after_rebuild(store, monkeypatch):
     """The same stale-handle diagnosis must fire on the write path — that is
-    where the webapp actually hit it (indexing exchanges after a turn)."""
+    where a long-lived process hits it when it next indexes something."""
 
     def stale_add_documents(*args, **kwargs):
         raise Exception(
@@ -1018,45 +730,13 @@ def test_reciprocal_rank_fusion_favours_ids_ranked_high_in_both_lists():
     assert set(fused[2:]) == {"c", "d"}
 
 
-# ── 15. Verified-metadata loop ─────────────────────────────────────────────────
-
-def test_add_paper_content_includes_authors_line(store):
-    """
-    An author-name query needs the authors to appear somewhere in the
-    embedded text — add_paper's content now includes an authors line.
-    """
-    paper = {
-        "link": "https://arxiv.org/abs/9999.00001",
-        "title": "Attention Is All You Need",
-        "authors": "Ashish Vaswani, Noam Shazeer",
-    }
-    add_paper(paper, dense_summary="Introduces the Transformer architecture.", store=store)
-    stored = store._collection.get(where={"source": {"$eq": paper["link"]}}, include=["documents"])
-    assert any("Ashish Vaswani, Noam Shazeer" in doc for doc in stored["documents"])
-
-
-def test_update_paper_metadata_sets_only_the_given_fields(store):
-    """
-    update_paper_metadata applies a human correction metadata-only — only
-    the fields the caller passes are changed on every chunk.
-    """
-    paper = _paper(50)
-    ids = add_paper(paper, dense_summary="Summary text.", store=store)
-
-    n = update_paper_metadata(paper["link"], title="Corrected Title", store=store)
-    assert n == len(ids)
-
-    stored = store._collection.get(where={"source": {"$eq": paper["link"]}}, include=["metadatas"])
-    assert all(m["title"] == "Corrected Title" for m in stored["metadatas"])
-
-
 # ── 16. doc_type list filter (papers + digests) ────────────────────────────────
 
 def test_search_doc_type_list_returns_papers_and_digests(store):
     """
     search() with a doc_type LIST must return documents of every listed type
-    and still exclude the rest — this is what lets retrieve_papers surface
-    weekly digest documents alongside individually indexed papers.
+    and still exclude the rest — this is what keeps digest documents indexed
+    by older versions findable under the "papers" kind until a rebuild.
 
     All three documents share the same content, so the doc_type filter (not
     relevance) must do the discrimination.
@@ -1080,422 +760,6 @@ def test_search_doc_type_list_returns_papers_and_digests(store):
     assert {doc.metadata["doc_type"] for doc in only_papers} == {"paper"}
 
 
-# ── 17. add_figures enabled override ───────────────────────────────────────────
-
-def _one_figure_pdf(tmp_path: Path) -> Path:
-    """A single-page PDF containing one 300×300 embedded image."""
-    import pymupdf
-
-    pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 300, 300), False)
-    pixmap.set_rect(pixmap.irect, (200, 30, 30))
-    doc = pymupdf.open()
-    page = doc.new_page()
-    page.insert_image(pymupdf.Rect(0, 0, 300, 300), stream=pixmap.tobytes("png"))
-    pdf_path = tmp_path / "figure.pdf"
-    doc.save(str(pdf_path))
-    doc.close()
-    return pdf_path
-
-
-class _CountingVisionProvider:
-    """Canned describe_image that counts how often the vision model runs."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def describe_image(self, image_bytes: bytes, context: str, cancel=None) -> str:
-        self.calls += 1
-        return "A bar chart comparing methods."
-
-
-def test_add_figures_enabled_true_forces_captioning_despite_config_off(
-    store, tmp_path, monkeypatch
-):
-    """
-    enabled=True is the per-document opt-in (kb add --figures / with_figures):
-    figures are captioned and indexed even though figure_captions defaults to
-    False in config.
-    """
-    monkeypatch.setattr(
-        "jarvis.kb.store.get_config", lambda: Config(rag_dir=tmp_path / "rag")
-    )
-    pdf_path = _one_figure_pdf(tmp_path)
-    provider = _CountingVisionProvider()
-
-    ids = add_figures(
-        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
-        provider_obj=provider, provider_str="ollama", title="Figure Paper",
-        store=store, enabled=True,
-    )
-    assert len(ids) == 1
-    assert provider.calls == 1
-
-
-def test_add_figures_enabled_none_respects_config(store, tmp_path, monkeypatch):
-    """
-    enabled=None defers to cfg.figure_captions: nothing happens under the
-    default (off), and flipping the config on enables captioning without any
-    per-call opt-in.
-    """
-    pdf_path = _one_figure_pdf(tmp_path)
-    provider = _CountingVisionProvider()
-
-    monkeypatch.setattr(
-        "jarvis.kb.store.get_config", lambda: Config(rag_dir=tmp_path / "rag")
-    )
-    ids = add_figures(
-        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
-        provider_obj=provider, provider_str="ollama", title="Figure Paper",
-        store=store, enabled=None,
-    )
-    assert ids == []
-    assert provider.calls == 0
-
-    monkeypatch.setattr(
-        "jarvis.kb.store.get_config",
-        lambda: Config(rag_dir=tmp_path / "rag", figure_captions=True),
-    )
-    ids = add_figures(
-        pdf_path, doc_type="paper", visibility="public", source=pdf_path.as_uri(),
-        provider_obj=provider, provider_str="ollama", title="Figure Paper",
-        store=store, enabled=None,
-    )
-    assert len(ids) == 1
-    assert provider.calls == 1
-
-
-# ── 18. Legacy PDF-note migration (kb doctor) ──────────────────────────────────
-
-
-def test_find_pdf_notes_ignores_vault_md_notes(store):
-    """
-    A vault .md note (relative file_path) must never be reported as a legacy
-    PDF note — only an absolute .pdf file_path counts.
-    """
-    add_texts(
-        content="A note about lab meetings.", doc_type="note", visibility="public",
-        source="local", extra_metadata={"file_path": "meetings.md", "title": "Meetings"},
-        store=store,
-    )
-    assert find_pdf_notes(store) == []
-
-
-def test_find_pdf_notes_groups_by_source_and_reports_visibility(store, tmp_path):
-    """
-    A legacy PDF note is reported once per source (not once per chunk), with
-    its title, visibility, and chunk count.
-    """
-    fake_pdf = tmp_path / "paper.pdf"
-    fake_pdf.write_bytes(b"%PDF fake content")
-    source = fake_pdf.as_uri()
-    add_texts(
-        content="Body text of a legacy PDF note.",
-        doc_type="note", visibility="public", source=source,
-        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
-                         "content_hash": "abc123", "storage_mode": "full_text"},
-        store=store,
-    )
-    # A second chunk of the same document (e.g. an annotation) must not be
-    # double-counted as a separate document.
-    add_texts(
-        content="[HIGHLIGHT p.1] An important passage.",
-        doc_type="note", visibility="public", source=source,
-        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
-                         "annotation_kind": "highlight"},
-        store=store,
-    )
-
-    found = find_pdf_notes(store)
-    assert len(found) == 1
-    assert found[0]["source"] == source
-    assert found[0]["title"] == "Legacy Note"
-    assert found[0]["visibility"] == "public"
-    assert found[0]["chunk_count"] == 2
-
-
-def test_reclassify_notes_as_papers_flips_doc_type_only(store, tmp_path):
-    """
-    Reclassifying a legacy PDF note to a paper flips only doc_type — every
-    other field (content_hash, storage_mode, file_path, visibility) is left
-    exactly as it was, matching the shape a daemon-ingested paper carries.
-    """
-    fake_pdf = tmp_path / "paper.pdf"
-    fake_pdf.write_bytes(b"%PDF fake content")
-    source = fake_pdf.as_uri()
-    add_texts(
-        content="Body text of a legacy PDF note.",
-        doc_type="note", visibility="public", source=source,
-        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
-                         "content_hash": "abc123", "storage_mode": "full_text"},
-        store=store,
-    )
-
-    n = reclassify_notes_as_papers([source], store)
-    assert n == 1
-
-    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
-    meta = stored["metadatas"][0]
-    assert meta["doc_type"] == "paper"
-    assert meta["content_hash"] == "abc123"
-    assert meta["storage_mode"] == "full_text"
-    assert meta["file_path"] == str(fake_pdf)
-    assert meta["visibility"] == "public"
-
-    # A reclassified document is no longer reported by find_pdf_notes.
-    assert find_pdf_notes(store) == []
-
-
-def test_reclassify_notes_as_papers_empty_sources_is_a_noop(store):
-    """An empty source list is a no-op, not an error."""
-    assert reclassify_notes_as_papers([], store) == 0
-
-
-# ── Records: frontmatter indexing, filtered search, schema migration ───────────
-
-def _write_record(vault, rel_path, frontmatter, body):
-    path = vault / rel_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"---\n{frontmatter}\n---\n\n{body}\n", encoding="utf-8")
-    return path
-
-
-def test_vault_note_frontmatter_becomes_filterable_metadata(store, tmp_path):
-    """
-    A record's frontmatter lands on every chunk as flat metadata, and the
-    frontmatter block itself is stripped from the indexed text.
-    """
-    vault = tmp_path / "vault"
-    path = _write_record(
-        vault, "records/acme.md",
-        "type: job_application\nentity: Acme Bio\nstatus: rejected\n"
-        "date: 2026-05-02\ntags: [remote, senior]\nvenue: NeurIPS",
-        "# Senior Bioinformatician\n\nRejected after the technical screen.",
-    )
-
-    index_vault_file(path, vault, store)
-
-    metadatas = store._collection.get(include=["metadatas"])["metadatas"]
-    assert metadatas
-    for meta in metadatas:
-        assert meta["category"] == "job_application"
-        assert meta["entity"] == "Acme Bio"
-        assert meta["status"] == "rejected"
-        assert meta["event_date"] == "2026-05-02"
-        assert meta["tags"] == "|remote|senior|"
-        assert meta["x_venue"] == "NeurIPS"
-        # Still a plain note as far as every existing privacy/delete path is
-        # concerned — records ride on doc_type, they don't replace it.
-        assert meta["doc_type"] == "note"
-        assert meta["visibility"] == "public"
-
-    documents = store._collection.get(include=["documents"])["documents"]
-    assert not any("type: job_application" in d for d in documents)
-
-
-def test_search_filters_narrow_by_record_fields(store, tmp_path):
-    """
-    category/status/entity filters select records; they fold into the same
-    where-clause as the privacy filter, so they can only ever narrow.
-    """
-    vault = tmp_path / "vault"
-    index_vault_file(
-        _write_record(vault, "a.md", "type: job_application\nentity: Acme Bio\nstatus: rejected",
-                      "# Acme\n\nBioinformatics role, technical screen."),
-        vault, store)
-    index_vault_file(
-        _write_record(vault, "b.md", "type: job_application\nentity: Beta Labs\nstatus: applied",
-                      "# Beta\n\nBioinformatics role, waiting to hear back."),
-        vault, store)
-    index_vault_file(
-        _write_record(vault, "c.md", "type: manuscript\nstatus: drafting",
-                      "# Paper\n\nBioinformatics methods manuscript."),
-        vault, store)
-
-    rejected = search("bioinformatics role", n_results=10, category="job_application",
-                      status="rejected", store=store)
-    assert {d.metadata["entity"] for d in rejected} == {"Acme Bio"}
-
-    applications = search("bioinformatics", n_results=10, category="job_application", store=store)
-    assert {d.metadata["entity"] for d in applications} == {"Acme Bio", "Beta Labs"}
-
-    manuscripts = search("bioinformatics", n_results=10, category="manuscript", store=store)
-    assert all(d.metadata["category"] == "manuscript" for d in manuscripts)
-
-
-def test_search_filters_on_a_custom_frontmatter_field(store, tmp_path):
-    """A key jarvis has never heard of is filterable without any code change."""
-    vault = tmp_path / "vault"
-    index_vault_file(
-        _write_record(vault, "a.md", "type: manuscript\nvenue: NeurIPS", "# A\n\nDraft about retrieval."),
-        vault, store)
-    index_vault_file(
-        _write_record(vault, "b.md", "type: manuscript\nvenue: ICML", "# B\n\nDraft about retrieval."),
-        vault, store)
-
-    results = search("retrieval draft", n_results=10, fields={"x_venue": "NeurIPS"}, store=store)
-    assert results
-    assert all(d.metadata["x_venue"] == "NeurIPS" for d in results)
-
-
-def test_tag_filter_requires_every_tag(store, tmp_path):
-    vault = tmp_path / "vault"
-    index_vault_file(
-        _write_record(vault, "a.md", "type: job_application\ntags: [remote, senior]",
-                      "# A\n\nA role with flexible hours."),
-        vault, store)
-    index_vault_file(
-        _write_record(vault, "b.md", "type: job_application\ntags: [remote]",
-                      "# B\n\nA role with flexible hours."),
-        vault, store)
-
-    both = search("flexible role", n_results=10, tags=["remote", "senior"], store=store)
-    assert {d.metadata["file_path"] for d in both} == {"a.md"}
-
-    either = search("flexible role", n_results=10, tags=["remote"], store=store)
-    assert {d.metadata["file_path"] for d in either} == {"a.md", "b.md"}
-
-
-def test_record_header_is_embedded_so_status_queries_match(store, tmp_path):
-    """
-    The record header rides in every chunk's embedded text, so a query phrased
-    in terms of the record's identity finds it even though the body never uses
-    those words. This is the reuse of the papers' embed_header mechanism.
-    """
-    vault = tmp_path / "vault"
-    index_vault_file(
-        _write_record(vault, "acme.md", "type: job_application\nentity: Acme Bio\nstatus: rejected",
-                      "# Senior Bioinformatician\n\nThey wanted more Rust experience."),
-        vault, store)
-
-    results = search("rejected job application", n_results=5, store=store)
-    assert any(d.metadata.get("entity") == "Acme Bio" for d in results)
-
-
-def test_refresh_vault_backfills_notes_indexed_under_an_older_schema(store, tmp_path):
-    """
-    A note whose meta_schema is behind is treated as changed, so the backfill
-    happens on the next daemon sweep with no user action and no migration
-    script — even though its content hash is unchanged.
-    """
-    from jarvis.kb.frontmatter import META_SCHEMA
-
-    vault = tmp_path / "vault"
-    path = _write_record(vault, "a.md", "type: job_application\nstatus: rejected", "# A\n\nBody.")
-    index_vault_file(path, vault, store)
-
-    # Stamp an older schema version on the stored chunks, standing in for a
-    # note indexed before record metadata existed. (Chroma's update merges
-    # metadata keys rather than replacing the dict, so the version marker is
-    # what the migration actually keys on — which is the point of having one.)
-    stored = store._collection.get(include=["metadatas"])
-    store._collection.update(
-        ids=stored["ids"],
-        metadatas=[{**meta, "meta_schema": 0} for meta in stored["metadatas"]],
-    )
-
-    added, updated, deleted = refresh_vault(vault, store)
-
-    assert (added, updated, deleted) == (0, 1, 0)
-    for meta in store._collection.get(include=["metadatas"])["metadatas"]:
-        assert meta["category"] == "job_application"
-        assert meta["meta_schema"] == META_SCHEMA
-
-
-def test_schema_migration_does_not_re_embed_a_note_without_frontmatter(store, tmp_path):
-    """
-    The common case: a plain note gains nothing from a re-index except the
-    schema marker, so it must be stamped in place. Re-embedding an entire
-    vault to record that most of it had nothing to record is pure cost — and
-    a delete-then-re-add leaves a window where the note is missing.
-
-    Proven by watching the chunk ids: a metadata-only update keeps them, a
-    delete-and-re-add cannot.
-    """
-    vault = tmp_path / "vault"
-    plain = vault / "plain.md"
-    plain.parent.mkdir(parents=True, exist_ok=True)
-    plain.write_text("# Plain\n\nNo frontmatter here.\n", encoding="utf-8")
-    index_vault_file(plain, vault, store)
-
-    before = store._collection.get(include=[])["ids"]
-    stored = store._collection.get(include=["metadatas"])
-    store._collection.update(
-        ids=stored["ids"],
-        metadatas=[{**m, "meta_schema": 0} for m in stored["metadatas"]],
-    )
-
-    assert refresh_vault(vault, store) == (0, 1, 0)
-
-    after = store._collection.get(include=["metadatas"])
-    assert sorted(after["ids"]) == sorted(before), "chunks were re-created, not stamped"
-    assert all(m["meta_schema"] == 1 for m in after["metadatas"])
-
-
-def test_schema_migration_re_indexes_a_note_that_has_frontmatter(store, tmp_path):
-    """
-    A note WITH frontmatter genuinely changes on re-index — the block is now
-    stripped from the indexed body and the record header joins the embedded
-    text — so this one has to be rebuilt rather than stamped.
-    """
-    vault = tmp_path / "vault"
-    path = _write_record(vault, "a.md", "type: manuscript\nstatus: drafting", "# A\n\nBody.")
-    index_vault_file(path, vault, store)
-
-    stored = store._collection.get(include=["metadatas"])
-    store._collection.update(
-        ids=stored["ids"],
-        metadatas=[
-            {**{k: v for k, v in m.items()}, "meta_schema": 0, "category": "stale"}
-            for m in stored["metadatas"]
-        ],
-    )
-
-    assert refresh_vault(vault, store) == (0, 1, 0)
-
-    for meta in store._collection.get(include=["metadatas"])["metadatas"]:
-        assert meta["category"] == "manuscript"   # re-read from the file
-        assert meta["meta_schema"] == 1
-    for document in store._collection.get(include=["documents"])["documents"]:
-        assert "type: manuscript" not in document   # block stripped from the body
-
-
-def test_refresh_vault_leaves_current_schema_notes_alone(store, tmp_path):
-    """
-    Every note carries meta_schema, frontmatter or not — otherwise a plain note
-    would look perpetually out of date and re-index on every single sweep.
-    """
-    vault = tmp_path / "vault"
-    plain = vault / "plain.md"
-    plain.parent.mkdir(parents=True, exist_ok=True)
-    plain.write_text("# Plain\n\nNo frontmatter here.\n", encoding="utf-8")
-    refresh_vault(vault, store)
-
-    assert refresh_vault(vault, store) == (0, 0, 0)
-
-
-def test_metadata_key_and_value_counts_expose_the_user_ontology(store, tmp_path):
-    """
-    `kb schema` exists so a typo in a status ("stauts") shows up as its own key
-    rather than silently never matching a filter.
-    """
-    from jarvis.kb.store import metadata_key_counts, metadata_value_counts
-
-    vault = tmp_path / "vault"
-    index_vault_file(
-        _write_record(vault, "a.md", "type: job_application\nstatus: rejected", "# A\n\nBody."),
-        vault, store)
-    index_vault_file(
-        _write_record(vault, "b.md", "type: job_application\nstauts: applied", "# B\n\nBody."),
-        vault, store)
-
-    keys = metadata_key_counts(store)
-    assert keys["category"] >= 2
-    assert "x_stauts" in keys  # the typo is visible, not silently ignored
-
-    statuses = metadata_value_counts("status", store)
-    assert set(statuses) == {"rejected"}
-
-
 # ── Who owns the index ─────────────────────────────────────────────────────────
 #
 # The knowledge-base server owns the index; everything else connects to it.
@@ -1506,7 +770,7 @@ def test_metadata_key_and_value_counts_expose_the_user_ontology(store, tmp_path)
 
 def test_get_store_refuses_to_open_directly_when_the_server_is_down(monkeypatch, tmp_path):
     """
-    The webapp and the sync daemon must fail loudly, naming the fix. Falling
+    jarvis-mcp and kb serve's sync must fail loudly, naming the fix. Falling
     back to opening the files would recreate the bug the server exists to
     remove: a long-lived reader caching a copy of the vector index while
     another process rewrites it.
@@ -1521,7 +785,7 @@ def test_get_store_refuses_to_open_directly_when_the_server_is_down(monkeypatch,
 
     monkeypatch.setattr(store_module, "_server_client", no_server)
 
-    with pytest.raises(RAGError, match="uv run kb server"):
+    with pytest.raises(RAGError, match="uv run kb serve"):
         store_module.get_store()
 
 
@@ -1587,7 +851,7 @@ def test_a_connection_reset_is_not_reported_as_a_stopped_server(store, monkeypat
 
     with pytest.raises(RAGError) as caught:
         search("anything", store=store, rerank=False)
-    assert "uv run kb server" not in str(caught.value)
+    assert "uv run kb serve" not in str(caught.value)
 
 
 def test_telemetry_is_disabled_before_any_library_is_imported():

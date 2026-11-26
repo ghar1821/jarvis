@@ -8,19 +8,15 @@ from typing import Callable, TypeVar
 F = TypeVar("F", bound=Callable)
 
 
-class PaperDigestError(Exception):
-    """Base exception for all paper_digest errors."""
+class JarvisError(Exception):
+    """Base exception for all jarvis errors."""
 
 
-class FetchError(PaperDigestError):
-    """Failed to fetch from an external service (arXiv, etc.)."""
+class FetchError(JarvisError):
+    """Failed to fetch from an external service (arXiv, bioRxiv, Crossref)."""
 
 
-class LLMError(PaperDigestError):
-    """LLM call failed or returned an unparseable response."""
-
-
-class RAGError(PaperDigestError):
+class RAGError(JarvisError):
     """Vector database operation failed."""
 
 
@@ -28,7 +24,7 @@ class KBCorruptionError(RAGError):
     """
     Raised when the knowledge-base index cannot resolve a chunk id it holds a
     reference to ("Error finding id"), or still names a collection that was
-    replaced by `kb reindex`.
+    replaced by `kb rebuild`.
 
     Historically this was diagnosed as on-disk corruption. That was wrong: the
     usual cause was a process holding a cached copy of the vector index while
@@ -41,33 +37,8 @@ class KBCorruptionError(RAGError):
     """
 
 
-class ConversionError(PaperDigestError):
+class ConversionError(JarvisError):
     """PDF-to-Markdown conversion produced no usable text (e.g. scanned/image-only PDF)."""
-
-
-class AuthenticationError(PaperDigestError):
-    """Missing or invalid credentials for an LLM provider."""
-
-
-class PrivacyError(PaperDigestError):
-    """
-    Raised when a cloud provider attempts to access private content.
-
-    Caught by agentic_turn() to terminate the tool loop immediately —
-    no further LLM calls are made after this is raised. This is a hard
-    prompt-injection defence: private notes may contain adversarial content
-    that must never reach a cloud model, even as a tool result.
-    """
-
-
-class TurnCancelled(PaperDigestError):
-    """
-    Raised when the human stops a chat turn while it is in flight.
-
-    Deliberately NOT an LLMError: the LLMError handlers turn a failure into a
-    "⚠️ ..." assistant reply saved to the session, and a stopped turn must
-    leave no trace at all. Callers catch this to roll the turn back instead.
-    """
 
 
 def with_retries(
@@ -80,13 +51,16 @@ def with_retries(
 
     Each failed attempt waits backoff * 2**(attempt-1) seconds, plus up to 25%
     random jitter so repeated failures don't hammer a struggling service in
-    lockstep. Prints a warning on each failure. Raises the last exception if
+    lockstep. Logs a warning on each failure. Raises the last exception if
     all attempts fail.
 
     Usage:
         @with_retries(max_attempts=5, backoff=2.0, exceptions=(FetchError,))
         def fetch(...): ...
     """
+    from jarvis.core.logs import get_logger
+
+    log = get_logger("jarvis.retry")
 
     def decorator(fn: F) -> F:
         @functools.wraps(fn)
@@ -99,10 +73,11 @@ def with_retries(
                     last_exc = exc
                     if attempt < max_attempts:
                         wait = backoff * 2 ** (attempt - 1) * random.uniform(1.0, 1.25)
-                        print(
-                            f"  Warning: {fn.__name__} failed (attempt {attempt}/{max_attempts}): {exc}. "
-                            f"Retrying in {wait:.0f}s...",
-                            flush=True,
+                        # Logged, not printed: fetchers now run inside the MCP
+                        # server, where stdout is the protocol channel.
+                        log.warning(
+                            "%s failed (attempt %d/%d): %s. Retrying in %.0fs...",
+                            fn.__name__, attempt, max_attempts, exc, wait,
                         )
                         time.sleep(wait)
             raise last_exc  # type: ignore[misc]

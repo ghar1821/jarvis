@@ -1,471 +1,173 @@
 """
-Tests for jarvis/core/config.py — load_config() resolution order.
+Tests for jarvis/core/config.py — load_config() and the README's promises.
 
-load_config() builds a Config in three layers, each overriding the previous:
-  1. Built-in defaults (hardcoded in the Config dataclass)
-  2. ~/.jarvis/config.toml values
-  3. Environment variable values
-
-All tests call load_config() with an explicit config_file path so the real
-~/.jarvis/config.toml on disk is never read. The monkeypatch fixture restores
-any environment variables changed during a test.
+Each test writes its own config.toml into tmp_path and passes it to
+load_config() directly, so the user's real ~/.jarvis/config.toml is never
+read. Config notes (moved and obsolete keys) go to stderr, because stdout is
+the MCP channel inside jarvis-mcp.
 """
 
+import re
+import tomllib
 from pathlib import Path
 
-import pytest
+from jarvis.core.config import Config, format_describe, load_config
 
-from jarvis.core.config import Config, load_config
+ROOT = Path(__file__).parent.parent
+
+
+def _write(tmp_path: Path, text: str) -> Path:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(text)
+    return config_file
 
 
 def test_defaults_when_no_config_file(tmp_path):
+    cfg = load_config(tmp_path / "missing.toml")
+    assert cfg == Config()
+    assert cfg.papers_dir is None
+    assert cfg.private_vault_dirs == ["private"]
+    assert cfg.sync_minutes == 30 and cfg.hybrid is True
+
+
+def test_kb_and_rag_sections_are_read(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+[kb]
+vault_path = "~/notes"
+private_vault_dirs = ["private", "journal"]
+papers_dir = "~/papers"
+sync_minutes = 10
+
+[rag]
+rag_dir = "~/index"
+embed_model = "BAAI/bge-base-en-v1.5"
+rerank_model = ""
+hybrid = false
+server_port = 9000
+"""))
+    # "~" is expanded — a literal one would be a path that never resolves.
+    assert cfg.vault_path == Path.home() / "notes"
+    assert cfg.papers_dir == Path.home() / "papers"
+    assert cfg.private_vault_dirs == ["private", "journal"]
+    assert cfg.sync_minutes == 10
+    assert cfg.rag_dir == Path.home() / "index"
+    assert cfg.embed_model == "BAAI/bge-base-en-v1.5"
+    assert cfg.rerank_model == "" and cfg.hybrid is False and cfg.server_port == 9000
+
+
+def test_moved_keys_still_work_from_their_old_place_and_say_so(tmp_path, capsys):
     """
-    When the config file does not exist every field comes from the built-in defaults.
-
-    Input:  path to a non-existent file
-    Expected output:
-        ollama_model    == "qwen3-vl:30b"
-        provider        == "ollama"
-        chunk_size      == 1024
-        chunk_overlap   == 128
-        embed_model     == "BAAI/bge-small-en-v1.5"
-        query_prefix    == the BGE search instruction
-        rerank_model    == "cross-encoder/ms-marco-MiniLM-L6-v2"
-        rerank_top_n    == 25
-        figure_captions == False   (off by default — vision calls cost per figure)
-        digest_enabled  == False   (off by default — jarvis is a general assistant)
+    An existing config keeps working: [chat] vault_path and [sync]
+    pdf_watch_dir are read as [kb] vault_path and papers_dir, with a note.
     """
-    cfg = load_config(tmp_path / "nonexistent.toml")
-    assert cfg.digest_enabled is False
-    assert cfg.ollama_model == "qwen3-vl:30b"
-    assert cfg.provider == "ollama"
-    assert cfg.chunk_size == 1024
-    assert cfg.chunk_overlap == 128
-    assert cfg.embed_model == "BAAI/bge-small-en-v1.5"
-    assert cfg.query_prefix == "Represent this sentence for searching relevant passages: "
-    assert cfg.rerank_model == "cross-encoder/ms-marco-MiniLM-L6-v2"
-    assert cfg.rerank_top_n == 25
-    assert cfg.figure_captions is False
-    assert cfg.figure_max_per_doc == 20
-    assert cfg.figure_min_pixels == 40000
-    assert cfg.hybrid is True
+    cfg = load_config(_write(tmp_path, """
+[chat]
+vault_path = "~/old-vault"
+private_vault_dirs = ["secret"]
 
+[sync]
+pdf_watch_dir = "~/old-inbox"
+vault_refresh_minutes = 15
+"""))
+    assert cfg.vault_path == Path.home() / "old-vault"
+    assert cfg.private_vault_dirs == ["secret"]
+    assert cfg.papers_dir == Path.home() / "old-inbox"
+    assert cfg.sync_minutes == 15
 
-def test_toml_values_override_defaults(tmp_path):
-    """
-    Values present in the TOML file replace the built-in defaults.
-    Fields not mentioned in the TOML stay at their defaults.
-
-    Input:  config.toml with [chat] ollama_model override and [digest] max_results = 5
-    Expected output:
-        ollama_model == "llava:13b"   (overridden)
-        max_results  == 5             (overridden)
-        provider     == "ollama"      (default, untouched)
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[digest]\nmax_results = 5\n\n'
-        '[chat]\nollama_model = "llava:13b"\n'
-    )
-    cfg = load_config(config_file)
-    assert cfg.ollama_model == "llava:13b"
-    assert cfg.max_results == 5
-    assert cfg.provider == "ollama"
-
-
-def test_rag_settings_override_defaults(tmp_path):
-    """
-    The [rag] section fields — including the retrieval-tuning and figure-caption
-    ones — are read from the TOML. An empty rerank_model is honoured as the
-    disable switch, and figure_captions can be turned on globally (it now
-    defaults off).
-
-    Input:  config.toml [rag] overriding embed_model, query_prefix, rerank_model,
-            rerank_top_n, and the figure-caption knobs
-    Expected output:
-        each field takes the TOML value; rerank_model == "" (re-ranking off)
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[rag]\n'
-        'embed_model = "all-MiniLM-L6-v2"\n'
-        'query_prefix = ""\n'
-        'rerank_model = ""\n'
-        'rerank_top_n = 40\n'
-        'figure_captions = true\n'
-        'figure_max_per_doc = 5\n'
-        'figure_min_pixels = 10000\n'
-    )
-    cfg = load_config(config_file)
-    assert cfg.embed_model == "all-MiniLM-L6-v2"
-    assert cfg.query_prefix == ""
-    assert cfg.rerank_model == ""
-    assert cfg.rerank_top_n == 40
-    assert cfg.figure_captions is True
-    assert cfg.figure_max_per_doc == 5
-    assert cfg.figure_min_pixels == 10000
-
-
-def test_hybrid_defaults_true_and_parses_from_toml(tmp_path):
-    """
-    hybrid defaults to True (dense-only retrieval was the pre-hybrid
-    behaviour) and can be turned off via [rag] hybrid = false.
-    """
-    cfg = load_config(tmp_path / "nonexistent.toml")
-    assert cfg.hybrid is True
-
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[rag]\nhybrid = false\n')
-    cfg = load_config(config_file)
-    assert cfg.hybrid is False
-
-
-def test_biorxiv_settings_override_defaults(tmp_path):
-    """
-    The [digest] bioRxiv keys parse into lists of (name, limit) tuples, the
-    same shape as arxiv_categories.
-
-    Input:  config.toml [digest] with biorxiv_categories/keywords/days
-    Expected output:
-        biorxiv_cats/keywords are lists of tuples; biorxiv_days overridden
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[digest]\n'
-        'biorxiv_categories = [["genomics", 40]]\n'
-        'biorxiv_keywords = [["flow cytometry", 25]]\n'
-        'biorxiv_days = 14\n'
-    )
-    cfg = load_config(config_file)
-    assert cfg.biorxiv_cats == [("genomics", 40)]
-    assert cfg.biorxiv_keywords == [("flow cytometry", 25)]
-    assert cfg.biorxiv_days == 14
-
-
-def test_env_var_overrides_toml(tmp_path, monkeypatch):
-    """
-    Environment variables win over TOML values when both are present.
-
-    Input:  TOML sets ollama_model; env var OLLAMA_MODEL differs
-    Expected output:
-        ollama_model == env var value   (env var wins)
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[chat]\nollama_model = "llava:13b"\n')
-    monkeypatch.setenv("OLLAMA_MODEL", "qwen3-vl:8b")
-    cfg = load_config(config_file)
-    assert cfg.ollama_model == "qwen3-vl:8b"
-
-
-def test_tilde_in_paths_is_expanded(tmp_path):
-    """
-    Paths written with ~ in the TOML are expanded to absolute paths at load time.
-
-    Input:  config.toml with output_dir = "~/my/papers"
-    Expected output:
-        output_dir is an absolute Path (does not start with "~")
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[digest]\noutput_dir = "~/my/papers"\n')
-    cfg = load_config(config_file)
-    assert not str(cfg.output_dir).startswith("~")
-    assert cfg.output_dir.is_absolute()
-
-
-def test_sync_section_defaults_and_overrides(tmp_path):
-    """
-    The [sync] section drives the jarvis-sync daemon. Defaults leave the
-    watcher off; TOML values override; PDF_WATCH_DIR env wins over TOML.
-
-    Input:  defaults, then a TOML [sync] block, then the env var
-    Expected output: each layer takes effect in order
-    """
-    cfg = load_config(tmp_path / "nonexistent.toml")
-    assert cfg.pdf_watch_dir is None
-    assert cfg.pdf_watch_minutes == 30
-    assert cfg.vault_refresh_minutes == 30
-    assert cfg.digest_day == "mon"
-    assert cfg.digest_hour == 5
-
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[sync]\n'
-        'pdf_watch_dir = "~/papers/inbox"\n'
-        'pdf_watch_minutes = 15\n'
-        'vault_refresh_minutes = 10\n'
-        'digest_day = "fri"\n'
-        'digest_hour = 6\n'
-    )
-    cfg = load_config(config_file)
-    assert cfg.pdf_watch_dir is not None
-    assert not str(cfg.pdf_watch_dir).startswith("~")
-    assert cfg.pdf_watch_minutes == 15
-    assert cfg.vault_refresh_minutes == 10
-    assert cfg.digest_day == "fri"
-    assert cfg.digest_hour == 6
-
-
-def test_pdf_watch_dir_env_override(tmp_path, monkeypatch):
-    """
-    PDF_WATCH_DIR env var overrides the TOML value.
-
-    Input:  TOML sets one path; env var sets another
-    Expected output: pdf_watch_dir == env var path (expanded)
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[sync]\npdf_watch_dir = "~/from-toml"\n')
-    monkeypatch.setenv("PDF_WATCH_DIR", str(tmp_path / "from-env"))
-    cfg = load_config(config_file)
-    assert cfg.pdf_watch_dir == tmp_path / "from-env"
-
-
-def test_anthropic_model_read_from_chat_section(tmp_path):
-    """
-    [chat] anthropic_model is the canonical home for the model key.
-
-    Input:  config.toml with [chat] anthropic_model set, no [digest] key
-    Expected output: cfg.anthropic_model == the [chat] value; no warning printed
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[chat]\nanthropic_model = "claude-opus-4-1"\n')
-    cfg = load_config(config_file)
-    assert cfg.anthropic_model == "claude-opus-4-1"
-
-
-def test_anthropic_model_digest_fallback_warns(tmp_path, capsys):
-    """
-    A legacy [digest] anthropic_model still works as a fallback, but prints a
-    one-line warning telling the user to move it — fail visibly, no silent
-    auto-rewrite of the user's file.
-
-    Input:  config.toml with only [digest] anthropic_model set
-    Expected output:
-        cfg.anthropic_model == the [digest] value
-        stdout mentions moving the key to [chat]
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[digest]\nanthropic_model = "claude-legacy-1"\n')
-    cfg = load_config(config_file)
-    assert cfg.anthropic_model == "claude-legacy-1"
     captured = capsys.readouterr()
-    assert "[chat]" in captured.out
-    assert "anthropic_model" in captured.out
+    assert captured.out == ""  # stdout is the MCP channel
+    assert "[sync] pdf_watch_dir has moved to [kb] papers_dir" in captured.err
+    assert "[chat] vault_path has moved to [kb] vault_path" in captured.err
 
 
-def test_anthropic_model_chat_wins_over_digest(tmp_path, capsys):
+def test_the_new_location_wins_over_the_old_one(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+[chat]
+vault_path = "~/old-vault"
+
+[kb]
+vault_path = "~/new-vault"
+"""))
+    assert cfg.vault_path == Path.home() / "new-vault"
+
+
+def test_obsolete_keys_are_reported_once_and_ignored(tmp_path, capsys):
     """
-    When both [chat] and [digest] set anthropic_model, [chat] wins and no
-    deprecation warning is printed (the legacy key is simply ignored).
-
-    Input:  config.toml with differing [chat] and [digest] anthropic_model values
-    Expected output: cfg.anthropic_model == the [chat] value; no warning
+    Settings from the old assistant (providers, API keys, drafts, digest
+    schedule, figure captions) do nothing now. Each is named so a setting
+    that silently stopped working is never a mystery — and an API key left
+    in the file is not echoed.
     """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[digest]\nanthropic_model = "claude-legacy-1"\n\n'
-        '[chat]\nanthropic_model = "claude-current-1"\n'
-    )
-    cfg = load_config(config_file)
-    assert cfg.anthropic_model == "claude-current-1"
-    captured = capsys.readouterr()
-    assert captured.out == ""
+    load_config(_write(tmp_path, """
+[chat]
+provider = "anthropic"
+vault_path = "~/vault"
+
+[auth]
+api_key = "sk-ant-should-never-be-printed"
+
+[digest]
+enabled = true
+
+[rag]
+figure_captions = true
+"""))
+    err = capsys.readouterr().err
+    assert "[chat] provider in" in err and "no longer does anything" in err
+    assert "[auth] api_key" in err and "sk-ant-should-never-be-printed" not in err
+    assert "[digest] enabled" in err
+    assert "[rag] figure_captions" in err
+    # A moved key is reported as moved, not as obsolete.
+    obsolete_chat_line = next(line for line in err.splitlines() if "[chat] provider" in line)
+    assert "vault_path" not in obsolete_chat_line
+    assert "[chat] vault_path has moved" in err
 
 
-def test_anthropic_model_env_wins_over_chat_and_digest(tmp_path, monkeypatch):
+def test_env_vars_override_the_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", "~/env-vault")
+    monkeypatch.setenv("PAPERS_DIR", "~/env-papers")
+    cfg = load_config(_write(tmp_path, '[kb]\nvault_path = "~/file-vault"\n'))
+    assert cfg.vault_path == Path.home() / "env-vault"
+    assert cfg.papers_dir == Path.home() / "env-papers"
+
+
+def test_format_describe_shows_the_resolved_folders(tmp_path):
+    text = format_describe(Config(vault_path=tmp_path / "v", papers_dir=None))
+    assert str(tmp_path / "v") in text
+    assert "no papers indexed" in text
+    assert "127.0.0.1 only" in text
+
+
+def test_the_readme_example_config_loads_cleanly(tmp_path, capsys):
     """
-    ANTHROPIC_MODEL env var wins over both [chat] and [digest] TOML values.
-
-    Input:  TOML sets both [chat] and [digest] anthropic_model; env var differs
-    Expected output: cfg.anthropic_model == the env var value
+    The config block a new user copies out of the README must load with no
+    "moved" or "obsolete" notes and produce absolute paths.
     """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        '[digest]\nanthropic_model = "claude-legacy-1"\n\n'
-        '[chat]\nanthropic_model = "claude-current-1"\n'
-    )
-    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-env-1")
-    cfg = load_config(config_file)
-    assert cfg.anthropic_model == "claude-env-1"
+    readme = (ROOT / "README.md").read_text()
+    blocks = re.findall(r"```toml\n(.*?)```", readme, re.DOTALL)
+    assert blocks, "the README should show an example config.toml"
 
+    cfg = load_config(_write(tmp_path, blocks[0]))
 
-def test_anthropic_model_default_when_unset(tmp_path):
-    """
-    Default anthropic_model is used when the config file has no matching key.
-
-    Input:  no config file
-    Expected output: cfg.anthropic_model == "claude-sonnet-4-6"
-    """
-    cfg = load_config(tmp_path / "nonexistent.toml")
-    assert cfg.anthropic_model == "claude-sonnet-4-6"
-
-
-def test_api_key_loaded_from_auth_section(tmp_path):
-    """
-    The [auth] api_key field is read into cfg.anthropic_api_key, allowing the
-    key to be stored in the config file instead of an environment variable.
-
-    Input:  config.toml with [auth] api_key = "sk-ant-test"
-    Expected output:
-        anthropic_api_key == "sk-ant-test"
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[auth]\napi_key = "sk-ant-test"\n')
-    cfg = load_config(config_file)
-    assert cfg.anthropic_api_key == "sk-ant-test"
-
-
-def test_digest_enabled_read_from_digest_section(tmp_path):
-    """
-    The digest is opt-in: [digest] enabled = true switches it back on, and
-    anything else leaves it off.
-
-    Input:  config.toml with [digest] enabled = true
-    Expected output:
-        digest_enabled is True
-    """
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[digest]\nenabled = true\nmax_results = 5\n')
-    cfg = load_config(config_file)
-    assert cfg.digest_enabled is True
-    assert cfg.max_results == 5
-
-    config_file.write_text('[digest]\nenabled = false\n')
-    assert load_config(config_file).digest_enabled is False
-
-
-# ── The README's setup instructions ───────────────────────────────────────────
-#
-# Someone following the README on a fresh machine has nothing else to go on, so
-# a renamed config key that nobody updates the README for is a setup that
-# silently does the wrong thing — the file parses, and the setting is ignored.
-
-
-def test_the_readme_openrouter_config_actually_works(tmp_path):
-    """
-    The copy-pasteable OpenRouter block in README.md must produce the config it
-    claims to. Extracted from the README itself rather than duplicated here, or
-    the test would drift from the thing it is checking.
-    """
-    import re
-
-    readme = (Path(__file__).parent.parent / "README.md").read_text()
-    match = re.search(r'```toml\n(\[chat\]\nprovider = "openrouter".*?)```', readme, re.S)
-    assert match, "the README no longer has an OpenRouter config block to check"
-
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(match.group(1))
-    cfg = load_config(config_file)
-
-    assert cfg.provider == "openrouter"
-    assert cfg.openrouter_model, "provider without a model fails at startup"
-    assert cfg.openrouter_api_key, "the [auth] key name must match what config reads"
-    # A literal "~" here would be a path that never resolves.
+    assert capsys.readouterr().err == ""
     assert cfg.vault_path.is_absolute()
-    assert cfg.models.get("openrouter"), "the [models] catalogue feeds the picker"
+    assert cfg.papers_dir is not None and cfg.papers_dir.is_absolute()
 
 
 def test_the_readme_names_commands_that_exist():
     """
     Every `uv run <entry-point>` the README tells a new user to type has to be
-    a real entry point in pyproject.toml.
+    a real entry point, and every `kb <subcommand>` a real subcommand.
     """
-    import re
-    import tomllib
-
-    root = Path(__file__).parent.parent
-    readme = (root / "README.md").read_text()
-    with open(root / "pyproject.toml", "rb") as handle:
+    readme = (ROOT / "README.md").read_text()
+    with open(ROOT / "pyproject.toml", "rb") as handle:
         scripts = set(tomllib.load(handle)["project"]["scripts"])
 
     named = set(re.findall(r"uv run ([a-z][a-z-]+)", readme)) - {"pytest", "python"}
     assert named <= scripts, f"README names commands that do not exist: {sorted(named - scripts)}"
 
+    from jarvis.kb import cli
 
-# ── describe(): the config as shown at startup and in the UI ─────────────────
-
-
-def test_describe_never_renders_an_api_key(tmp_path):
-    """
-    The one property that matters here. This is printed to a terminal someone
-    may be screen-sharing and rendered into a browser tab, so the key itself
-    must not appear anywhere in the output.
-    """
-    from jarvis.core.config import describe
-
-    secret = "sk-or-v1-9f3c2a-DO-NOT-LEAK"
-    cfg = Config(anthropic_api_key=secret, openrouter_api_key=secret)
-
-    rendered = describe(cfg)
-    flat = " ".join(
-        f"{value['key']} {value['value']}"
-        for section in rendered
-        for value in section["values"]
-    )
-
-    assert secret not in flat
-    assert "DO-NOT-LEAK" not in flat
-
-
-def test_describe_says_whether_each_key_is_set(tmp_path):
-    """Redacted, but still answering the question you came to ask."""
-    from jarvis.core.config import describe
-
-    cfg = Config(anthropic_api_key="something", openrouter_api_key="")
-    creds = {
-        value["key"]: value["value"]
-        for section in describe(cfg)
-        if section["section"] == "Credentials"
-        for value in section["values"]
-    }
-
-    assert creds["anthropic_api_key"] == "set"
-    assert creds["openrouter_api_key"] == "not set"
-
-
-def test_describe_redacts_a_secret_that_leaks_into_another_field(tmp_path):
-    """
-    The backstop. If a field is ever added to a group raw, or a key ends up
-    pasted into some other setting, it still must not render.
-    """
-    from jarvis.core.config import describe
-
-    secret = "sk-or-v1-abcdef123456"
-    cfg = Config(openrouter_api_key=secret, response_style=f"use {secret} please")
-
-    flat = " ".join(
-        value["value"] for section in describe(cfg) for value in section["values"]
-    )
-
-    assert secret not in flat
-
-
-def test_describe_reports_resolved_values_not_the_file(tmp_path, monkeypatch):
-    """
-    "Why isn't my setting working" is usually an env var winning over the
-    file, so this has to show what is in effect, not what the file says.
-    """
-    from jarvis.core.config import describe, load_config
-
-    config_file = tmp_path / "config.toml"
-    config_file.write_text('[chat]\nprovider = "ollama"\n')
-    monkeypatch.setenv("CHAT_PROVIDER", "anthropic")
-
-    cfg = load_config(config_file)
-    chat = {
-        value["key"]: value["value"]
-        for section in describe(cfg)
-        if section["section"] == "Chat"
-        for value in section["values"]
-    }
-
-    assert chat["provider"] == "anthropic", "the env var is what is in effect"
-
-
-def test_format_describe_is_printable_text(tmp_path):
-    """What the webapp prints at startup."""
-    from jarvis.core.config import format_describe
-
-    text = format_describe(Config(anthropic_api_key="secret-value"))
-
-    assert "Chat" in text and "provider" in text
-    assert "secret-value" not in text
+    subcommands = set(re.findall(r"^  (\w+)\s", cli.__doc__, re.MULTILINE))
+    named_kb = set(re.findall(r"uv run kb ([a-z-]+)", readme))
+    assert named_kb <= subcommands, f"README names kb commands that do not exist: {sorted(named_kb - subcommands)}"
