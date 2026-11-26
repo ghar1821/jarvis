@@ -61,8 +61,9 @@ def _chunks(store, **where):
 
 @pytest.fixture(autouse=True)
 def _no_network_metadata(monkeypatch):
-    """Crossref is an HTTP boundary; tests that want it patch it themselves."""
+    """Crossref and arXiv are HTTP boundaries; tests that want them patch them themselves."""
     monkeypatch.setattr("jarvis.kb.metadata.crossref_lookup", lambda doi: {})
+    monkeypatch.setattr("jarvis.kb.metadata.arxiv_lookup", lambda arxiv_id: {})
 
 
 @pytest.fixture(autouse=True)
@@ -615,6 +616,59 @@ def test_paper_metadata_comes_from_crossref_when_a_doi_is_printed(tmp_path, stor
     _, metadatas = _chunks(store, source=pdf.as_uri())
     assert {m["title"] for m in metadatas} == {"Deep Phenotyping of Immune Cells"}
     assert {m["doi"] for m in metadatas} == {"10.1038/s41586-020-1234-5"}
+
+
+def test_arxiv_preprint_records_its_id_and_real_title(tmp_path, store, monkeypatch):
+    """
+    An arXiv PDF with no DOI is stored with its arXiv ID, and its title comes
+    from arXiv instead of the filename.
+    """
+    monkeypatch.setattr("jarvis.kb.metadata.arxiv_lookup",
+                        lambda arxiv_id: {"title": "Sparse Autoencoders", "authors": "A. Lovelace"})
+    papers = tmp_path / "papers"
+    pdf = _write_pdf(papers / "2411.01234v2.pdf", "arXiv:2411.01234v2 [cs.LG] 3 Nov 2024")
+
+    refresh_papers(papers, store)
+
+    _, metadatas = _chunks(store, source=pdf.as_uri())
+    assert {m["arxiv_id"] for m in metadatas} == {"2411.01234"}
+    assert {m["title"] for m in metadatas} == {"Sparse Autoencoders"}
+
+
+def test_papers_indexed_before_arxiv_ids_are_upgraded_once(tmp_path, store, monkeypatch):
+    """
+    A paper indexed by an older version has no arxiv_id. The next sync
+    re-indexes it if its PDF has an arXiv ID, and otherwise stores an empty
+    one, so the PDF is not read again on later passes.
+    """
+    papers = tmp_path / "papers"
+    preprint = _write_pdf(papers / "2411.01234v2.pdf", "arXiv:2411.01234v2 [cs.LG] 3 Nov 2024")
+    journal = _write_pdf(papers / "journal.pdf", "doi: 10.1038/s41586-020-1234-5. Results.")
+    refresh_papers(papers, store)
+
+    # Make both look like they came from the older version.
+    result = store._collection.get(include=["metadatas"])
+    # Chroma merges metadata on update, and a None value deletes the key.
+    old_metadatas = [{**m, "arxiv_id": None} for m in result["metadatas"]]
+    store._collection.update(ids=result["ids"], metadatas=old_metadatas)
+    assert all("arxiv_id" not in m for m in store._collection.get(include=["metadatas"])["metadatas"])
+
+    monkeypatch.setattr("jarvis.kb.metadata.arxiv_lookup",
+                        lambda arxiv_id: {"title": "Sparse Autoencoders", "authors": "A. Lovelace"})
+    assert refresh_papers(papers, store)["updated"] == 1
+
+    _, preprint_metadatas = _chunks(store, source=preprint.as_uri())
+    assert {m["arxiv_id"] for m in preprint_metadatas} == {"2411.01234"}
+    assert {m["title"] for m in preprint_metadatas} == {"Sparse Autoencoders"}
+    _, journal_metadatas = _chunks(store, source=journal.as_uri())
+    assert {m["arxiv_id"] for m in journal_metadatas} == {""}
+
+    # Already upgraded: the next pass reads neither PDF.
+    def must_not_read(pdf_path, *args, **kwargs):
+        raise AssertionError(f"{pdf_path} was read again")
+
+    monkeypatch.setattr("jarvis.kb.metadata.extract_arxiv_id", must_not_read)
+    assert refresh_papers(papers, store)["updated"] == 0
 
 
 def test_sync_all_covers_both_folders(tmp_path, store):

@@ -60,6 +60,8 @@ def test_to_paper_maps_result_fields():
     assert paper["published"] == "2023-01-17"
     assert paper["source"] == "arXiv:cs.LG"
     assert paper["doi"] == ""  # arxiv.Result.doi defaults to "" when the API has none
+    # The ID without its version, so any version matches a paper already held.
+    assert paper["arxiv_id"] == "2301.07041"
 
 
 def test_to_paper_surfaces_doi_when_arxiv_result_has_one():

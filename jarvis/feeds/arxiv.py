@@ -7,6 +7,8 @@ delay arXiv's terms of use ask for. The @with_retries layer on top covers
 whole-search failures (connection resets, persistent empty feeds).
 """
 
+import re
+
 import arxiv
 import requests
 
@@ -26,6 +28,8 @@ def _to_paper(result: arxiv.Result, source_label: str) -> dict:
         "published": result.published.date().isoformat(),
         "source": source_label,
         "doi": result.doi or "",
+        # "2411.01234v2" → "2411.01234": every version is the same paper.
+        "arxiv_id": re.sub(r"v\d+$", "", result.get_short_id()),
     }
 
 

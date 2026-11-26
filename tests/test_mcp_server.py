@@ -203,7 +203,7 @@ def test_listings_and_stats_name_nothing_private(kb):
 
 # ── fetch_recent_papers ────────────────────────────────────────────────────────
 
-def test_fetch_recent_papers_marks_what_is_already_indexed(kb, monkeypatch):
+def test_fetch_recent_papers_marks_what_is_already_indexed(kb, store, monkeypatch):
     """
     Recent papers come back with DOI links; one already in the papers folder
     is marked; one older than the window is dropped; a failed category is
@@ -211,6 +211,12 @@ def test_fetch_recent_papers_marks_what_is_already_indexed(kb, monkeypatch):
     """
     today = date.today().isoformat()
     old = (date.today() - timedelta(days=30)).isoformat()
+    # An arXiv preprint in the papers folder, indexed under its filename.
+    add_texts(content="Sparse autoencoders for single-cell data.",
+              doc_type="paper", visibility="public", source="file:///papers/2411.01234v2.pdf",
+              extra_metadata={"title": "2411.01234v2", "doi": "", "arxiv_id": "2411.01234",
+                              "file_path": "/papers/2411.01234v2.pdf"},
+              store=store)
 
     def fake_fetch_arxiv(category, max_results):
         if category == "q-bio.QM":
@@ -220,6 +226,10 @@ def test_fetch_recent_papers_marks_what_is_already_indexed(kb, monkeypatch):
              "published": today, "source": "arXiv:cs.LG", "doi": "10.1234/DIAMOND", "link": "x"},
             {"title": "Fresh result", "abstract": "Brand new.", "authors": "A. New",
              "published": today, "source": "arXiv:cs.LG", "doi": "", "link": "http://arxiv.org/abs/2611.00001"},
+            # No DOI and a different title from the indexed copy: only the arXiv ID matches.
+            {"title": "Sparse autoencoders, revised title", "abstract": "Have it.", "authors": "A. Held",
+             "published": today, "source": "arXiv:cs.LG", "doi": "", "arxiv_id": "2411.01234",
+             "link": "http://arxiv.org/abs/2411.01234v3"},
             {"title": "Old result", "abstract": "Too old.", "authors": "A. Old",
              "published": old, "source": "arXiv:cs.LG", "doi": "", "link": "x"},
         ]
@@ -231,6 +241,7 @@ def test_fetch_recent_papers_marks_what_is_already_indexed(kb, monkeypatch):
 
     assert not is_error
     assert "Diamond magnetometry  [ALREADY IN PAPERS]" in text
+    assert "Sparse autoencoders, revised title  [ALREADY IN PAPERS]" in text
     assert "Fresh result" in text and "[ALREADY" not in text.split("Fresh result")[1].splitlines()[0]
     assert "http://arxiv.org/abs/2611.00001" in text
     assert "Old result" not in text

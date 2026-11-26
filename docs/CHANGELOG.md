@@ -166,6 +166,17 @@
 
 ### MINOR CHANGES
 
+- Corrected the weekly digest setup in the README and
+  `docs/examples/weekly-digest-task.md` (PR #6). Scheduled tasks in Claude
+  Desktop's Cowork tab run in the cloud and can't reach jarvis, so the
+  digest came back saying the jarvis tools weren't available. The docs now
+  say to create the task in the **Code** tab, which runs Claude Code on your
+  computer, and to add jarvis to Claude Code with `claude mcp add`, since
+  Claude Code doesn't read `claude_desktop_config.json`.
+
+- The README now explains how `[ALREADY IN PAPERS]` is decided and what it
+  can miss (PR #6).
+
 - PDF export from the editor no longer gives up after a minute. The ceiling on
   one LaTeX or pandoc run (`[drafts] compile_timeout_seconds`) is now 180
   seconds, since the first Markdown export on a machine spends minutes building
@@ -200,6 +211,21 @@
   - Add explicit "USD" next to cost.
 
 ### BUG FIXES
+
+- Fix the weekly digest suggesting arXiv papers you already have (PR #6).
+  `fetch_recent_papers` matched papers only by DOI or exact title. arXiv
+  feeds rarely include a DOI, arXiv PDFs rarely print one, and an arXiv PDF
+  without embedded metadata was indexed under its filename, so neither
+  matched. Jarvis now reads the arXiv ID that arXiv stamps on each PDF and
+  matches on that too, ignoring the version.
+
+- Fix arXiv preprints being titled by their filename, e.g. `2411.01234v2`
+  (PR #6). When a PDF has an arXiv ID but no Crossref title, the title and
+  authors now come from arXiv. Only the ID is sent.
+
+- Papers indexed before this change get their arXiv ID on the next sync.
+  Each PDF's first page is read once. Papers with an arXiv ID are indexed
+  again, which also fixes their title. No `kb rebuild` is needed (PR #6).
 
 - Fix re-adding a document leaving you with nothing when the add process failed 
   part way. Re-adding deletes the old entry and indexes the new one, and

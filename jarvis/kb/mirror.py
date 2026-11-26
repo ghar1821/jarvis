@@ -302,6 +302,7 @@ def index_paper_file(pdf_path: Path, store: Chroma | None = None) -> int:
         "title": title,
         "authors": authors,
         "doi": doi,
+        "arxiv_id": meta["arxiv_id"],
         "file_path": str(resolved),
         "content_hash": _file_hash(resolved),
         "modified_at": _modified_at(resolved),
@@ -334,9 +335,32 @@ def index_paper_file(pdf_path: Path, store: Chroma | None = None) -> int:
     if not documents:
         log.warning("papers: nothing indexable in %s (no text, no annotations)", resolved.name)
     commit_documents(documents, store, replace_source=source)
-    log.info('papers: indexed "%s" — authors: %s; doi: %s; file: %s',
-             title, authors or "unknown", doi or "unknown", resolved)
+    log.info('papers: indexed "%s" — authors: %s; doi: %s; arXiv: %s; file: %s',
+             title, authors or "unknown", doi or "unknown", meta["arxiv_id"] or "none", resolved)
     return len(documents)
+
+
+def _record_arxiv_id(pdf_path: Path, store: Chroma) -> bool:
+    """
+    One-time upgrade for a paper indexed before arXiv IDs were recorded.
+
+    If the PDF carries an arXiv ID, the paper is indexed again. That stores
+    the ID and also replaces a filename title with the real one from arXiv.
+    If it has none, an empty arxiv_id is stored so the PDF is not read again
+    on the next pass. Returns True when the paper was indexed again.
+    """
+    from .metadata import arxiv_id_from_doi, extract_arxiv_id, extract_doi
+
+    try:
+        arxiv_id = arxiv_id_from_doi(extract_doi(pdf_path)) or extract_arxiv_id(pdf_path)
+        if arxiv_id:
+            index_paper_file(pdf_path, store)
+            return True
+        update_metadata_fields(str(pdf_path), {"arxiv_id": ""}, store)
+    except Exception:
+        # Not fatal: the paper stays searchable, and the next pass tries again.
+        log.exception("papers: could not check %s for an arXiv ID", pdf_path)
+    return False
 
 
 def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict[str, int]:
@@ -366,10 +390,14 @@ def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict
         file_path = meta.get("file_path", "")
         if not file_path or not Path(file_path).is_relative_to(papers_dir):
             continue
-        entry = indexed.setdefault(meta["source"], {"file_path": file_path})
+        entry = indexed.setdefault(meta["source"], {"file_path": file_path, "has_arxiv_id": False})
         for key in ("content_hash", "modified_at"):
             if meta.get(key) and not entry.get(key):
                 entry[key] = meta[key]
+        # Papers indexed before arXiv IDs were recorded have no "arxiv_id"
+        # key at all (not even an empty one). They are checked once below.
+        if "arxiv_id" in meta:
+            entry["has_arxiv_id"] = True
     indexed_by_path = {entry["file_path"]: source for source, entry in indexed.items()}
 
     # The PDFs on disk right now. An iCloud-evicted file shows up only as a
@@ -399,6 +427,8 @@ def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict
             # bytes, which skips hashing hundreds of PDFs every pass.
             entry = indexed[source]
             if entry.get("modified_at") == _modified_at(path):
+                if not entry["has_arxiv_id"] and _record_arxiv_id(path, s):
+                    counts["updated"] += 1
                 continue
             if not wait_for_stable(path):
                 log.warning("papers: %s still changing — leaving it for the next pass", path.name)

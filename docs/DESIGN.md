@@ -57,7 +57,7 @@ Three invariants shape everything below:
 │   ├── kb/
 │   │   ├── mirror.py        # the two folders → the index (sync, move detection, rebuild)
 │   │   ├── store.py         # chunk storage and hybrid retrieval (LangChain + ChromaDB)
-│   │   ├── metadata.py      # paper title/authors/DOI without an LLM (regex + Crossref)
+│   │   ├── metadata.py      # paper title/authors/DOI/arXiv ID without an LLM (regex, Crossref, arXiv)
 │   │   ├── convert.py       # PDF → Markdown (pymupdf4llm)
 │   │   ├── annotations.py   # PDF highlights and typed notes (PyMuPDF)
 │   │   ├── frontmatter.py   # note YAML frontmatter → flat record metadata
@@ -194,7 +194,12 @@ older version indexed from elsewhere is left alone (and reported by `kb
 doctor`). For each PDF on disk:
 
 1. **Indexed at this path, same mtime** → skip without hashing. This is what
-   makes a pass over hundreds of PDFs cheap.
+   makes a pass over hundreds of PDFs cheap. The one exception is a paper
+   indexed before arXiv IDs were recorded, whose chunks have no `arxiv_id`
+   key at all. Its first page is read once (`_record_arxiv_id`). If it has
+   an arXiv ID, the paper is re-indexed, which stores the ID and replaces a
+   filename title with the real one. If not, an empty `arxiv_id` is stored
+   so the PDF is not read again.
 2. **Indexed, mtime changed** → wait until the file is stable, hash it. Same
    hash: refresh `modified_at` only. Different hash: re-index (new highlights
    saved into a PDF land here).
@@ -206,8 +211,8 @@ doctor`). For each PDF on disk:
 Entries whose file vanished and matched no new path are deleted.
 
 **`index_paper_file`** builds the annotation chunks and the full-text body
-chunks, stamps every chunk with title/authors/doi/`file_path`/`content_hash`/
-`modified_at`, embeds `"{title} — {authors}"` on every body chunk, and
+chunks, stamps every chunk with title/authors/doi/`arxiv_id`/`file_path`/
+`content_hash`/`modified_at`, embeds `"{title} — {authors}"` on every body chunk, and
 commits once with `replace_source` — so a re-index never leaves the paper
 half-present. There is no summary mode: every paper is full text.
 
@@ -249,15 +254,28 @@ optional.
 
 `resolve_pdf_metadata(pdf_path)` takes the first answer for each field from:
 
-1. **DOI** — regex `10\.\d{4,9}/\S+` over the first two pages, trailing
-   punctuation stripped.
+1. **Identifiers.** The DOI is found by the regex `10\.\d{4,9}/\S+` over
+   the first two pages, with trailing punctuation stripped. The arXiv ID is
+   taken from an arXiv DOI (`10.48550/arXiv.<id>`) if there is one, and
+   otherwise from the first page. There, arXiv's margin stamp
+   (`arXiv:2411.01234v2 [cs.LG] …`) is preferred over any other `arXiv:`
+   mention, which may be a citation. Both ID formats are recognised (current
+   `2411.01234` and pre-2007 `hep-th/9901001`), and the version is dropped
+   so every version counts as the same paper.
 2. **Crossref** — `GET api.crossref.org/works/<doi>` for the canonical title
    and `"Given Family, …"` authors. Only the DOI is sent, with a generic
    User-Agent: Crossref's "polite pool" asks for a contact email and jarvis
    never sends one. 10-second timeout.
-3. **Embedded PDF metadata** — `title`/`author`, skipping placeholders such
+3. **arXiv** — only when there is an arXiv ID and Crossref gave no title,
+   so a published paper keeps its journal title. The `arxiv` package's
+   client asks for that one ID; nothing else is sent.
+4. **Embedded PDF metadata** — `title`/`author`, skipping placeholders such
    as "untitled".
-4. **Filename** — the title of last resort.
+5. **Filename** — the title of last resort.
+
+arXiv preprints are why step 3 exists. Their PDFs usually print no DOI, and
+their embedded title is often empty, so before arXiv IDs were read they were
+indexed under filenames like `2411.01234v2`.
 
 Every step is best-effort and logged on failure; a paper is always indexed.
 There is no correction command: Crossref is usually right, and the files are
@@ -623,7 +641,7 @@ annotated `read_only_hint`:
 | `read_note(path)` | One vault file from disk, by relative or absolute path, under the privacy rules above |
 | `list_documents(kind, limit ≤ 50, category, status, entity)` | Papers or notes, newest first |
 | `kb_stats()` | Counts, and the record types and statuses in use |
-| `fetch_recent_papers(source, categories, keywords, days ≤ 60, max_per_category ≤ 200)` | Recent arXiv/bioRxiv papers with DOI links, marked `[ALREADY IN PAPERS]` by DOI or normalised title; failed categories listed rather than hidden |
+| `fetch_recent_papers(source, categories, keywords, days ≤ 60, max_per_category ≤ 200)` | Recent arXiv/bioRxiv papers with DOI links, marked `[ALREADY IN PAPERS]` when one matches an indexed paper; failed categories listed rather than hidden |
 | `reveal_in_finder(path)` | `open -R` on an indexed document (macOS); list arguments, no shell |
 
 **No write tools.** There is no add, remove, edit or move. Text from papers,
@@ -656,11 +674,31 @@ When it is down:
   connection, so once the server is up the next call succeeds without
   restarting the client.
 
-**Scheduled work lives in the client.** The weekly digest is a scheduled task
-in the client (Claude Desktop *Scheduled tasks*, Antigravity *background
-automations*) that calls `fetch_recent_papers` with a prompt the user owns —
-see `docs/examples/weekly-digest-task.md`. It has to be a *local* task, since a
-cloud-run task can't reach a server on the user's machine.
+**How `[ALREADY IN PAPERS]` is decided.** The mark is added by jarvis, not
+judged by the model: `_papers_already_indexed()` collects the DOI, arXiv ID
+and title of every indexed paper, and a recent paper is marked when any one
+of them matches (DOI and arXiv ID case-insensitively, the title after
+lower-casing and collapsing whitespace). bioRxiv papers match by DOI, since
+the feed and the PDF both carry it. arXiv papers match by arXiv ID, since
+the feed rarely has a DOI. A paper still goes unmarked if its PDF prints
+neither identifier and its indexed title differs from the feed's, for
+example a publisher PDF of a paper whose preprint is in the feed.
+
+**Scheduled work lives in the client, and must run on the user's machine.**
+The weekly digest is a scheduled task that calls `fetch_recent_papers` with
+a prompt the user owns (see `docs/examples/weekly-digest-task.md`). jarvis
+is a local stdio server, so only a task that runs locally can reach it:
+
+- **Claude Desktop's Cowork scheduled tasks run in the cloud** and cannot
+  reach jarvis. Such a run lists only claude.ai connectors and reports the
+  jarvis tools as missing.
+- **Claude Code scheduled tasks** (the Code tab in Claude Desktop) run
+  locally, but Claude Code reads its own MCP registry, not
+  `claude_desktop_config.json`, so jarvis must be added with
+  `claude mcp add --scope user jarvis -- <uv> --directory <jarvis> run jarvis-mcp`.
+- **Antigravity background automations** have not been tested with jarvis.
+  They can only work if they run on the same machine and jarvis is in
+  Antigravity's MCP config.
 
 ---
 
@@ -727,6 +765,10 @@ Retry layering is two levels deep, deliberately:
   MCP tool filters these to its `days` window, since arXiv returns the newest
   N regardless of date.
 - `deduplicate(papers)` — remove duplicate titles
+
+Each paper dict carries `arxiv_id`, the ID without its version
+(`get_short_id()` minus `vN`), which `fetch_recent_papers` matches against the
+IDs read from PDFs in the papers folder.
 
 ---
 

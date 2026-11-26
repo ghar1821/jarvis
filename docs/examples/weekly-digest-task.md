@@ -1,9 +1,14 @@
 # Weekly digest task
 
-A ready-to-paste prompt for a weekly scheduled task in your MCP client: *Scheduled
-tasks* in Claude Desktop, or a background automation in Antigravity. It uses
+A ready-to-paste prompt for a weekly scheduled task in your MCP client. It uses
 jarvis's `fetch_recent_papers` tool, so `kb serve` must be running when the task
 fires.
+
+The task must run on your computer, where jarvis is. In Claude Desktop, create
+it in the **Code** tab, not in Cowork. Cowork's scheduled tasks run in the
+cloud and can't reach jarvis. Code-tab tasks are Claude Code tasks, so first
+add jarvis to Claude Code with `claude mcp add` (see the README's "Connect your
+assistant").
 
 Before using it:
 
@@ -12,6 +17,9 @@ Before using it:
 - Change the **sources** to your arXiv categories, bioRxiv categories and keywords.
 - In the client, set `fetch_recent_papers` and `search_kb` to "always allow", so
   the task can run unattended. Both only read.
+
+`[ALREADY IN PAPERS]` is added by jarvis, not by the assistant. It means the
+paper's DOI, arXiv ID or title matches a paper in your papers folder.
 
 ---
 

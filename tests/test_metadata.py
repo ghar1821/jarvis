@@ -1,19 +1,29 @@
 """
 Tests for jarvis/kb/metadata.py — title, authors and DOI without an LLM.
 
-The order is DOI regex → Crossref → the PDF's embedded metadata → filename,
-first answer per field wins, and nothing ever raises. PDFs are generated
-in-test with pymupdf (cheap and real); Crossref is the one HTTP boundary, so
-requests.get is replaced with a canned response there and nowhere else.
+The order is identifiers by regex (DOI, arXiv ID) → Crossref → arXiv → the
+PDF's embedded metadata → filename, first answer per field wins, and nothing
+ever raises. PDFs are generated in-test with pymupdf (cheap and real).
+Crossref and arXiv are the HTTP boundaries, so only they are replaced with
+canned responses.
 """
 
 from pathlib import Path
 
+import arxiv
 import pymupdf
 import requests
 
 from jarvis.kb import metadata
-from jarvis.kb.metadata import crossref_lookup, embedded_metadata, extract_doi, resolve_pdf_metadata
+from jarvis.kb.metadata import (
+    arxiv_id_from_doi,
+    arxiv_lookup,
+    crossref_lookup,
+    embedded_metadata,
+    extract_arxiv_id,
+    extract_doi,
+    resolve_pdf_metadata,
+)
 
 
 def _make_pdf(path: Path, text: str, title: str = "", author: str = "") -> Path:
@@ -137,7 +147,7 @@ def test_crossref_wins_over_embedded_metadata(tmp_path, monkeypatch):
     pdf = _make_pdf(tmp_path / "p.pdf", "doi 10.1234/xyz", title="Embedded Title", author="E. Author")
 
     assert resolve_pdf_metadata(pdf) == {
-        "title": "Canonical Title", "authors": "A. Author", "doi": "10.1234/xyz",
+        "title": "Canonical Title", "authors": "A. Author", "doi": "10.1234/xyz", "arxiv_id": "",
     }
 
 
@@ -149,14 +159,16 @@ def test_embedded_metadata_used_without_a_doi(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "crossref_lookup", must_not_call)
     pdf = _make_pdf(tmp_path / "p.pdf", "No identifier.", title="Embedded Title", author="E. Author")
 
-    assert resolve_pdf_metadata(pdf) == {"title": "Embedded Title", "authors": "E. Author", "doi": ""}
+    assert resolve_pdf_metadata(pdf) == {"title": "Embedded Title", "authors": "E. Author", "doi": "", "arxiv_id": ""}
 
 
 def test_filename_is_the_title_of_last_resort(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "crossref_lookup", lambda doi: {})
     pdf = _make_pdf(tmp_path / "smith2024-cytometry.pdf", "doi 10.1234/xyz")
 
-    assert resolve_pdf_metadata(pdf) == {"title": "smith2024-cytometry", "authors": "", "doi": "10.1234/xyz"}
+    assert resolve_pdf_metadata(pdf) == {
+        "title": "smith2024-cytometry", "authors": "", "doi": "10.1234/xyz", "arxiv_id": "",
+    }
 
 
 def test_an_unreadable_file_still_resolves(tmp_path):
@@ -164,4 +176,90 @@ def test_an_unreadable_file_still_resolves(tmp_path):
     broken = tmp_path / "broken.pdf"
     broken.write_bytes(b"not a pdf at all")
 
-    assert resolve_pdf_metadata(broken) == {"title": "broken", "authors": "", "doi": ""}
+    assert resolve_pdf_metadata(broken) == {"title": "broken", "authors": "", "doi": "", "arxiv_id": ""}
+
+
+# ── arXiv IDs ──────────────────────────────────────────────────────────────────
+# arXiv preprints rarely print a DOI, so the arXiv ID is what lets
+# fetch_recent_papers recognise one already in the papers folder.
+
+def test_arxiv_stamp_found_without_its_version(tmp_path):
+    pdf = _make_pdf(tmp_path / "p.pdf", "arXiv:2411.01234v2  [cs.LG]  3 Nov 2024")
+    assert extract_arxiv_id(pdf) == "2411.01234"
+
+
+def test_arxiv_stamp_preferred_over_a_cited_preprint(tmp_path):
+    """A first page can cite other preprints; the margin stamp names this one."""
+    pdf = _make_pdf(
+        tmp_path / "p.pdf",
+        "Building on arXiv:2301.00001, we ...\narXiv:2411.01234v1 [q-bio.QM] 1 Nov 2024",
+    )
+    assert extract_arxiv_id(pdf) == "2411.01234"
+
+
+def test_old_style_arxiv_id_found(tmp_path):
+    pdf = _make_pdf(tmp_path / "p.pdf", "arXiv:hep-th/9901001v3 [hep-th]")
+    assert extract_arxiv_id(pdf) == "hep-th/9901001"
+
+
+def test_no_arxiv_id_gives_empty_string(tmp_path):
+    pdf = _make_pdf(tmp_path / "p.pdf", "doi: 10.1038/s41586-020-1234-5")
+    assert extract_arxiv_id(pdf) == ""
+
+
+def test_arxiv_id_read_from_an_arxiv_doi():
+    assert arxiv_id_from_doi("10.48550/arXiv.2411.01234") == "2411.01234"
+    assert arxiv_id_from_doi("10.1038/s41586-020-1234-5") == ""
+
+
+def test_arxiv_lookup_maps_title_and_authors(monkeypatch):
+    """Only the ID goes to arXiv; whitespace in the title is collapsed."""
+    requested = []
+
+    def fake_results(search):
+        requested.append(search.id_list)
+        return iter([arxiv.Result(
+            entry_id="http://arxiv.org/abs/2411.01234v2",
+            title="Sparse  Autoencoders\n for Cells",
+            authors=[arxiv.Result.Author("Ada Lovelace"), arxiv.Result.Author("Alan Turing")],
+        )])
+
+    monkeypatch.setattr(metadata._arxiv_client, "results", fake_results)
+
+    assert arxiv_lookup("2411.01234") == {
+        "title": "Sparse Autoencoders for Cells", "authors": "Ada Lovelace, Alan Turing",
+    }
+    assert requested == [["2411.01234"]]
+
+
+def test_arxiv_lookup_failure_gives_empty_dict(monkeypatch):
+    def failing_results(search):
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr(metadata._arxiv_client, "results", failing_results)
+    assert arxiv_lookup("2411.01234") == {}
+
+
+def test_arxiv_title_used_when_there_is_no_doi(tmp_path, monkeypatch):
+    """An arXiv preprint saved as "2411.01234v2.pdf" gets its real title, not the filename."""
+    monkeypatch.setattr(metadata, "arxiv_lookup",
+                        lambda arxiv_id: {"title": "Sparse Autoencoders", "authors": "A. Lovelace"})
+    pdf = _make_pdf(tmp_path / "2411.01234v2.pdf", "arXiv:2411.01234v2 [cs.LG] 3 Nov 2024")
+
+    assert resolve_pdf_metadata(pdf) == {
+        "title": "Sparse Autoencoders", "authors": "A. Lovelace", "doi": "", "arxiv_id": "2411.01234",
+    }
+
+
+def test_journal_title_wins_over_the_preprint_title(tmp_path, monkeypatch):
+    """A published paper with both identifiers keeps Crossref's title; arXiv isn't asked."""
+    def must_not_call(arxiv_id):
+        raise AssertionError("arXiv must not be asked when Crossref has a title")
+
+    monkeypatch.setattr(metadata, "crossref_lookup", lambda doi: {"title": "Journal Title"})
+    monkeypatch.setattr(metadata, "arxiv_lookup", must_not_call)
+    pdf = _make_pdf(tmp_path / "p.pdf", "arXiv:2411.01234v2 [cs.LG]\ndoi 10.1234/xyz")
+
+    result = resolve_pdf_metadata(pdf)
+    assert result["title"] == "Journal Title"
+    assert result["arxiv_id"] == "2411.01234"

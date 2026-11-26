@@ -358,14 +358,18 @@ def kb_stats() -> str:
     return "\n".join(lines)
 
 
-def _papers_already_indexed() -> tuple[set[str], set[str]]:
-    """(DOIs, normalised titles) of every indexed paper, for "already have it" marks."""
+def _papers_already_indexed() -> tuple[set[str], set[str], set[str]]:
+    """
+    (DOIs, arXiv IDs, normalised titles) of every indexed paper, for the
+    "already have it" marks. A recent paper matching any one of them is marked.
+    """
     result = _store()._collection.get(
         where={"doc_type": {"$eq": "paper"}}, include=["metadatas"]
     )
     dois = {str(m["doi"]).lower() for m in result["metadatas"] if m.get("doi")}
+    arxiv_ids = {str(m["arxiv_id"]).lower() for m in result["metadatas"] if m.get("arxiv_id")}
     titles = {" ".join(str(m["title"]).lower().split()) for m in result["metadatas"] if m.get("title")}
-    return dois, titles
+    return dois, arxiv_ids, titles
 
 
 @server.tool(annotations=READ_ONLY_INTERNET)
@@ -415,18 +419,20 @@ def fetch_recent_papers(
     papers = [paper for paper in deduplicate(papers) if paper.get("published", "") >= cutoff]
 
     try:
-        indexed_dois, indexed_titles = _papers_already_indexed()
+        indexed_dois, indexed_arxiv_ids, indexed_titles = _papers_already_indexed()
     except Exception as exc:
         # The list is still useful without the marks; say they are missing.
         log.warning("could not read indexed papers for marking: %s", exc)
-        indexed_dois, indexed_titles = set(), set()
+        indexed_dois, indexed_arxiv_ids, indexed_titles = set(), set(), set()
         problems.append("could not check which papers are already in the knowledge base")
 
     lines = [f"{len(papers)} paper(s) from {source} in the last {days} day(s):\n"]
     for index, paper in enumerate(papers, 1):
         doi = paper.get("doi", "")
+        arxiv_id = paper.get("arxiv_id", "")
         have_it = (
             (doi and doi.lower() in indexed_dois)
+            or (arxiv_id and arxiv_id.lower() in indexed_arxiv_ids)
             or " ".join(paper["title"].lower().split()) in indexed_titles
         )
         mark = "  [ALREADY IN PAPERS]" if have_it else ""

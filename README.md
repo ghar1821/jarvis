@@ -111,6 +111,17 @@ If it doesn't connect:
   terminal. It should sit silently waiting for input (Ctrl-C to stop). Any
   error it prints is the one Claude Desktop hits.
 
+**Claude Code**, including scheduled tasks created in Claude Desktop's
+**Code** tab. Claude Code keeps its own list of MCP servers and doesn't read
+`claude_desktop_config.json`, so add jarvis to it separately:
+
+```bash
+claude mcp add --scope user jarvis -- /absolute/path/to/uv --directory /absolute/path/to/jarvis run jarvis-mcp
+```
+
+`--scope user` makes jarvis available in every Claude Code session.
+`claude mcp list` should then show `jarvis: … ✔ Connected`.
+
 **Antigravity, or any other MCP client.** Add the same `command` and `args` to
 its MCP server configuration. Any client that can launch a local (stdio) MCP
 server works the same way.
@@ -165,9 +176,11 @@ Changes show up at the next sync (within `sync_minutes`, 30 by default).
 `uv run kb sync` runs one now.
 
 **Paper details.** Jarvis reads the DOI printed on the first page and looks
-up the title and authors on [Crossref](https://www.crossref.org). It sends only
-the DOI. Without a DOI it uses the PDF's own metadata, and failing that, the
-filename.
+up the title and authors on [Crossref](https://www.crossref.org). arXiv
+preprints usually print no DOI, so for those it reads the arXiv ID that arXiv
+stamps in the page margin and asks arXiv instead. Each lookup sends only the
+DOI or arXiv ID. With neither, it uses the PDF's own metadata, and failing
+that, the filename.
 
 **Highlights and typed notes.** Highlights and typed notes made in macOS
 Preview or Foxit Reader are indexed too, and saving new ones re-indexes the
@@ -230,25 +243,39 @@ is not private.
 
 ## A weekly paper digest
 
-Your assistant can run the digest on a schedule:
-
-- **Claude Desktop:** *Scheduled tasks*.
-- **Antigravity:** *background automations* (`/schedule`, `/automation`).
-
-Create a weekly task whose prompt asks it to call `fetch_recent_papers` for
-your categories and score the results against your interests.
+Your assistant can run the digest on a schedule. Create a weekly task whose
+prompt asks it to call `fetch_recent_papers` for your categories and score
+the results against your interests.
 [`docs/examples/weekly-digest-task.md`](docs/examples/weekly-digest-task.md)
 is a ready-to-paste prompt; edit the research context to match your work. To
 keep a paper, open its DOI link and save the PDF into `papers_dir`.
 
-Some things to know:
+**The task has to run on your computer**, because that's where jarvis is.
+Where you create it matters:
 
-- **Local tasks only.** Claude Desktop's local tasks run only while the app is
-  open and the computer is awake. A cloud-run task can't reach jarvis, because
-  jarvis runs on your machine.
-- **Pre-approve the tools.** For an unattended run, set `fetch_recent_papers`
-  and `search_kb` to "always allow" in the client. Both only read, so this is
-  safe.
+- **Claude Desktop, Cowork tab: doesn't work.** Cowork's scheduled tasks run
+  in the cloud, so they can't reach jarvis. A run there reports that the
+  jarvis tools aren't available, and lists only claude.ai connectors such as
+  PubMed.
+- **Claude Desktop, Code tab: works.** These are Claude Code scheduled tasks,
+  and they run on your computer. Add jarvis to Claude Code first (see
+  [Connect your assistant](#4-connect-your-assistant)). They run only while
+  Claude Desktop is open and the computer is awake.
+- **Antigravity background automations** (`/schedule`, `/automation`) haven't
+  been tested. They can only reach jarvis if they run on your computer.
+
+For an unattended run, set `fetch_recent_papers` and `search_kb` to "always
+allow", or run the task once by hand and approve them then. Both only read,
+so this is safe. `kb serve` must be running when the task fires.
+
+**How papers you already have are left out.** `fetch_recent_papers` marks a
+paper `[ALREADY IN PAPERS]` when it matches one in your papers folder, and
+the prompt tells the assistant to skip those. Jarvis does the matching, not
+the assistant. A paper matches if it has the same DOI, the same arXiv ID
+(any version) or the same title. bioRxiv papers match by DOI and arXiv
+papers by arXiv ID. It can miss a paper whose PDF prints neither identifier
+and whose title is different, for example a journal PDF of a paper whose
+arXiv preprint is in the feed.
 
 ---
 
