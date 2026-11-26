@@ -1,23 +1,25 @@
 """
-Automatic metadata inference for locally-added PDFs.
+Title, authors and DOI for a PDF in the papers folder, without an LLM.
 
-Local PDFs arrive with nothing but a filename, so infer_pdf_metadata() reads
-the first couple of pages and asks the active provider to extract a title
-and author list. A DOI is looked for with a regex first — cheap and exact
-when present — and the LLM is only asked to guess one when the regex misses.
-resolve_pdf_metadata() is the entry point every add-path calls: it layers
-explicit user overrides and inference, so the three call sites (kb add, chat
-add_document, daemon ingest_pdf) share one policy instead of three copies of
-it. Local PDFs are always public papers, so inference never needs to worry
-about reaching a cloud provider with private content — that guard lives
-entirely in the vault-note privacy machinery instead.
+A PDF arrives with nothing but its bytes, so resolve_pdf_metadata() works
+down a list of sources and keeps the first answer for each field:
+
+  1. DOI — a regex over the first pages. Most published papers print it.
+  2. Crossref — given a DOI, its public API returns the canonical title and
+     author list. Only the DOI is sent, with a generic User-Agent.
+  3. The PDF's own embedded metadata (title/author), which publishers and
+     LaTeX often fill in, though sometimes with junk like "untitled".
+  4. The filename, as the title of last resort.
+
+Every step is best-effort: a failure is logged and the next source is tried,
+so a paper is always indexed, at worst under its filename.
 """
 
-import json
 import re
 from pathlib import Path
 
 import pymupdf
+import requests
 
 from jarvis.core.logs import get_logger
 
@@ -25,97 +27,101 @@ log = get_logger(__name__)
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
 
-_EXTRACTION_PROMPT = (
-    "Below is text extracted from the first pages of a PDF document. Extract "
-    "the paper's title and author list.{doi_instruction} Respond with ONLY a "
-    'JSON object of the form {{"title": "...", "authors": "...", "doi": "..."}} '
-    "(omit a field — empty string — if you can't find it). No other text."
-    "\n\n---\n{excerpt}\n---"
-)
+_CROSSREF_URL = "https://api.crossref.org/works/{doi}"
+# Generic on purpose: Crossref's "polite pool" asks for a contact email, and
+# jarvis never sends anything that identifies its user.
+_CROSSREF_HEADERS = {"User-Agent": "jarvis-kb/1.0 (personal knowledge base)"}
+_CROSSREF_TIMEOUT = 10
+
+# Embedded titles that are really placeholders left by an authoring tool.
+_JUNK_TITLES = {"", "untitled", "microsoft word", "title", "paper"}
 
 
-def _extract_excerpt(pdf_path: Path, max_pages: int = 2) -> str:
+def extract_doi(pdf_path: Path, max_pages: int = 2) -> str:
+    """The first DOI printed on the first pages, or "" if there is none."""
     doc = pymupdf.open(pdf_path)
     try:
-        return "\n".join(page.get_text() for page in doc[: min(max_pages, len(doc))])
+        excerpt = "\n".join(page.get_text() for page in doc[: min(max_pages, len(doc))])
     finally:
         doc.close()
+    match = _DOI_RE.search(excerpt)
+    # A DOI printed mid-sentence often drags trailing punctuation with it.
+    return match.group(0).rstrip(").,;") if match else ""
 
 
-def _parse_json_object(raw: str) -> dict:
+def crossref_lookup(doi: str) -> dict:
     """
-    Models often wrap JSON in commentary or code fences despite instructions
-    not to — pull out the first {...} substring rather than requiring the
-    whole response to be valid JSON.
+    {title, authors} for a DOI from Crossref, or {} on any failure.
+
+    Authors are joined as "Given Family, Given Family" — the same shape the
+    arXiv fetcher produces, so author-name search behaves the same for both.
     """
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        return {}
     try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        log.warning("metadata inference returned unparseable JSON: %s", exc)
+        response = requests.get(
+            _CROSSREF_URL.format(doi=doi),
+            headers=_CROSSREF_HEADERS,
+            timeout=_CROSSREF_TIMEOUT,
+        )
+        response.raise_for_status()
+        work = response.json().get("message", {})
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("Crossref lookup failed for %s: %s", doi, exc)
         return {}
-
-
-def infer_pdf_metadata(pdf_path: Path, provider) -> dict:
-    """
-    Infer {title, authors, doi} from a local PDF's first pages via one small
-    provider.complete() call. Returns only the keys it filled in — always
-    includes "doi" (possibly ""). Degrades to {} on any LLM failure —
-    inference is best-effort, never fatal to the add.
-    """
-    excerpt = _extract_excerpt(pdf_path)
-    doi_match = _DOI_RE.search(excerpt)
-    regex_doi = doi_match.group(0).rstrip(").,;") if doi_match else ""
-
-    doi_instruction = "" if regex_doi else " Also extract the DOI if one appears in the text."
-    prompt = _EXTRACTION_PROMPT.format(doi_instruction=doi_instruction, excerpt=excerpt[:4000])
-    try:
-        raw = provider.complete([{"role": "user", "content": prompt}], max_tokens=300)
-        parsed = _parse_json_object(raw)
-    except Exception as exc:
-        # Best-effort by design — a failure here must not stop the add. But a
-        # paper landing with its filename as the title and no authors is
-        # otherwise unexplained, so the reason goes in the log.
-        log.warning("metadata inference failed, falling back to the filename: %s", exc)
-        parsed = {}
 
     result: dict = {}
-    if parsed.get("title"):
-        result["title"] = str(parsed["title"]).strip()
-    if parsed.get("authors"):
-        result["authors"] = str(parsed["authors"]).strip()
-    result["doi"] = regex_doi or str(parsed.get("doi", "")).strip()
+    titles = work.get("title") or []
+    if titles and str(titles[0]).strip():
+        result["title"] = " ".join(str(titles[0]).split())
+    names = [
+        " ".join(part for part in (author.get("given", ""), author.get("family", "")) if part)
+        for author in work.get("author") or []
+    ]
+    names = [name for name in names if name]
+    if names:
+        result["authors"] = ", ".join(names)
     return result
 
 
-def resolve_pdf_metadata(
-    pdf_path: Path,
-    provider,
-    title_override: str = "",
-    authors_override: str = "",
-    doi_override: str = "",
-) -> dict:
+def embedded_metadata(pdf_path: Path) -> dict:
+    """{title, authors} from the PDF's own metadata dictionary, skipping placeholders."""
+    doc = pymupdf.open(pdf_path)
+    try:
+        info = doc.metadata or {}
+    finally:
+        doc.close()
+    result: dict = {}
+    title = " ".join(str(info.get("title") or "").split())
+    if title.lower() not in _JUNK_TITLES:
+        result["title"] = title
+    author = " ".join(str(info.get("author") or "").split())
+    if author:
+        result["authors"] = author
+    return result
+
+
+def resolve_pdf_metadata(pdf_path: Path) -> dict:
     """
-    Resolve title/authors/doi for one local-PDF add, applying in order:
-      1. explicit overrides — always win, skip inference entirely if all three given
-      2. automatic inference for whichever fields are still unset
+    Resolve {"title", "authors", "doi"} for one PDF. Never raises.
 
-    Local PDFs are always public papers, so inference is always allowed —
-    there is no private-note guard to apply here (private documents only
-    ever come from the Obsidian vault, handled separately).
-
-    Returns {"title", "authors", "doi"}; each defaults to "" (caller falls
-    back to the filename stem for title).
+    Title always ends up non-empty (the filename stem at worst); authors and
+    doi are "" when nothing found them.
     """
-    if title_override and authors_override and doi_override:
-        return {"title": title_override, "authors": authors_override, "doi": doi_override}
+    try:
+        doi = extract_doi(pdf_path)
+    except Exception as exc:
+        log.warning("could not read %s to look for a DOI: %s", pdf_path.name, exc)
+        doi = ""
 
-    inferred = infer_pdf_metadata(pdf_path, provider)
+    from_crossref = crossref_lookup(doi) if doi else {}
+
+    try:
+        from_pdf = embedded_metadata(pdf_path)
+    except Exception as exc:
+        log.warning("could not read embedded metadata from %s: %s", pdf_path.name, exc)
+        from_pdf = {}
 
     return {
-        "title": title_override or inferred.get("title", ""),
-        "authors": authors_override or inferred.get("authors", ""),
-        "doi": doi_override or inferred.get("doi", ""),
+        "title": from_crossref.get("title") or from_pdf.get("title") or pdf_path.stem,
+        "authors": from_crossref.get("authors") or from_pdf.get("authors", ""),
+        "doi": doi,
     }

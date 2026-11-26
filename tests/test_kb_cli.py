@@ -1,34 +1,35 @@
 """
-Tests for jarvis/kb/cli.py's `kb doctor` and `kb reindex` subcommands.
+Tests for jarvis/kb/cli.py — `kb doctor`, its migration report, and `kb rebuild`'s
+confirmation.
 
-get_store()/search()/get_config() are monkeypatched to the isolated test
-store (or a stub) so this never touches the real CLI parser's live
-~/.jarvis config — per the project rule that tests must never open the
-user's actual knowledge base.
+The doctor's probe runs in a subprocess, because reading a damaged vector
+index kills the process by signal rather than raising. `_run_doctor_probe` is
+therefore the seam these tests patch: it stands in for "what the child
+reported", and returning None stands in for "the child died". Nothing here
+opens the user's real knowledge base.
 """
 
-import chromadb
+from pathlib import Path
+
 import pytest
 
 from jarvis.core.config import Config
-from jarvis.core.errors import KBCorruptionError, RAGError
 import jarvis.kb.cli as cli
-from jarvis.kb.cli import _check_legacy_pdf_notes, _migrated_chunk_text, cmd_doctor, cmd_reindex
+from jarvis.kb.cli import cmd_doctor, find_unbacked_entries
+from jarvis.kb.store import add_texts
 
 
-# The probe now runs in a subprocess, because reading a damaged vector index
-# kills the process by signal rather than raising. `_run_doctor_probe` is
-# therefore the seam these tests patch: it stands in for "what the child
-# reported", and returning None stands in for "the child died".
+def _healthy(via_server=True, count=5):
+    return {"opened": True, "count": count, "search_ok": True, "error": None,
+            "via_server": via_server}
 
+
+# ── Doctor: health ─────────────────────────────────────────────────────────────
 
 def test_cmd_doctor_reports_healthy_store(monkeypatch, capsys):
-    """A store that opens, counts, and search-probes cleanly reports healthy."""
-    monkeypatch.setattr(
-        cli, "_run_doctor_probe",
-        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None},
-    )
-    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+    """A store that opens, counts and search-probes cleanly reports healthy."""
+    monkeypatch.setattr(cli, "_run_doctor_probe", _healthy)
+    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda: object())
 
     cmd_doctor()
@@ -36,16 +37,14 @@ def test_cmd_doctor_reports_healthy_store(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Store opened" in out
     assert "5 chunk(s) indexed" in out
-    assert "Knowledge base is healthy." in out
+    assert "Search probe succeeded" in out
 
 
 def test_cmd_doctor_survives_an_index_that_kills_the_probe(monkeypatch, capsys):
     """
-    The case that matters most: a damaged HNSW index terminates the child by
-    signal, so there is no exception to catch and nothing to report from
-    inside it. Doctor must survive, explain what happened, and name the
-    recovery command — rather than vanishing with no output, which is what it
-    used to do.
+    A damaged HNSW index terminates the child by signal, so there is no
+    exception to catch. Doctor must survive, explain, and name the recovery —
+    which is a rebuild from the files, since every entry comes from one.
     """
     monkeypatch.setattr(cli, "_run_doctor_probe", lambda: None)
 
@@ -55,18 +54,16 @@ def test_cmd_doctor_survives_an_index_that_kills_the_probe(monkeypatch, capsys):
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "damaged beyond reading" in err
-    assert "kb reindex --from-storage" in err
-    # It must also say the documents are probably fine, or the message reads
-    # like total data loss when it is not.
-    assert "chroma.sqlite3" in err
+    assert "kb rebuild" in err
+    # It must also say nothing is lost, or it reads like total data loss.
+    assert "Nothing is lost" in err
 
 
 def test_cmd_doctor_exits_nonzero_on_corruption(monkeypatch, capsys):
     """A corrupted index reports the diagnosis and exits non-zero, scriptably."""
     monkeypatch.setattr(
         cli, "_run_doctor_probe",
-        lambda: {"opened": True, "count": 5, "search_ok": False,
-                 "error": "run `uv run kb reindex`"},
+        lambda: {"opened": True, "count": 5, "search_ok": False, "error": "run `uv run kb rebuild`"},
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -74,8 +71,7 @@ def test_cmd_doctor_exits_nonzero_on_corruption(monkeypatch, capsys):
 
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
-    assert "Search failed" in err
-    assert "kb reindex" in err
+    assert "Search failed" in err and "kb rebuild" in err
 
 
 def test_cmd_doctor_exits_nonzero_when_store_fails_to_open(monkeypatch, capsys):
@@ -94,215 +90,126 @@ def test_cmd_doctor_exits_nonzero_when_store_fails_to_open(monkeypatch, capsys):
 
 
 def test_cmd_doctor_reports_empty_store_without_search_probe(monkeypatch, capsys):
-    """An empty store is healthy by definition — no search probe is attempted."""
-    monkeypatch.setattr(
-        cli, "_run_doctor_probe",
-        lambda: {"opened": True, "count": 0, "search_ok": None, "error": None},
-    )
+    """An empty store is healthy by definition, and the fix is a sync."""
+    monkeypatch.setattr(cli, "_run_doctor_probe", lambda: _healthy(count=0))
 
     cmd_doctor()
 
     out = capsys.readouterr().out
     assert "0 chunk(s) indexed" in out
-    assert "empty" in out
+    assert "kb sync" in out
 
 
-def test_cmd_reindex_backfills_embed_header_end_to_end(tmp_path, monkeypatch, embeddings):
-    """
-    Full pass through cmd_reindex against an isolated, temporary ChromaDB
-    directory (never ~/.jarvis): a legacy header-less paper chunk comes out
-    the other side with the header prepended, while an annotation chunk and
-    a note chunk are left exactly as they were.
-    """
-    from jarvis.kb.store import COLLECTION_NAME
-
-    client = chromadb.PersistentClient(path=str(tmp_path))
-    collection = client.create_collection(COLLECTION_NAME)
-    collection.add(
-        ids=["paper-chunk", "annotation-chunk", "note-chunk"],
-        documents=[
-            "The dominant sequence transduction models are based on...",
-            "Figure 2: architecture diagram.",
-            "Meeting notes from Tuesday.",
-        ],
-        metadatas=[
-            {"doc_type": "paper", "title": "Attention Is All You Need", "authors": "Vaswani et al."},
-            {"doc_type": "paper", "annotation_kind": "figure",
-             "title": "Attention Is All You Need", "authors": "Vaswani et al."},
-            {"doc_type": "note", "title": "Meeting notes from Tuesday.", "authors": ""},
-        ],
-        embeddings=[[0.0] * 384, [0.0] * 384, [0.0] * 384],
-    )
-
-    cfg = Config(rag_dir=tmp_path)
-    monkeypatch.setattr("jarvis.core.config.get_config", lambda: cfg)
-    monkeypatch.setattr("jarvis.kb.store.build_embeddings", lambda model, prefix: embeddings)
-
-    cmd_reindex(None)
-
-    reindexed = client.get_collection(COLLECTION_NAME)
-    stored = reindexed.get(ids=["paper-chunk", "annotation-chunk", "note-chunk"], include=["documents"])
-    by_id = dict(zip(stored["ids"], stored["documents"]))
-
-    assert by_id["paper-chunk"].startswith("Attention Is All You Need — Vaswani et al.\n")
-    assert by_id["annotation-chunk"] == "Figure 2: architecture diagram."
-    assert by_id["note-chunk"] == "Meeting notes from Tuesday."
-
-    # A second reindex pass must be a no-op on the already-migrated text.
-    cmd_reindex(None)
-    reindexed_again = client.get_collection(COLLECTION_NAME)
-    stored_again = reindexed_again.get(ids=["paper-chunk"], include=["documents"])
-    assert stored_again["documents"][0] == by_id["paper-chunk"]
-
-
-# ── `kb doctor` legacy PDF-note migration ───────────────────────────────────
-#
-# Local PDFs are now always public papers — notes come exclusively from the
-# vault. `_check_legacy_pdf_notes` finds leftover doc_type="note" chunks with
-# a .pdf file_path and offers to reclassify the public ones; private ones are
-# never silently flipped.
-
-
-def test_check_legacy_pdf_notes_reclassifies_public_on_yes(store, tmp_path, monkeypatch, capsys):
-    """A public legacy PDF note is reclassified to doc_type='paper' after a y answer."""
-    from jarvis.kb.store import add_texts
-
-    fake_pdf = tmp_path / "paper.pdf"
-    fake_pdf.write_bytes(b"%PDF fake content")
-    source = fake_pdf.as_uri()
-    add_texts(
-        content="Body text of a legacy PDF note.",
-        doc_type="note", visibility="public", source=source,
-        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
-                         "content_hash": "abc123", "storage_mode": "full_text"},
-        store=store,
-    )
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
-
-    _check_legacy_pdf_notes(store)
-
-    out = capsys.readouterr().out
-    assert "1 legacy PDF note(s) found" in out
-    assert "Reclassified 1 document(s)" in out
-    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
-    assert stored["metadatas"][0]["doc_type"] == "paper"
-
-
-def test_check_legacy_pdf_notes_skips_public_on_no(store, tmp_path, monkeypatch, capsys):
-    """Declining the prompt leaves the entry as doc_type='note' for next time."""
-    from jarvis.kb.store import add_texts
-
-    fake_pdf = tmp_path / "paper.pdf"
-    fake_pdf.write_bytes(b"%PDF fake content")
-    source = fake_pdf.as_uri()
-    add_texts(
-        content="Body text of a legacy PDF note.",
-        doc_type="note", visibility="public", source=source,
-        extra_metadata={"title": "Legacy Note", "file_path": str(fake_pdf),
-                         "content_hash": "abc123", "storage_mode": "full_text"},
-        store=store,
-    )
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
-
-    _check_legacy_pdf_notes(store)
-
-    out = capsys.readouterr().out
-    assert "Skipped" in out
-    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
-    assert stored["metadatas"][0]["doc_type"] == "note"
-
-
-def test_check_legacy_pdf_notes_never_reclassifies_private(store, tmp_path, monkeypatch, capsys):
-    """
-    A private legacy PDF note is only listed with resolution options — never
-    silently made public — and no prompt is even shown for it.
-    """
-    from jarvis.kb.store import add_texts
-
-    fake_pdf = tmp_path / "notebook.pdf"
-    fake_pdf.write_bytes(b"%PDF fake content")
-    source = fake_pdf.as_uri()
-    add_texts(
-        content="Confidential lab notebook entry.",
-        doc_type="note", visibility="private", source=source,
-        extra_metadata={"title": "Private Note", "file_path": str(fake_pdf),
-                         "content_hash": "def456", "storage_mode": "full_text"},
-        store=store,
-    )
-
-    def _fail_if_prompted(prompt=""):
-        raise AssertionError("private PDF notes must never trigger a reclassify prompt")
-
-    monkeypatch.setattr("builtins.input", _fail_if_prompted)
-
-    _check_legacy_pdf_notes(store)
-
-    out = capsys.readouterr().out
-    assert "1 private legacy PDF note(s) found" in out
-    assert "kb remove" in out
-    stored = store._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
-    assert stored["metadatas"][0]["doc_type"] == "note"
-    assert stored["metadatas"][0]["visibility"] == "private"
-
-
-def test_check_legacy_pdf_notes_no_op_when_none_found(store, capsys):
-    """No legacy PDF notes in the store — nothing is printed, no prompt shown."""
-    _check_legacy_pdf_notes(store)
-    assert capsys.readouterr().out == ""
-
-
-# ── The knowledge-base server ──────────────────────────────────────────────────
-
-
-def test_doctor_says_when_the_server_is_not_running(monkeypatch, capsys):
-    """
-    "Is the server up?" is the first question when chat searches fail but the
-    CLI is fine — they are different processes reaching the same data by
-    different routes, and only one of them needs the server.
-    """
-    monkeypatch.setattr(
-        cli, "_run_doctor_probe",
-        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None,
-                 "via_server": False},
-    )
-    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+def test_doctor_says_when_kb_serve_is_not_running(monkeypatch, capsys):
+    """jarvis-mcp needs `kb serve`; the CLI does not. Doctor says which case this is."""
+    monkeypatch.setattr(cli, "_run_doctor_probe", lambda: _healthy(via_server=False))
+    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
 
-    cli.cmd_doctor()
+    cmd_doctor()
 
     out = capsys.readouterr().out
-    assert "server is NOT running" in out
-    assert "uv run kb server" in out
+    assert "kb serve is NOT running" in out
+    assert "uv run kb serve" in out
 
 
-def test_doctor_confirms_the_server_when_it_is_up(monkeypatch, capsys):
-    monkeypatch.setattr(
-        cli, "_run_doctor_probe",
-        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None,
-                 "via_server": True},
-    )
-    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+def test_doctor_confirms_kb_serve_when_it_is_up(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_run_doctor_probe", _healthy)
+    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
     monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
 
-    cli.cmd_doctor()
+    cmd_doctor()
 
     out = capsys.readouterr().out
-    assert "server is running" in out
+    assert "kb serve is running" in out
     assert "NOT running" not in out
 
 
-def test_reindex_from_storage_refuses_while_the_server_holds_the_index(monkeypatch, capsys):
+# ── Doctor: the one-time migration report ──────────────────────────────────────
+
+@pytest.fixture
+def legacy_index(store, tmp_path):
+    """An index holding one of everything an older version could have added."""
+    papers_dir = tmp_path / "papers"
+    papers_dir.mkdir()
+    backed_pdf = papers_dir / "kept.pdf"
+
+    def add(content, doc_type, visibility, source, **metadata):
+        add_texts(content=content, doc_type=doc_type, visibility=visibility,
+                  source=source, extra_metadata=metadata, store=store)
+
+    add("A paper in the papers folder.", "paper", "public", backed_pdf.as_uri(),
+        title="Kept paper", file_path=str(backed_pdf))
+    add("A paper added by arXiv URL.", "paper", "public", "https://arxiv.org/abs/2301.00001",
+        title="URL paper", doi="10.48550/arXiv.2301.00001")
+    add("A paper added from Downloads.", "paper", "public", "file:///Users/x/Downloads/d.pdf",
+        title="Downloads paper", file_path="/Users/x/Downloads/d.pdf")
+    add("A weekly digest.", "digest", "public", "file:///digests/2026-07-06.md",
+        title="Paper Digest — 2026-07-06")
+    add("A private note.", "note", "private", "local",
+        title="Secret salary note", file_path="private/salary.md")
+    add("An old chat exchange.", "chat", "public", "session:abc", title="A chat")
+    add("A public note.", "note", "public", "local", title="Public note", file_path="n.md")
+    return store, Config(papers_dir=papers_dir)
+
+
+def test_unbacked_entries_are_grouped_and_private_ones_only_counted(legacy_index):
     """
-    --from-storage reads chroma.sqlite3 with raw SQL. Doing that behind the
-    server's back would race it on the same file, so it stops with the fix
-    rather than producing a confusing failure deeper down.
+    Everything a rebuild would drop is found: papers with no file in
+    papers_dir (with a DOI link where one is known), digests, private
+    documents (counted only — their titles are private too) and chat chunks.
+    Backed papers and public notes are not reported.
     """
-    import argparse
+    store, config = legacy_index
 
-    monkeypatch.setattr("jarvis.kb.store._server_client", lambda port: object())
+    unbacked = find_unbacked_entries(store, config)
 
-    with pytest.raises(SystemExit) as caught:
-        cli.cmd_reindex(argparse.Namespace(from_storage=True))
+    assert [paper["title"] for paper in unbacked["papers"]] == ["Downloads paper", "URL paper"]
+    assert unbacked["papers"][1]["doi"] == "10.48550/arXiv.2301.00001"
+    assert unbacked["digests"] == ["Paper Digest — 2026-07-06"]
+    assert unbacked["private_documents"] == 1
+    assert unbacked["chat_chunks"] == 1
 
-    assert caught.value.code == 1
-    assert "Stop it first" in capsys.readouterr().err
+
+def test_the_report_names_how_to_keep_each_paper_and_hides_private_titles(
+    legacy_index, monkeypatch, capsys
+):
+    store, config = legacy_index
+    monkeypatch.setattr("jarvis.core.config.get_config", lambda: config)
+
+    cli._report_unbacked_entries(store)
+
+    out = capsys.readouterr().out
+    assert "https://doi.org/10.48550/arXiv.2301.00001" in out
+    assert "/Users/x/Downloads/d.pdf" in out
+    assert "1 private document(s)" in out
+    assert "Secret salary note" not in out
+    assert "uv run kb rebuild" in out
+
+
+def test_a_clean_index_reports_nothing_to_migrate(store, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("jarvis.core.config.get_config", lambda: Config(papers_dir=tmp_path))
+    add_texts(content="A public note.", doc_type="note", visibility="public", source="local",
+              extra_metadata={"file_path": "n.md"}, store=store)
+
+    cli._report_unbacked_entries(store)
+
+    assert "Every entry comes from a file" in capsys.readouterr().out
+
+
+# ── Rebuild confirmation ───────────────────────────────────────────────────────
+
+def test_rebuild_does_nothing_unless_confirmed(monkeypatch, capsys):
+    """The rebuild prompt defaults to no, and a no touches nothing."""
+    def must_not_rebuild(cfg):
+        raise AssertionError("rebuild_index must not run without a yes")
+
+    monkeypatch.setattr("jarvis.kb.mirror.rebuild_index", must_not_rebuild)
+    monkeypatch.setattr("jarvis.core.config.get_config", lambda: Config(papers_dir=Path("/p")))
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    cli.cmd_rebuild()
+
+    out = capsys.readouterr().out
+    assert "no file anywhere is touched" in out
+    assert "Cancelled." in out

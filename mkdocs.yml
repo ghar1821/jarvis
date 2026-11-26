@@ -1,5 +1,5 @@
 site_name: jarvis
-site_description: A personal research knowledge base with an arXiv digest and a local-first LLM agent
+site_description: Your Obsidian vault and papers as a read-only knowledge base for MCP clients
 site_url: https://ghar1821.github.io/jarvis/
 repo_url: https://github.com/ghar1821/jarvis
 repo_name: ghar1821/jarvis
@@ -63,6 +63,7 @@ nav:
   - Home: index.md
   - Design: DESIGN.md
   - Testing: TESTING.md
+  - Weekly digest task: examples/weekly-digest-task.md
   - Changelog: CHANGELOG.md
   - Blog: blog/index.md
 

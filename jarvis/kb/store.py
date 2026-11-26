@@ -1,57 +1,39 @@
 """
-Knowledge base using LangChain + ChromaDB.
+Knowledge base storage and retrieval, using LangChain + ChromaDB.
 
-Single unified collection with a flat document schema. All content —
-papers, vault notes, local PDFs — is chunked and stored as LangChain
-Documents with consistent metadata.
+One collection with a flat document schema. What goes into it — which files,
+and when — is decided by jarvis/kb/mirror.py; this module only stores chunks
+and searches them.
 
 Document schema
 ---------------
   page_content : str   — chunked text (embedded for similarity search)
   metadata:
     date_added  : str  — ISO timestamp of when the chunk was indexed
-    doc_type    : str  — "paper" | "note" | "chat" (past chat exchanges) |
-                         "digest" (indexed weekly digest .md files)
-    visibility  : str  — "public" | "private" (papers are always public)
-    source      : str  — arXiv/DOI URL for papers, file:/// URI for local
-                         PDFs and digest files, "local" for vault notes,
-                         "session:<id>" for chat exchanges
-    title       : str  — display title (optional)
+    doc_type    : str  — "paper" | "note"  ("chat"/"digest" only on indexes
+                         built by older versions, until `kb rebuild`)
+    visibility  : str  — always "public" for anything indexed now; private
+                         vault folders are never indexed
+    source      : str  — file:/// URI for papers, "local" for vault notes
+    title       : str  — display title
     authors     : str  — comma-separated authors, papers only (optional)
-    doi         : str  — DOI for papers, regex/LLM-inferred for local PDFs (optional)
-    score       : int  — relevance score 0-10, papers only (optional)
-    track       : str  — research track label, papers only (optional)
-    file_path   : str  — vault-relative path for notes, absolute for PDFs (optional)
-    content_hash: str  — SHA-256 of full file, used for change detection
+    doi         : str  — DOI, papers only (optional)
+    file_path   : str  — vault-relative path for notes, absolute for papers
+    content_hash: str  — SHA-256 of the whole file, for change and move detection
     chunk_index : int  — position of this chunk within its source document
     section     : str  — markdown header breadcrumb ("H1 › H2"), "" if none
-    storage_mode: str  — "summary" | "full_text" (optional)
-    modified_at : str  — ISO mtime of the source file, vault notes only (optional)
+    modified_at : str  — ISO mtime of the source file, vault notes only
 
-  PDF annotation and figure chunks (see add_annotations / add_figures)
-  additionally carry:
-    annotation_kind : str — "highlight" | "comment" | "figure" (absent on body chunks)
-    page            : int — 1-indexed PDF page the annotation/figure came from
-    note_text       : str — the user's typed comment, "" if none (always "" for figures)
-  They share source/file_path/doc_type/visibility with the parent PDF's body
-  chunks, so every existing delete path sweeps them along automatically.
-  Figure chunks store a vision-model caption prefixed "[FIGURE p.N]".
-
-Privacy model
--------------
-  "public"  — accessible to all providers (local Ollama and Anthropic)
-  "private" — accessible to the local model only
-
-  search_with_privacy_check() enforces this at query time:
-  - cloud provider  → searches public docs only; reports whether private
-                       docs also matched so the user can be warned
-  - local provider  → searches all docs without restriction
+  PDF annotation chunks (see build_annotation_documents) additionally carry:
+    annotation_kind : str — "highlight" | "comment" (absent on body chunks)
+    page            : int — 1-indexed PDF page the annotation came from
+    note_text       : str — the user's typed comment, "" if none
+  They share source/file_path/doc_type/visibility with the paper's body
+  chunks, so every delete path sweeps them along automatically.
 """
 
 import fcntl
-import hashlib
 import os
-import re
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -73,8 +55,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from jarvis.core.config import get_config
-from jarvis.core.llm import is_cloud_provider
-from jarvis.core.errors import KBCorruptionError, LLMError, RAGError
+from jarvis.core.errors import KBCorruptionError, RAGError
 
 COLLECTION_NAME = "knowledge_base"
 
@@ -138,11 +119,11 @@ def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
       it, and it went away the moment that reader was restarted. The server
       owns the index now, so a reader cannot hold a stale copy at all, and a
       one-shot command on the direct path opened the index moments ago. If it
-      still appears, the index genuinely cannot resolve its own ids, and a
-      rebuild is the answer.
+      still appears, the index genuinely cannot resolve its own ids, and
+      `kb rebuild` (from the files) is the answer.
 
     - "Collection [...] does not exist": survives the move to a server. A
-      client resolves a collection to an id once, and `kb reindex` swaps in a
+      client resolves a collection to an id once, and `kb rebuild` swaps in a
       rebuilt collection with a new id, so a process that was already
       connected still names the old one. Restarting it is still the fix.
     """
@@ -152,18 +133,16 @@ def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
     if "Error finding id" in text:
         return KBCorruptionError(
             "The knowledge-base index could not resolve a chunk id it holds a "
-            "reference to. Run `uv run kb doctor` to check the index; if it "
-            "reports missing ids, `uv run kb reindex` rebuilds the vectors "
-            "from the chunk text already stored — nothing is lost. If even "
-            "that cannot run, use `uv run kb reindex --from-storage`."
+            "reference to. Run `uv run kb doctor` to check the index; "
+            "`uv run kb rebuild` recreates it from your vault and papers "
+            "folders — nothing is lost, every entry comes from a file."
         )
     if "does not exist" in text and "Collection" in text:
         return KBCorruptionError(
-            "The knowledge-base collection was rebuilt (by `kb reindex`) while "
+            "The knowledge-base collection was rebuilt (by `kb rebuild`) while "
             "this process was running, so it still refers to the collection "
-            "that was replaced. Fix: restart this process (the webapp or "
-            "jarvis-sync) — nothing is lost; the rebuilt knowledge base is "
-            "intact."
+            "that was replaced. Fix: restart this process (your MCP client, "
+            "or `kb serve`) — nothing is lost; the rebuilt index is intact."
         )
     return RAGError(fallback_message)
 
@@ -254,8 +233,8 @@ def _chroma_settings() -> Settings:
 
 _SERVER_DOWN_HELP = (
     "The knowledge-base server is not running.\n"
-    "  Start it with:  uv run kb server\n"
-    "  It needs to stay running (tmux or its own terminal), like jarvis-sync."
+    "  Start it with:  uv run kb serve\n"
+    "  It needs to stay running (tmux or its own terminal)."
 )
 
 
@@ -263,8 +242,7 @@ def _server_client(port: int):
     """
     Connect to the knowledge-base server, or raise if it is not answering.
 
-    Bound to 127.0.0.1 by both sides: the index holds private note text and
-    Chroma's server has no authentication, so reachability from outside this
+    Bound to 127.0.0.1 by both sides: Chroma's server has no authentication, so reachability from outside this
     machine is the thing that must never become configurable.
     """
     import chromadb
@@ -275,7 +253,7 @@ def _server_client(port: int):
 
 
 # Set once by the entry points that are one-shot commands rather than
-# long-lived services (the kb CLI, run-digest). A flag rather than an argument
+# long-lived services (the kb CLI). A flag rather than an argument
 # threaded through every call site: get_store() is called from a dozen places
 # per command, and one missed kwarg would mean a command that dies whenever
 # the server is down — precisely the case the fallback exists for.
@@ -294,11 +272,50 @@ def allow_direct_index_access() -> None:
     _allow_direct = True
 
 
+def open_index_client():
+    """
+    Return (client, via_server): a raw Chroma client for the index.
+
+    get_store() wraps one fixed collection; `kb rebuild` needs the client
+    itself so it can build a second collection beside the live one and swap
+    it in. Same routing rule as get_store(): through the server when it is up,
+    straight to the files only for a one-shot command and only when it is down.
+    """
+    import chromadb
+
+    cfg = get_config()
+    try:
+        return _server_client(cfg.server_port), True
+    except Exception as exc:
+        if not _allow_direct:
+            raise RAGError(f"{_SERVER_DOWN_HELP}\n  ({exc})") from exc
+    cfg.rag_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(cfg.rag_dir, 0o700)
+    return chromadb.PersistentClient(path=str(cfg.rag_dir), settings=_chroma_settings()), False
+
+
+def open_collection(client, name: str) -> Chroma:
+    """A LangChain store over one named collection, tagged with the embedding model."""
+    cfg = get_config()
+    return Chroma(
+        client=client,
+        collection_name=name,
+        embedding_function=_get_embeddings(),
+        collection_metadata={"embed_model": cfg.embed_model, "query_prefix": cfg.query_prefix},
+    )
+
+
+def forget_store() -> None:
+    """Drop the cached store, so the next get_store() resolves the collection afresh."""
+    global _store
+    _store = None
+
+
 def get_store(rag_dir: Path | None = None, allow_direct: bool = False) -> Chroma:
     """
     Return the process-wide Chroma vector store singleton.
 
-    One process owns the index — the server started by `uv run kb server` —
+    One process owns the index — the server started by `uv run kb serve` —
     and everything else talks to it. That is what stops a long-lived reader
     holding a cached copy of the vector index while another process rewrites
     it underneath (see docs/DESIGN.md, "Who owns the index").
@@ -307,21 +324,21 @@ def get_store(rag_dir: Path | None = None, allow_direct: bool = False) -> Chroma
     is not running. It is for one-shot `kb` commands only: they exit in
     seconds, so they cannot go stale, and it keeps `kb doctor` working at
     exactly the moment the server is the thing that is broken. Long-lived
-    readers (webapp, sync daemon) leave it False and fail loudly instead.
+    readers (`kb serve`'s sync, jarvis-mcp) leave it False and fail loudly instead.
     """
     global _store
     if _store is None:
         d = rag_dir or get_config().rag_dir
         d.mkdir(parents=True, exist_ok=True)
-        # The index holds the full text of private notes, so it gets the same
-        # owner-only treatment as sessions and drafts. chmod every time rather
-        # than only on create: an index that predates this is fixed on open.
+        # The index holds the full text of your notes and papers, so it is
+        # owner-only. chmod every time rather than only on create: an index
+        # that predates this is fixed on open.
         try:
             os.chmod(d, 0o700)
         except OSError as exc:
             # Someone else owning the directory shouldn't stop jarvis working,
-            # but it does mean private note text is readable by whoever can
-            # reach it — worth a line rather than a silent pass.
+            # but it does mean note text is readable by whoever can reach it —
+            # worth a line rather than a silent pass.
             log.warning("could not restrict %s to owner-only access: %s", d, exc)
         cfg = get_config()
         shared: dict = {
@@ -364,7 +381,7 @@ def _check_embedding_model_matches(store: Chroma, embed_model: str) -> None:
         raise RAGError(
             f"Embedding model mismatch: the knowledge base was built with "
             f"'{recorded or 'unknown'}' but config specifies '{embed_model}'. "
-            f"Run 'uv run kb reindex' to re-embed the knowledge base with the new model."
+            f"Run 'uv run kb rebuild' to re-index your folders with the new model."
         )
 
 
@@ -388,8 +405,8 @@ def _split_markdown(content: str) -> list[tuple[str, str]]:
     with the recursive character splitter so long sections still obey the chunk
     size. Every chunk is paired with a breadcrumb of the headers above it, e.g.
     "CRISPR screens › Results", so a chunk carries the context of where it came
-    from. Content with no headers (such as paper summaries) passes through as a
-    single section with an empty breadcrumb — behaviour identical to before.
+    from. Content with no headers passes through as a single section with an
+    empty breadcrumb.
 
     Returns a list of (chunk_text, breadcrumb) pairs.
     """
@@ -416,10 +433,10 @@ def _split_markdown(content: str) -> list[tuple[str, str]]:
 # Each add_* function below splits into two halves: a build_* function that
 # turns its input into Documents without touching the database, and one shared
 # commit_documents() that performs the only write. Keeping the halves separate
-# is what lets a caller assemble a whole document — body, annotations, figure
-# captions — and commit it in a single atomic write. An ingest that is stopped
-# or fails part-way then leaves nothing behind at all, instead of a half-indexed
-# document. See _add_document in jarvis/chat/chat.py for the staged caller.
+# is what lets a caller assemble a whole document — body and annotations — and
+# commit it in a single atomic write. An ingest that fails part-way then leaves
+# nothing behind at all, instead of a half-indexed document. See
+# index_paper_file in jarvis/kb/mirror.py for the staged caller.
 
 
 def commit_documents(
@@ -434,10 +451,6 @@ def commit_documents(
     old entry's chunks are deleted and the new ones added together, so a
     re-ingest is never observable as "old entry gone, new entry not yet here".
 
-    Cancellation is deliberately not checked in here. This is the point of no
-    return — an interrupted Chroma write is exactly the corruption the staging
-    above exists to prevent, so once we reach this function the write always
-    runs to completion.
     """
     s = store or get_store()
     try:
@@ -586,256 +599,6 @@ def add_annotations(
     return commit_documents(documents, store)
 
 
-def build_figure_documents(
-    pdf_path: Path,
-    doc_type: str,
-    visibility: str,
-    source: str,
-    provider_obj,
-    provider_str: str,
-    title: str = "",
-    file_path: str = "",
-    *,
-    enabled: bool | None = None,
-    cancel=None,
-) -> list[Document]:
-    """
-    Caption a PDF's embedded figures with the active provider's vision model
-    and build one Document per figure, ready for commit_documents(). Returns []
-    when there are no figures, captioning is disabled, or the privacy guard
-    blocks it.
-
-    This is the slowest build step by far — one vision call per figure — so
-    cancel is checked before each one. Nothing has been written at this point,
-    so a stop here simply throws the captions away.
-
-    enabled=None follows cfg.figure_captions (off by default); enabled=True
-    forces captioning for this one document — the per-document opt-in behind
-    `kb add --figures` and the chat tool's with_figures. It never overrides
-    the privacy guard below, only the config kill-switch.
-
-    The embedded text is prefixed "[FIGURE p.N]" so retrieval can tell captions
-    apart from body prose. Metadata mirrors the parent PDF's body chunks (same
-    source/file_path/doc_type/visibility, annotation_kind="figure") so deletes
-    and re-ingests sweep figures together with the body and annotations.
-
-    Privacy guard: images of a private note must never reach a cloud model, so
-    when visibility is "private" and the provider is Anthropic, captioning is
-    skipped entirely with a visible warning and nothing is written. Papers are
-    always public, so paper figures caption under either provider.
-
-    Per-figure captioning failures warn and skip that one figure — a single bad
-    image never aborts the ingest.
-    """
-    cfg = get_config()
-    captions_on = cfg.figure_captions if enabled is None else enabled
-    if not captions_on:
-        return []
-
-    if visibility == "private" and is_cloud_provider(provider_str):
-        print(
-            "  ⚠️  skipping figure captioning — images of a private note must not "
-            "reach a cloud provider (switch to the local model to caption them)",
-            flush=True,
-        )
-        return []
-
-    from .images import extract_figures
-
-    figures = extract_figures(
-        pdf_path,
-        max_figures=cfg.figure_max_per_doc,
-        min_pixels=cfg.figure_min_pixels,
-    )
-    if not figures:
-        return []
-
-    documents = []
-    for index, figure in enumerate(figures):
-        if cancel is not None:
-            cancel.check()
-        try:
-            caption = provider_obj.describe_image(
-                figure["image_bytes"], context=title, cancel=cancel
-            )
-        except LLMError as exc:
-            print(f"  ⚠️  figure caption failed (p.{figure['page']}): {exc}", flush=True)
-            continue
-        page_content = f"[FIGURE p.{figure['page']}] {caption}".strip()
-        metadata = {
-            "date_added": datetime.now(timezone.utc).isoformat(),
-            "doc_type": doc_type,
-            "visibility": visibility,
-            "source": source,
-            "title": title,
-            "annotation_kind": "figure",
-            "page": figure["page"],
-            "note_text": "",
-            "chunk_index": index,
-            "section": "",
-        }
-        if file_path:
-            metadata["file_path"] = file_path
-        documents.append(Document(page_content=page_content, metadata=metadata))
-
-    return documents
-
-
-def add_figures(
-    pdf_path: Path,
-    doc_type: str,
-    visibility: str,
-    source: str,
-    provider_obj,
-    provider_str: str,
-    title: str = "",
-    file_path: str = "",
-    store: Chroma | None = None,
-    *,
-    enabled: bool | None = None,
-) -> list[str]:
-    """
-    Caption a PDF's embedded figures and index one chunk per figure. Returns
-    the chunk IDs ([] when there is nothing to caption).
-    """
-    documents = build_figure_documents(
-        pdf_path, doc_type, visibility, source, provider_obj, provider_str,
-        title=title, file_path=file_path, enabled=enabled,
-    )
-    if not documents:
-        return []
-    return commit_documents(documents, store)
-
-
-def _source_exists(source: str, store: Chroma) -> bool:
-    """Return True if any chunks with this source URL are already indexed."""
-    if not source:
-        return False
-    try:
-        result = store._collection.get(where={"source": {"$eq": source}}, include=[])
-        return len(result["ids"]) > 0
-    except Exception as exc:
-        # False means "not a duplicate", so the caller goes ahead and adds.
-        # On a broken store that quietly produces a second copy of a paper
-        # you already have.
-        log.warning("duplicate check by source failed, treating as new: %s", exc)
-        return False
-
-
-def _normalise_title(title: str) -> str:
-    """Lowercase and collapse whitespace so near-identical titles compare equal."""
-    return re.sub(r"\s+", " ", title.strip().lower())
-
-
-def _title_exists(title: str, store: Chroma) -> bool:
-    """
-    Return True if a paper with this title is already indexed, matching on the
-    normalised title. A paper can now arrive via two sources (arXiv + bioRxiv)
-    with different URLs, so source-URL dedup alone is no longer enough. This
-    scans stored paper metadata — fine at personal-KB scale.
-    """
-    if not title:
-        return False
-    target = _normalise_title(title)
-    try:
-        result = store._collection.get(where={"doc_type": {"$eq": "paper"}}, include=["metadatas"])
-        return any(_normalise_title(m.get("title", "")) == target for m in result["metadatas"])
-    except Exception as exc:
-        log.warning("duplicate check by title failed, treating as new: %s", exc)
-        return False
-
-
-def build_paper_documents(
-    paper: dict,
-    dense_summary: str,
-    score: int = 0,
-    track: str = "",
-    storage_mode: str = "summary",
-) -> list[Document]:
-    """
-    Assemble a paper's summary into Documents ready for commit_documents().
-
-    The chunked text leads with title, source URL and authors so a chunk can
-    match on any of them, then carries the dense summary.
-    """
-    source = paper.get("link", "")
-    header_lines = [paper.get("title", ""), source]
-    if paper.get("authors"):
-        header_lines.append(paper["authors"])
-    content = "\n".join(header_lines) + f"\n\n{dense_summary}"
-    return build_text_documents(
-        content=content,
-        doc_type="paper",
-        visibility="public",
-        source=source,
-        extra_metadata={
-            "title": paper.get("title", ""),
-            "authors": paper.get("authors", ""),
-            "doi": paper.get("doi", ""),
-            "score": int(score),
-            "track": str(track),
-            "storage_mode": storage_mode,
-        },
-    )
-
-
-def add_paper(
-    paper: dict,
-    dense_summary: str,
-    score: int = 0,
-    track: str = "",
-    store: Chroma | None = None,
-    storage_mode: str = "summary",
-    allow_duplicate: bool = False,
-) -> list[str]:
-    """
-    Add a paper to the knowledge base. Papers are always public. Skips (returns
-    []) if a paper with the same source URL or the same title is already
-    indexed, unless allow_duplicate is set (the user explicitly chose to add it
-    anyway).
-    """
-    s = store or get_store()
-    source = paper.get("link", "")
-    if not allow_duplicate and (_source_exists(source, s) or _title_exists(paper.get("title", ""), s)):
-        return []
-    documents = build_paper_documents(
-        paper, dense_summary, score=score, track=track, storage_mode=storage_mode
-    )
-    if not documents:
-        return []
-    return commit_documents(documents, s)
-
-
-def add_papers_batch(
-    entries: list[tuple[dict, dict]],
-    store: Chroma | None = None,
-) -> tuple[int, int]:
-    """
-    Batch-add papers from a digest scoring run.
-    Reuses existing summary+why fields — no extra LLM call.
-    Returns (added, skipped): skipped papers were already in the KB (matched by
-    source URL or title), so add_paper returned no chunk ids for them.
-    """
-    s = store or get_store()
-    added = skipped = 0
-    for paper, selected in entries:
-        summary = "\n\n".join(
-            filter(None, [selected.get("summary", ""), selected.get("why", "")])
-        )
-        ids = add_paper(
-            paper=paper,
-            dense_summary=summary,
-            score=selected.get("score", 0),
-            track=selected.get("track", ""),
-            store=s,
-        )
-        if ids:
-            added += 1
-        else:
-            skipped += 1
-    return added, skipped
-
-
 def delete_by_metadata(
     key: str,
     value: str,
@@ -852,109 +615,6 @@ def delete_by_metadata(
             return len(ids)
     except Exception as exc:
         raise RAGError(f"Delete failed: {exc}") from exc
-
-
-def update_paper_metadata(
-    source: str,
-    title: str | None = None,
-    authors: str | None = None,
-    doi: str | None = None,
-    store: Chroma | None = None,
-) -> int:
-    """
-    Apply user-verified title/authors/doi to every chunk of a paper, no
-    re-embedding. Only the fields the caller passes (not None) are changed.
-    Returns the chunk count updated.
-    """
-    s = store or get_store()
-    try:
-        result = s._collection.get(where={"source": {"$eq": source}}, include=["metadatas"])
-    except Exception as exc:
-        raise RAGError(f"Failed to look up source: {exc}") from exc
-
-    ids = result["ids"]
-    if not ids:
-        return 0
-
-    updated_metadatas = []
-    for meta in result["metadatas"]:
-        new_meta = dict(meta)
-        if title is not None:
-            new_meta["title"] = title
-        if authors is not None:
-            new_meta["authors"] = authors
-        if doi is not None:
-            new_meta["doi"] = doi
-        updated_metadatas.append(new_meta)
-
-    try:
-        with _kb_write_lock():
-            s._collection.update(ids=ids, metadatas=updated_metadatas)
-    except Exception as exc:
-        raise RAGError(f"Failed to update metadata: {exc}") from exc
-
-    return len(ids)
-
-
-# ── Legacy PDF-note migration (kb doctor) ──────────────────────────────────────
-#
-# Local PDFs are now always public papers — notes come exclusively from the
-# Obsidian vault (.md files). Entries added before that decision may still
-# carry doc_type="note" with an absolute PDF file_path; these two helpers let
-# `kb doctor` find and reclassify them.
-
-
-def find_pdf_notes(store: Chroma | None = None) -> list[dict]:
-    """
-    Find leftover doc_type="note" chunks whose file_path is a local PDF path.
-    Returns one summary dict per distinct source, sorted by source:
-    {"source", "title", "visibility", "chunk_count"}.
-    """
-    s = store or get_store()
-    result = s._collection.get(where={"doc_type": {"$eq": "note"}}, include=["metadatas"])
-    by_source: dict[str, dict] = {}
-    for meta in result["metadatas"]:
-        file_path = meta.get("file_path", "")
-        if not file_path.lower().endswith(".pdf"):
-            continue
-        source = meta.get("source", file_path)
-        entry = by_source.setdefault(source, {
-            "source": source,
-            "title": meta.get("title", "untitled"),
-            "visibility": meta.get("visibility", "public"),
-            "chunk_count": 0,
-        })
-        entry["chunk_count"] += 1
-    return sorted(by_source.values(), key=lambda entry: entry["source"])
-
-
-def reclassify_notes_as_papers(sources: list[str], store: Chroma | None = None) -> int:
-    """
-    Flip doc_type from "note" to "paper" for every chunk belonging to the
-    given sources — every other field (content_hash, storage_mode, file_path,
-    ...) is left untouched, so the result has the same shape a
-    daemon-ingested paper carries. Private chunks are skipped outright —
-    papers are always public, so that invariant holds here by construction
-    rather than by caller discipline. Returns the number of chunks updated.
-    """
-    if not sources:
-        return 0
-    s = store or get_store()
-    result = s._collection.get(where={"source": {"$in": sources}}, include=["metadatas"])
-    ids_to_update = []
-    updated_metadatas = []
-    for chunk_id, meta in zip(result["ids"], result["metadatas"]):
-        if meta.get("visibility") == "private":
-            continue
-        new_meta = dict(meta)
-        new_meta["doc_type"] = "paper"
-        ids_to_update.append(chunk_id)
-        updated_metadatas.append(new_meta)
-    if not ids_to_update:
-        return 0
-    with _kb_write_lock():
-        s._collection.update(ids=ids_to_update, metadatas=updated_metadatas)
-    return len(ids_to_update)
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
@@ -1122,57 +782,6 @@ def search(
     return candidates[:n_results]
 
 
-def search_with_privacy_check(
-    query: str,
-    provider: str,
-    n_results: int = 5,
-    doc_type: str | list[str] | None = None,
-    store: Chroma | None = None,
-    **filters,
-) -> tuple[list[Document], bool]:
-    """
-    Search with provider-aware privacy handling.
-
-    Returns (results, has_private_hits).
-
-    For cloud providers (anything but ollama):
-      - Returns public docs only
-      - has_private_hits=True if private docs also matched (so the caller
-        can warn the user that results may be incomplete)
-
-    For local providers (Ollama):
-      - Returns all docs regardless of visibility
-      - has_private_hits is always False
-
-    `filters` (category/status/entity/fields/tags) pass straight through to
-    search(), where they narrow the already-privacy-filtered pool. They are
-    applied to the private-hit probe too, so the "some matches were excluded"
-    caveat reflects the same query the user actually asked.
-    """
-    s = store or get_store()
-    if is_cloud_provider(provider):
-        results = search(query, n_results=n_results, visibility="public",
-                         doc_type=doc_type, store=s, **filters)
-        try:
-            # A cheap existence probe — order doesn't matter, so skip re-ranking.
-            # The retrieved private document never leaves this machine: it is
-            # read from the local knowledge-base server over loopback, nothing
-            # beyond len(...) is used, and the probe runs before any cloud
-            # request — so private content cannot leak through this path.
-            private_check = search(query, n_results=1, visibility="private",
-                                   doc_type=doc_type, store=s, rerank=False, **filters)
-            has_private = len(private_check) > 0
-        except RAGError as exc:
-            # The public results above are already correctly filtered, so no
-            # private content leaks — but the "some matches were excluded"
-            # caveat is silently dropped, which is worth knowing about.
-            log.warning("private-content probe failed, caveat suppressed: %s", exc)
-            has_private = False
-        return results, has_private
-    else:
-        return search(query, n_results=n_results, doc_type=doc_type, store=s, **filters), False
-
-
 def metadata_key_counts(store: Chroma | None = None) -> dict[str, int]:
     """
     How many chunks carry each metadata key, for `kb schema`.
@@ -1287,9 +896,9 @@ def get_document_chunks(source: str, store: Chroma | None = None) -> list[Docume
     Fetch every chunk belonging to one document, in reading order.
 
     Body chunks come first (sorted by chunk_index), followed by annotation
-    and figure chunks (identified by the presence of annotation_kind
-    metadata, also sorted by chunk_index) — this lets a caller page through
-    the source text before hitting highlights/figure captions. Returns []
+    chunks (identified by the presence of annotation_kind metadata, also
+    sorted by chunk_index) — this lets a caller page through the source text
+    before hitting the highlights. Returns []
     for an unknown source rather than raising, mirroring update_file_path.
     """
     s = store or get_store()
@@ -1351,44 +960,6 @@ def update_metadata_fields(
     return len(ids)
 
 
-def update_visibility(file_path: str, new_visibility: str, store: Chroma | None = None) -> int:
-    """
-    Update the visibility metadata for all chunks of a vault note, without
-    touching content or re-embedding. Used by refresh_vault when a file's
-    classification changes (e.g. private_vault_dirs edited in config) even
-    though its content and path did not.
-    """
-    return update_metadata_fields(file_path, {"visibility": new_visibility}, store)
-
-
-def update_chat_title(session_id: str, new_title: str, store: Chroma | None = None) -> int:
-    """
-    Update the title metadata for all indexed chat chunks of one session, so a
-    renamed session shows its new name in search_chat_history results. Metadata
-    only — no content change, no re-embedding. Returns the chunk count updated.
-    """
-    s = store or get_store()
-    try:
-        result = s._collection.get(
-            where={"session_id": {"$eq": session_id}}, include=["metadatas"]
-        )
-    except Exception as exc:
-        raise RAGError(f"Failed to look up session chunks: {exc}") from exc
-
-    ids = result["ids"]
-    if not ids:
-        return 0
-
-    updated_metadatas = [{**m, "title": new_title} for m in result["metadatas"]]
-    try:
-        with _kb_write_lock():
-            s._collection.update(ids=ids, metadatas=updated_metadatas)
-    except Exception as exc:
-        raise RAGError(f"Failed to update chat title: {exc}") from exc
-
-    return len(ids)
-
-
 def list_documents(
     limit: int = 10_000,
     doc_type: str | list[str] = "paper",
@@ -1444,174 +1015,3 @@ def list_documents(
     documents = [{**meta, "chunk_count": chunk_counts[key]} for key, meta in first_meta.items()]
     documents.sort(key=lambda d: d.get("date_added", ""), reverse=True)
     return documents[:limit]
-
-
-# ── Vault indexing ────────────────────────────────────────────────────────────
-
-
-def get_visibility(file_path: Path, vault_root: Path) -> str:
-    """Determine document visibility from vault folder structure."""
-    try:
-        parts = file_path.relative_to(vault_root).parts
-        if parts and parts[0] in get_config().private_vault_dirs:
-            return "private"
-    except ValueError:
-        pass
-    return "public"
-
-
-def index_vault_file(
-    file_path: Path,
-    vault_root: Path,
-    store: Chroma | None = None,
-) -> list[str]:
-    """
-    Chunk and index a single vault .md file. Returns list of chunk IDs.
-
-    YAML frontmatter, when present, becomes filterable metadata (see
-    jarvis/kb/frontmatter.py) — that is what lets a note be a job application
-    with an outcome or a manuscript with a venue rather than just prose. The
-    frontmatter block itself is stripped before chunking (it is structure, not
-    content the user would want retrieved), but the record header derived from
-    it is embedded into every chunk so a query naming the record's type,
-    entity, or status can match any part of it.
-    """
-    from .frontmatter import META_SCHEMA, parse_frontmatter, record_header
-
-    content = file_path.read_text(encoding="utf-8", errors="replace")
-    rel_path = str(file_path.relative_to(vault_root))
-    visibility = get_visibility(file_path, vault_root)
-    # Hashed over the WHOLE file, frontmatter included — editing only the
-    # status of a record must still count as a change.
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
-    modified_at = datetime.fromtimestamp(
-        file_path.stat().st_mtime, tz=timezone.utc
-    ).isoformat()
-
-    record_metadata, body = parse_frontmatter(content, file_label=rel_path)
-    title_match = re.search(r"^#\s+(.+)", body, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else file_path.stem
-
-    return add_texts(
-        content=body,
-        doc_type="note",
-        visibility=visibility,
-        source="local",
-        extra_metadata={
-            # Record fields FIRST, jarvis's own keys after, so the note's own
-            # frontmatter can never win a collision. parse_frontmatter already
-            # namespaces user keys under x_, but ordering makes the guarantee
-            # structural rather than dependent on that table staying correct.
-            **record_metadata,
-            "file_path": rel_path,
-            "title": title,
-            "content_hash": content_hash,
-            "modified_at": modified_at,
-            # Stamped on every note, frontmatter or not, so refresh_vault can
-            # tell "indexed under the current schema" from "needs a backfill".
-            "meta_schema": META_SCHEMA,
-        },
-        embed_header=record_header(record_metadata),
-        store=store,
-    )
-
-
-def refresh_vault(
-    vault_root: Path,
-    store: Chroma | None = None,
-) -> tuple[int, int, int]:
-    """
-    Incrementally sync the vault index with the filesystem.
-    Indexes new/changed files, removes chunks for deleted files.
-    Returns (added, updated, deleted) file counts.
-    Safe to call on an empty collection.
-    """
-    s = store or get_store()
-
-    from .frontmatter import META_SCHEMA
-
-    # Build map of currently indexed notes:
-    #   file_path → (content_hash, visibility, meta_schema)
-    try:
-        result = s._collection.get(
-            where={"doc_type": {"$eq": "note"}},
-            include=["metadatas"],
-        )
-        indexed: dict[str, tuple[str, str, int]] = {}
-        for meta in result["metadatas"]:
-            fp = meta.get("file_path", "")
-            if fp and fp not in indexed:
-                indexed[fp] = (
-                    meta.get("content_hash", ""),
-                    meta.get("visibility", "public"),
-                    int(meta.get("meta_schema", 0)),
-                )
-    except Exception as exc:
-        # Falling back to an empty map would look like "nothing is indexed":
-        # refresh_vault would re-index the entire vault and treat every
-        # existing note as new. A read failure here is a real fault, so it
-        # surfaces instead of quietly changing what the sync does.
-        log.error("refresh_vault: could not read the indexed note map: %s", exc)
-        raise _diagnose_kb_error(exc, f"Failed to read the vault index: {exc}") from exc
-
-    # Scan current vault files
-    current: dict[str, tuple[Path, str]] = {}
-    for md_file in vault_root.rglob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        rel = str(md_file.relative_to(vault_root))
-        current[rel] = (md_file, hashlib.sha256(text.encode()).hexdigest())
-
-    added = updated = deleted = 0
-
-    for rel_path, (file_path, file_hash) in current.items():
-        stored = indexed.get(rel_path)
-        if stored is None:
-            index_vault_file(file_path, vault_root, s)
-            added += 1
-            continue
-        stored_hash, stored_visibility, stored_schema = stored
-        if stored_hash != file_hash:
-            # The file itself changed: its text must be re-chunked and
-            # re-embedded, so the delete-and-re-add is unavoidable.
-            delete_by_metadata("file_path", rel_path, s)
-            index_vault_file(file_path, vault_root, s)
-            updated += 1
-        elif stored_schema < META_SCHEMA:
-            # The file is untouched; only jarvis's reading of it moved on.
-            # Whether that needs a re-embed depends on one thing: does the note
-            # have a frontmatter block? If it does, both the indexed body (the
-            # block is now stripped from it) and the embedded record header
-            # change, so it has to be re-indexed. If it does not — the common
-            # case for a plain note — nothing about its vectors would differ,
-            # so stamp the marker and move on. That keeps a schema migration
-            # from re-embedding an entire vault to record that most of it had
-            # nothing to record.
-            from .frontmatter import split_frontmatter
-
-            raw, _ = split_frontmatter(
-                file_path.read_text(encoding="utf-8", errors="replace")
-            )
-            if raw.strip():
-                delete_by_metadata("file_path", rel_path, s)
-                index_vault_file(file_path, vault_root, s)
-            else:
-                update_metadata_fields(rel_path, {"meta_schema": META_SCHEMA}, s)
-            updated += 1
-        else:
-            # Content unchanged, but the classification rule may have changed
-            # (private_vault_dirs config edits). Stale visibility would let a
-            # cloud provider keep seeing a note that is now private.
-            current_visibility = get_visibility(file_path, vault_root)
-            if current_visibility != stored_visibility:
-                update_visibility(rel_path, current_visibility, s)
-                updated += 1
-
-    for rel_path in indexed:
-        if rel_path not in current:
-            delete_by_metadata("file_path", rel_path, s)
-            deleted += 1
-
-    return added, updated, deleted

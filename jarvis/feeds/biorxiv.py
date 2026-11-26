@@ -35,6 +35,7 @@ def _record_to_paper(record: dict, source_label: str) -> dict:
         "authors": str(record.get("authors", "")).strip(),
         "published": str(record.get("date", "")).strip(),
         "source": source_label,
+        "doi": doi,
     }
 
 

@@ -1,5 +1,5 @@
 """
-Tests for jarvis/digest/biorxiv/fetch.py — bioRxiv retrieval over the details API.
+Tests for jarvis/feeds/biorxiv.py — bioRxiv retrieval over the details API.
 
 The bioRxiv API is a real network boundary (live HTTP to api.biorxiv.org), so
 these tests stub `requests.get` with fake responses shaped exactly like the
@@ -13,9 +13,9 @@ Retries use monkeypatched time.sleep so no real waiting happens.
 
 import pytest
 
-import jarvis.digest.biorxiv.fetch as fetch_mod
+import jarvis.feeds.biorxiv as fetch_mod
 import jarvis.core.errors
-from jarvis.digest.biorxiv.fetch import fetch_biorxiv, fetch_biorxiv_keywords
+from jarvis.feeds.biorxiv import fetch_biorxiv, fetch_biorxiv_keywords
 from jarvis.core.errors import FetchError
 
 
@@ -88,6 +88,7 @@ def test_record_maps_to_paper_shape(monkeypatch):
     assert p["abstract"] == "An abstract."
     assert p["authors"] == "Lovelace, A.; Turing, A."
     assert p["link"] == "https://doi.org/10.1101/2026.01.01.123456"
+    assert p["doi"] == "10.1101/2026.01.01.123456"
     assert p["published"] == "2026-07-01"
     assert p["source"] == "bioRxiv:bioinformatics"
 

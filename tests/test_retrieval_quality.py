@@ -21,7 +21,7 @@ The corpus deliberately includes:
     jarvis/kb/store.py::_hybrid_search, gated by [rag] hybrid) targets
   - author-name queries (e.g. "papers by Vaswani"), which only the
     embed_header prepended to every paper chunk can satisfy — the dense
-    summary text itself never mentions an author's name
+    paper text itself never mentions an author's name
 
 Runs with the default config (hybrid=True), the same as production.
 """
@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from jarvis.kb.store import add_paper, add_texts, search
+from jarvis.kb.store import add_texts, search
 
 # Same gitignored store directory the other KB tests use (see conftest.py).
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
@@ -40,11 +40,11 @@ TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
 
 # ── Fixture corpus ───────────────────────────────────────────────────────────
 
-# Paper summaries: (source, title, dense_summary, authors). authors defaults to ""
-# except where a golden query below specifically targets an author's name — the
-# summary text alone never mentions authors, so the header embedded by
-# add_paper() is the only thing that can make an author-name query hit.
-# Stored via add_paper in summary mode (title + link + authors + summary → one or two chunks).
+# Papers: (source, title, text, authors). authors defaults to "" except where a
+# golden query below specifically targets an author's name — the text alone
+# never mentions authors, so the "title — authors" header embedded on every
+# chunk (as jarvis/kb/mirror.py's index_paper_file does) is the only thing that
+# can make an author-name query hit.
 _PAPERS = [
     ("paper-transformers", "Attention Is All You Need",
      "We introduce the Transformer, a sequence model based entirely on self-attention "
@@ -170,7 +170,7 @@ _GOLDEN = [
     ("BERT", "paper-bert"),
     ("aggregating model updates without sharing raw data across devices", "paper-federated"),
     ("adaptive per-parameter learning rate", "note-optimisers"),
-    # Author-name queries — the summary text never mentions an author, so
+    # Author-name queries — the paper text never mentions an author, so
     # only the embed_header (title + authors, prepended to every chunk) can
     # make these hit. This is the sentinel for the embed-header migration.
     ("papers by Vaswani", "paper-transformers"),
@@ -215,9 +215,10 @@ def quality_store(embeddings):
         embedding_function=embeddings,
         persist_directory=str(TEST_CHROMA_DIR),
     )
-    for source, title, summary, authors in _PAPERS:
-        add_paper({"link": source, "title": title, "authors": authors},
-                  dense_summary=summary, store=store)
+    for source, title, text, authors in _PAPERS:
+        add_texts(content=text, doc_type="paper", visibility="public", source=source,
+                  extra_metadata={"title": title, "authors": authors},
+                  embed_header=f"{title} — {authors}" if authors else title, store=store)
     for source, text in _NOTES:
         add_texts(content=text, doc_type="note", visibility="public",
                   source=source, store=store)

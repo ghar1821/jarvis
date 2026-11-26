@@ -2,8 +2,14 @@
 
 [![Tests](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ghar1821/jarvis/actions/workflows/tests.yml)
 
-A personal assistant that knows your notes, documents and papers, runs on
-your machine, and can write documents with you.
+Your Obsidian notes and your research papers, searchable from any AI assistant: Claude Desktop, Google
+Antigravity, Claude Code and others.
+
+Jarvis indexes two folders you already have, your vault and a folder of PDFs.
+It keeps the index in step with them, and gives your assistant read-only
+tools to search and read them via [MCP](https://modelcontextprotocol.io). 
+The assistant does the thinking. 
+Jarvis makes no LLM calls, holds no API keys, never writes to your folders.
 
 Named after Iron Man's J.A.R.V.I.S. (Just A Rather Very Intelligent System).
 
@@ -18,14 +24,7 @@ Full documentation: **<https://ghar1821.github.io/jarvis/>**
 - [uv](https://github.com/astral-sh/uv) and Python 3.12 or newer. If you have
   neither: `curl -LsSf https://astral.sh/uv/install.sh | sh`, then
   `uv python install 3.12`.
-- An [OpenRouter](https://openrouter.ai/keys) key, or an Anthropic key.
-- To run locally instead, install [Ollama](https://ollama.com) and pull a model
-  that supports tool calling and vision, e.g. `ollama pull qwen3-vl:30b`. Tool
-  calling is required; vision is only used for figure captioning.
-- Optional, for the editor's PDF output: a LaTeX distribution (MacTeX, TeX Live)
-  to compile `.tex`, and `pandoc` to export Markdown as PDF. You can add these
-  later; a button for a missing tool stays hidden rather than sitting there
-  broken.
+- An MCP client, such as Claude Desktop or Google Antigravity.
 
 ### 1. Install
 
@@ -36,194 +35,154 @@ uv sync
 
 ### 2. Write the config
 
-Jarvis reads `~/.jarvis/config.toml` and nothing else. It won't create the file
-for you, and without it you get the defaults: local Ollama, and a vault at
-`~/vault`.
-
-```bash
-mkdir -p ~/.jarvis
-$EDITOR ~/.jarvis/config.toml
-```
-
-A working OpenRouter config:
+Jarvis reads `~/.jarvis/config.toml`. The minimum is where your two folders
+are:
 
 ```toml
-[chat]
-provider = "openrouter"
-openrouter_model = "anthropic/claude-sonnet-4.6"
-vault_path = "~/Documents/obsidian"          # your notes; must exist
-
-[auth]
-openrouter_api_key = "sk-or-..."             # or the OPENROUTER_API_KEY env var
-
-# Extra models for the picker. Optional.
-[models]
-openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5"]
+[kb]
+vault_path = "~/Documents/obsidian"     # your Obsidian vault (default: ~/vault)
+papers_dir = "~/Documents/papers"       # PDFs here, and in its subfolders, are your papers
 ```
 
-Then restrict the permission of the file, since it can hold your API key:
+- **`vault_path`** can be left out if your vault is at `~/vault`.
+- **`papers_dir`** can be left out, but then no papers are indexed, only notes.
+- **`private_vault_dirs`** is the list of top-level vault folders that are never
+  indexed. It defaults to `["private"]`. Add it under `[kb]` only if yours are
+  named differently, e.g. `private_vault_dirs = ["journal"]`.
+
+There are no API keys to add. Everything else has a sensible default (see
+[`docs/DESIGN.md`](docs/DESIGN.md#configuration)).
+
+### 3. Start the index
 
 ```bash
-chmod 600 ~/.jarvis/config.toml
+uv run kb serve
 ```
 
-In the config file, the `provider` is mandatory, and can be the following:
-- `openrouter`: uses Openrouter service to route your prompts to their hosted LLM. 
-Make sure you then supply the following as well:
-  - `openrouter_api_key` under `[auth]`.
-  - `openrouter_model` under `[chat]` which denotes what default model it will route your prompt to
-  - `openrouter` setting under `[models]` which list all available models you can switch to.
-  - If you want to use Openrouter's automatic routing, add `openrouter/auto` to either `openrouter_model` or `openrouter`. 
-- `anthropic`: uses Anthropic service. Make sure you then supply `api_key` field under `[auth]` and fill it in with your Anthropic API key.
-- `ollama`. Make sure you then supply `ollama_model` under `[chat]` which denotes what model it will route your prompt to.
+Leave it running in its own terminal or a tmux pane. It runs the search index
+and re-syncs both folders every 30 minutes. The first start downloads and
+caches the embedding model (`BAAI/bge-small-en-v1.5`), then indexes everything.
+`uv run kb doctor` checks it's healthy, and `uv run kb status` shows the last
+sync.
 
-### 3. Index your notes
+Your assistant needs `kb serve` running. The MCP server only connects to the
+index that `kb serve` runs; it never opens the index files itself, so it can't
+end up searching a stale copy while the sync rewrites them. If `kb serve` isn't
+running:
 
-```bash
-uv run kb index-vault
-```
+- **The client still connects.** Jarvis and its tools show up as normal.
+- **Every tool call fails.** The error says "The knowledge-base server is not
+  running. Start it with: `uv run kb serve`".
+- **It recovers by itself.** Once you start `kb serve`, the next tool call
+  works without restarting the client.
 
-The first run downloads and caches the `BAAI/bge-small-en-v1.5` embedding
-model. If `vault_path` doesn't exist you get `Error: vault path does not exist`
-before anything downloads. Skip this step if your vault is empty.
+### 4. Connect your assistant
 
-### 4. Check it worked
+**Claude Desktop**
 
-```bash
-uv run kb models     # which providers are configured, and which lack a key
-uv run kb stats      # what got indexed
-uv run kb doctor     # embedding model and index health
-```
+1. Open Settings → Developer → Edit Config. This opens
+   `~/Library/Application Support/Claude/claude_desktop_config.json`.
+2. Add a `jarvis` entry under `mcpServers`. If other servers are already
+   listed, add it beside them rather than replacing the file:
 
-`kb models` reads your config instead of the network, so it's the quickest way
-to confirm the file is being picked up:
+   ```json
+   {
+     "mcpServers": {
+       "jarvis": {
+         "command": "/absolute/path/to/uv",
+         "args": ["--directory", "/absolute/path/to/jarvis", "run", "jarvis-mcp"]
+       }
+     }
+   }
+   ```
 
-```
-ollama:qwen3-vl:30b  [local]
-anthropic:claude-sonnet-4-6  [cloud]  (no API key)
-openrouter:anthropic/claude-sonnet-4.6  [cloud]
-```
+   Use the full path to `uv` (`which uv` prints it). Claude Desktop starts
+   servers with a minimal `PATH` and won't find a bare `uv`.
+3. Quit Claude Desktop completely (⌘Q, not just closing the window) and reopen
+   it.
+4. "jarvis" now appears in the chat box's tools menu with seven tools. Try
+   *"what's in my knowledge base?"*. The first call takes a few seconds while
+   the models load, and Claude asks permission the first time each tool runs.
 
-`(no API key)` means configured but unusable. A missing `openrouter:` line
-means `openrouter_model` was never set.
+If it doesn't connect:
 
-### 5. Run it
+- **Read the log.** It's at `~/Library/Logs/Claude/mcp-server-jarvis.log`.
+- **Run the command yourself.** Run the same `command` plus `args` in a
+  terminal. It should sit silently waiting for input (Ctrl-C to stop). Any
+  error it prints is the one Claude Desktop hits.
 
-Two processes, each in its own terminal (or a tmux pane):
+**Antigravity, or any other MCP client.** Add the same `command` and `args` to
+its MCP server configuration. Any client that can launch a local (stdio) MCP
+server works the same way.
 
-```bash
-uv run kb server     # the knowledge base — must be running first
-uv run webapp        # browser at http://127.0.0.1:8080 (localhost only)
-```
-
-`kb server` owns the search index, and the webapp connects to it. 
-The split is deliberate so no process caches a copy of the index and goes out of 
-sync if notes are edited.
-The webapp will refuse to start if the kb server does not start.
-
-Note: any `kb` commands don't need this server as they read the index directly.
+The client starts and stops `jarvis-mcp` itself, so you never run it by hand.
+It runs whatever code is checked out in the jarvis folder, so after you switch
+branches or pull, restart the client.
 
 ---
 
 ## Ask it things
 
-Talk to it. It searches your notes, papers and past conversations before
-answering, and shows you every step along the way.
+Just ask. Your assistant decides when to search your notes and papers:
 
 ```
 what did I conclude about batch effects in the cytometry project?
 which papers do I have on sparse autoencoders?
-what did we discuss about this last week?
-add https://arxiv.org/abs/2406.04093
+read me the methods section of the DIA-NN paper
+where's that paper on spillover correction? show it in Finder
 ```
 
-By default it answers only from your knowledge base. Turn the **DB only**
-toggle off and it can fall back on the model's own training knowledge, saying
-on screen when it does.
+The tools jarvis gives it:
 
-Conversations save themselves. Resume, rename, pin or delete one from the
-**Chats** section of the sidebar.
+| Tool | What it does |
+|---|---|
+| `search_kb` | Searches notes and papers, combining semantic and keyword search with re-ranking. Each hit has the full passage, the file path and, for papers, a DOI link |
+| `get_document` | Reads a whole paper, page by page |
+| `read_note` | Reads one vault note in full |
+| `list_documents` | Lists your papers or notes, optionally filtered by record fields |
+| `kb_stats` | Shows counts, and which record types and statuses exist |
+| `fetch_recent_papers` | Lists new arXiv or bioRxiv papers, marking ones you already have |
+| `reveal_in_finder` | Opens Finder with a paper or note selected |
 
-While a reply is generating, the Send button becomes a red **Stop**. A stopped
-turn leaves no trace: your question returns to the input box, nothing is
-written to the conversation, and nothing is indexed. Tokens a paid model
-already generated are still billed.
+Every tool only reads. Your assistant can't add, edit, move or delete
+anything through jarvis.
 
 ---
 
-## Write documents with it
+## Add and remove papers and notes
 
-Ask for a document and you get a real file you can open.
+The index mirrors your files:
 
-```
-draft the methods section from my notes on the pipeline
-```
-
-Documents land in `~/.jarvis/drafts/`, which the assistant can write to freely.
-Your vault stays read-only to it. To get a document out, right-click it, choose
-**Show in Finder**, and copy it wherever you like.
-
-A draft is a folder rather than a single file, so `main.tex`, its chapters and
-its `.bib` live together and compile as a unit. A single-file draft shows as one
-row; a multi-file one lists its parts underneath. Right-click a document to add
-another file to it.
-
-Click a document, or press **Show editor** in the header, and the editor opens
-above the chat. Source on the left, preview on the right, **Recompile** to
-re-render, and a layout control for split / source only / output only. Markdown
-renders to HTML; LaTeX compiles to a PDF, with the log underneath when it
-fails. Both export to PDF.
-
-- Each file opens in its own tab. A filled dot means unsaved changes; an ×
-  means none. Closing a tab saves it first if it needs saving.
-- ⌘S saves the current tab and re-renders the preview. Previewing, compiling
-  and exporting all save first.
-- Scrolling the source scrolls the preview to the matching place. Markdown
-  only, since a compiled PDF is displayed by the browser itself.
-- Every earlier version is kept. **History** restores one, and restoring is
-  itself undoable.
-- When the assistant proposes a change you get a diff with a checkbox per hunk,
-  and only what you tick gets written. A ✎ on a tab means a suggestion is still
-  waiting. ⋮ → **Discard pending suggestions** clears them all, and they clear
-  themselves on restart.
-- Drafts expire after 30 days untouched. `uv run kb drafts` shows how long each
-  has left, and **Keep** exempts one permanently. Set
-  `[drafts] retention_days = 0` to turn the sweep off.
-
-Exporting your first Markdown PDF on a new machine can be slow, sometimes past
-the compile timeout, because fontspec builds a system font cache once. Get it
-over with ahead of time:
-
-```bash
-printf '\\documentclass{article}\\usepackage{fontspec}\\begin{document}x\\end{document}' > /tmp/warm.tex
-xelatex -output-directory=/tmp /tmp/warm.tex
-```
-
-### Editing the prompts
-
-Three prompts drive everything jarvis asks a model to do, and all three are
-configurable: ⋮ → **Edit prompts**.
-
-| Prompt | What it controls |
+| You do this | The index |
 |---|---|
-| Assistant instructions | How the chat agent behaves: when it searches, how it cites |
-| Paper summary | How a paper is summarised when you add one |
-| Digest scoring | Which papers the weekly digest thinks matter |
+| Save a PDF into `papers_dir` (any subfolder) | Adds it as a paper, full text |
+| Write or edit a note in the vault | Adds it or updates it |
+| Move or rename a PDF | Follows it, without re-indexing |
+| Delete a file | Drops it |
+| Move a note into a private folder | Drops it |
 
-Your editable copies live in `~/.jarvis/prompts/`, created on first run.
-**Revert to default** will revert to a default prompt stored in this repo.
-Any edits will apply to your next message with no restart.
+Changes show up at the next sync (within `sync_minutes`, 30 by default).
+`uv run kb sync` runs one now.
 
-If you turn the digest on, the scoring prompt important. It ships with
-What you write there decides which papers are searched and retained.
+**Paper details.** Jarvis reads the DOI printed on the first page and looks
+up the title and authors on [Crossref](https://www.crossref.org). It sends only
+the DOI. Without a DOI it uses the PDF's own metadata, and failing that, the
+filename.
+
+**Highlights and typed notes.** Highlights and typed notes made in macOS
+Preview or Foxit Reader are indexed too, and saving new ones re-indexes the
+paper. Freehand pen scribbles aren't text, so they can't be read.
+
+**Scanned PDFs.** A PDF with no text layer can't be searched, but its
+highlights and notes still are.
 
 ---
 
 ## Keep records, not just notes
 
-Any note can carry YAML config, and jarvis turns that into something you
-can filter on. Handy for anything you accumulate a lot of and need to track the
-state of: manuscripts, grants, experiments, meetings.
+Any note can carry YAML frontmatter, and jarvis turns it into fields you can
+filter on. That's handy for anything you accumulate and need to track:
+manuscripts, grants, experiments, job applications.
 
 ```markdown
 ---
@@ -245,212 +204,106 @@ Then ask by record instead of by wording:
 ```
 which manuscripts are under review, and what are reviewers asking for?
 what have I got in drafting for Nature Methods?
-show me everything I submitted this year
 ```
 
-What fields you specify in the YAML config is yours to decide. 
-The default config parsed by Jarvis are: `type`, `status`, `entity`, `date` and `tags`. 
-Run `uv run kb schema` to see which keys and values exist. 
-
-
----
-
-## Add papers and PDFs
-
-```bash
-uv run kb add https://arxiv.org/abs/2406.04093       # a summary (fast, default)
-uv run kb add https://arxiv.org/abs/2406.04093 --full-text
-uv run kb add paper.pdf                               # title/authors/DOI inferred
-uv run kb add paper.pdf --authors "Ada Lovelace"      # or set them yourself
-```
-
-Or ask in chat: *"add ~/Downloads/paper.pdf, full text"*.
-
-Set 
-```
-[sync] pdf_watch_dir = "~/Documents/papers/inbox"
-``` 
-and the background
-daemon sweeps that folder every half hour.
-
-Highlights and typed notes made in macOS Preview or Foxit Reader are indexed
-Freehand pen scribbles aren't text, so they can't be extracted.
-
-Figures can be captioned by a vision model and made searchable. This is off by
-default, since every figure costs a call. Add `--figures`, or ask for a paper
-"with figures".
-
----
-
-## Choose a model
-
-⋮ → **Switch model** changes model mid-conversation without losing the thread.
-It applies from your next message, per conversation, which means two sessions
-can run different models at once. The header shows the active model and what the
-session has cost so far.
-
-Whatever you set as `openrouter_model` (or `ollama_model`) already appears in
-the picker. `[models]` adds more:
-
-```toml
-[models]
-openrouter = ["anthropic/claude-sonnet-4.6", "openai/gpt-5", "openrouter/auto"]
-```
-
-The picker also has a box for typing any model id OpenRouter accepts, listed or
-not, applied to the current conversation without touching your config. Keep
-`[models]` to the handful you actually switch between.
-
-OpenRouter's auto router is just a model id: set
-`openrouter_model = "openrouter/auto"` and it picks a model per request. The
-header then shows both halves, `openrouter/auto → claude-sonnet-4.6`, and
-hovering the cost breaks the total down by model. Jarvis sends
-`allow_fallbacks = false` by default, which hasn't been tested against the auto
-router, so loosen it under `[openrouter]` if requests start failing.
-
-Cost is shown only for OpenRouter, which reports what each request actually
-cost. A local model costs nothing, and jarvis won't invent a figure for
-anything else.
-
-OpenRouter is a broker: your request routes to somebody else's hardware. Jarvis
-sends `data_collection = "deny"` and no silent fallbacks by default.
+`type`, `status`, `entity`, `date` and `tags` are the named fields; any other
+key works too. `uv run kb schema` shows which keys and values exist, which is
+also how you catch a typo like `stauts`.
 
 ---
 
 ## Keep things private
 
-Notes in the folders listed under `private_vault_dirs` (default: `private/`)
-are only ever visible to a local model.
+Every MCP client sends what it reads to a cloud model. So jarvis never
+indexes notes in `private_vault_dirs`, and `read_note` refuses them:
 
 ```
 vault/
-├── private/    ← local model only, never sent anywhere
-└── research/   ← any model
+├── private/    ← never indexed, never readable by your assistant
+└── research/   ← searchable
 ```
 
-Once a conversation touches private content it stays private and can't switch
-to a cloud model. Papers are always public, so keep anything sensitive in a
-note.
-
-Jarvis never deletes a file (removing a document removes its database entry
-only) and never writes to your vault.
+Read private notes in Obsidian. Only top-level folders count: `research/private/`
+is not private.
 
 ---
 
-## Use it from Claude Desktop
+## A weekly paper digest
 
-`jarvis-mcp` is an MCP server that gives Claude Desktop read-only access to
-your notes and papers: search, read a paper or note in full, list documents,
-and see counts. Claude Desktop sends everything to Anthropic, so it gets
-the same treatment as any cloud model. Notes in your private folders never
-come back, and no setting changes that.
+Your assistant can run the digest on a schedule:
 
-`uv run kb server` has to be running, the same as for the webapp. Then add
-this to `~/Library/Application Support/Claude/claude_desktop_config.json`
-and restart Claude Desktop:
+- **Claude Desktop:** *Scheduled tasks*.
+- **Antigravity:** *background automations* (`/schedule`, `/automation`).
 
-```json
-{
-  "mcpServers": {
-    "jarvis": {
-      "command": "/absolute/path/to/uv",
-      "args": ["--directory", "/absolute/path/to/jarvis", "run", "jarvis-mcp"]
-    }
-  }
-}
-```
+Create a weekly task whose prompt asks it to call `fetch_recent_papers` for
+your categories and score the results against your interests.
+[`docs/examples/weekly-digest-task.md`](docs/examples/weekly-digest-task.md)
+is a ready-to-paste prompt; edit the research context to match your work. To
+keep a paper, open its DOI link and save the PDF into `papers_dir`.
 
-Use the full path to `uv` (`which uv` prints it). Claude Desktop starts
-servers with a minimal `PATH` and won't find it otherwise. Claude Desktop
-starts and stops `jarvis-mcp` itself, so you don't run it by hand. If a tool
-says the knowledge-base server isn't running, start `uv run kb server`. Server
-logs are in `~/Library/Logs/Claude/mcp-server-jarvis.log`.
+Some things to know:
 
-There are no tools for adding or removing anything. Use the webapp or `kb`
-for that.
+- **Local tasks only.** Claude Desktop's local tasks run only while the app is
+  open and the computer is awake. A cloud-run task can't reach jarvis, because
+  jarvis runs on your machine.
+- **Pre-approve the tools.** For an unattended run, set `fetch_recent_papers`
+  and `search_kb` to "always allow" in the client. Both only read, so this is
+  safe.
 
 ---
 
-## Jarvis sync and index refresh
+## Upgrading from an older jarvis
 
-```bash
-uv run jarvis-sync
-```
+Older versions had their own chat app (a web UI with model switching, drafts
+and a document editor), added papers by arXiv URL, and kept digests and chat
+history in the index. That version is preserved on the
+`archive/pre-mcp-simplification` branch if you ever need it.
 
-Optional. It's a scheduler that runs the same vault sync, PDF sweep and draft
-cleanup you can run by hand, just on a timer. Skip it and you index manually
-after editing your notes. It needs `kb server` running, for the same reason the
-webapp does — it writes to the index the chat is reading. It logs to `~/.jarvis/logs/sync.log` and to the
-terminal, and stays in the foreground, so run it under `tmux` or `screen` if
-you want it to survive closing the terminal. It won't start Ollama for you.
+Entries those versions added are still searchable after upgrading, but no file
+backs them. To remove them all:
 
+1. Set `papers_dir` (or keep your old `[sync] pdf_watch_dir`, which still
+   counts) to the folder that holds your PDFs. Any paper whose PDF isn't in
+   that folder is dropped by the next step.
+2. Run `uv run kb rebuild` and answer `y`. It rebuilds the index from your
+   vault's public notes and `papers_dir`. Everything else is dropped:
+   arXiv-URL papers, digests, chat history, private notes. Only index entries
+   go; no file is touched.
+3. Restart `kb serve` and your MCP client.
 
-### Updating the index by hand
+To see what would be dropped before you rebuild, run `uv run kb doctor`. It
+lists each entry with a DOI link, in case you want to save a PDF first.
 
-`kb index-vault` is almost always the one you want. It's incremental and it's
-exactly what the daemon runs on its timer. `kb reindex` re-embeds text already
-in the database and never looks at your vault. It won't notice a note you
-changed.
-
-| You did this | Run this |
-|---|---|
-| Edited, added or deleted notes | `kb index-vault` |
-| Want a clean rebuild of the note index | `kb index-vault --force` |
-| Changed `embed_model` in the config | `kb reindex` |
-| Chat says the index can't resolve an id | `kb doctor` first — it says whether a rebuild is needed |
-| `kb doctor` reported missing ids | `kb reindex` (or `--from-storage`, with `kb server` stopped) |
-
-After `kb reindex` the collection is a new one, so anything already connected —
-the webapp, `jarvis-sync` — is still pointing at the old one and needs a
-restart. It says so when it finishes.
-
----
-
-## Weekly paper digest
-
-Off by default. To switch on automated arXiv/bioRxiv discovery:
-
-```toml
-[digest]
-enabled = true
-arxiv_categories = [["cs.LG", 150], ["cs.AI", 80]]
-```
-
-It fetches weekly, scores everything against your relevance prompt, writes a
-tiered Markdown digest, and indexes the best papers. If your machine was
-asleep, it catches up automatically. Run one by hand with
-`uv run run-digest --force`.
+Your old config keeps working. Jarvis prints one line for each setting that has
+moved or no longer does anything, and never edits the file itself. Old
+`~/.jarvis/sessions/`, `~/.jarvis/drafts/` and `~/.jarvis/prompts/` folders are
+left untouched. Delete them yourself if you don't need them.
 
 ---
 
 ## Command reference
 
 ```bash
-# Everyday
-uv run kb server               # the knowledge base (webapp and sync need it)
-uv run webapp                  # the UI
-uv run jarvis-sync             # background sync
-# jarvis-mcp is started by Claude Desktop, not by hand (see above)
-
-# Knowledge base
-uv run kb index-vault          # re-index your notes (--force for a clean rebuild)
-uv run kb add <url|file.pdf>   # add a paper or PDF
-uv run kb list                 # indexed papers (--notes for records)
-uv run kb schema               # which metadata keys/values exist
-uv run kb stats                # counts
-uv run kb remove <source>      # remove a database entry (never a file)
-uv run kb set-meta <source> --authors "..."
-uv run kb doctor               # diagnose a sick index
-uv run kb reindex              # re-embed everything (no LLM calls)
-
-# Drafts
-uv run kb drafts               # list, with expiry
-uv run kb drafts --prune --dry-run
-
-# Models
-uv run kb models
+uv run kb serve       # run the index and keep it in sync (leave running)
+uv run kb sync        # sync both folders now
+uv run kb rebuild     # recreate the index from your folders
+uv run kb list        # indexed papers (--notes for notes and records)
+uv run kb stats       # counts
+uv run kb schema      # which metadata keys and values exist
+uv run kb status      # is kb serve running, and how did the last sync go
+uv run kb doctor      # diagnose the index; list entries a rebuild would drop
+# jarvis-mcp is started by your MCP client, not by hand
 ```
 
-Everything lives under `~/.jarvis/`: `config.toml`, your index, sessions,
-drafts, logs. The full configuration reference is in
-[`docs/DESIGN.md`](docs/DESIGN.md#configuration--jarviscoreconfigpy).
+`kb serve` is the only long-running process. The other commands work whether
+or not it's running.
+
+| Something's wrong | Run this |
+|---|---|
+| A note or paper is missing or stale | `kb sync`, then check `kb status` |
+| Your assistant says the index can't resolve an id | `kb doctor` |
+| `kb doctor` dies or reports damage | `kb rebuild` (nothing is lost; every entry comes from a file) |
+| You changed `embed_model` in the config | `kb rebuild` |
+
+Everything jarvis stores lives under `~/.jarvis/`: `config.toml`, the index,
+logs, and the `kb serve` status file.
