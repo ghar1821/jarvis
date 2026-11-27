@@ -95,11 +95,13 @@
 ### BREAKING CHANGES
 
 - Removed `fetch_recent_papers`, the `jarvis/feeds/` arXiv and bioRxiv
-  fetchers, and the weekly digest prompt in `docs/examples/` (PR #6). Your
-  MCP client's own connectors (for example PubMed, or arXiv and bioRxiv
-  connectors) find new papers more reliably. Ask it to call `has_paper` to
-  skip the ones you already have. A scheduled task that calls
-  `fetch_recent_papers` will now fail; change its prompt.
+  fetchers (PR #6). Your MCP client's own connectors (for example PubMed,
+  or arXiv and bioRxiv connectors) find new papers more reliably. Ask it to
+  call `has_paper` to skip the ones you already have. A scheduled task that
+  calls `fetch_recent_papers` will now fail; change its prompt. The example
+  prompt in `docs/examples/weekly-digest-task.md` is replaced by
+  `docs/examples/paper-digest-task.md`, which uses the alphaXiv and bioRxiv
+  MCP servers and `has_paper`.
 
 - The previous version of jarvis, the full assistant with its own web UI, is
   archived on the `archive/pre-mcp-simplification` branch. It was cut from

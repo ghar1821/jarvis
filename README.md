@@ -263,6 +263,12 @@ last few minutes is found once `kb serve` has synced it.
 
 To keep a paper, open its DOI link and save the PDF into `papers_dir`.
 
+For a full example, see
+[`docs/examples/paper-digest-task.md`](docs/examples/paper-digest-task.md).
+It is a weekly scheduled task that finds new arXiv and bioRxiv papers, uses
+`has_paper` to drop the ones you already have, and scores the rest against
+your research interests. Edit its research context to match your work.
+
 ---
 
 ## Upgrading from an older jarvis

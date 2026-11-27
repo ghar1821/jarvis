@@ -69,7 +69,9 @@ Three invariants shape everything below:
 └── docs/
     ├── DESIGN.md            # this file
     ├── TESTING.md
-    └── CHANGELOG.md
+    ├── CHANGELOG.md
+    └── examples/
+        └── paper-digest-task.md    # a weekly digest prompt that uses has_paper
 ```
 
 ---
