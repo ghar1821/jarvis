@@ -141,6 +141,7 @@ what did I conclude about batch effects in the cytometry project?
 which papers do I have on sparse autoencoders?
 read me the methods section of the DIA-NN paper
 where's that paper on spillover correction? show it in Finder
+do I already have 10.1101/2024.05.01.592000?
 ```
 
 The tools jarvis gives it:
@@ -152,7 +153,7 @@ The tools jarvis gives it:
 | `read_note` | Reads one vault note in full |
 | `list_documents` | Lists your papers or notes, optionally filtered by record fields |
 | `kb_stats` | Shows counts, and which record types and statuses exist |
-| `fetch_recent_papers` | Lists new arXiv or bioRxiv papers, marking ones you already have |
+| `has_paper` | Checks whether you already have a paper, by DOI, arXiv ID or title |
 | `reveal_in_finder` | Opens Finder with a paper or note selected |
 
 Every tool only reads. Your assistant can't add, edit, move or delete
@@ -241,41 +242,26 @@ is not private.
 
 ---
 
-## A weekly paper digest
+## Checking whether you already have a paper
 
-Your assistant can run the digest on a schedule. Create a weekly task whose
-prompt asks it to call `fetch_recent_papers` for your categories and score
-the results against your interests.
-[`docs/examples/weekly-digest-task.md`](docs/examples/weekly-digest-task.md)
-is a ready-to-paste prompt; edit the research context to match your work. To
-keep a paper, open its DOI link and save the PDF into `papers_dir`.
+jarvis doesn't fetch new papers. Your assistant's own connectors do that
+better, for example PubMed in Claude Desktop. When it suggests papers, ask it
+to check each one with `has_paper` first, so it skips the ones in your papers
+folder. A prompt line like this works:
 
-**The task has to run on your computer**, because that's where jarvis is.
-Where you create it matters:
+```text
+Before listing a paper, call jarvis's has_paper with its DOI, arXiv ID and
+title, and leave it out if I already have it.
+```
 
-- **Claude Desktop, Cowork tab: doesn't work.** Cowork's scheduled tasks run
-  in the cloud, so they can't reach jarvis. A run there reports that the
-  jarvis tools aren't available, and lists only claude.ai connectors such as
-  PubMed.
-- **Claude Desktop, Code tab: works.** These are Claude Code scheduled tasks,
-  and they run on your computer. Add jarvis to Claude Code first (see
-  [Connect your assistant](#4-connect-your-assistant)). They run only while
-  Claude Desktop is open and the computer is awake.
-- **Antigravity background automations** (`/schedule`, `/automation`) haven't
-  been tested. They can only reach jarvis if they run on your computer.
+`has_paper` checks your papers folder, not the assistant. A paper matches if
+it has the same DOI (ignoring case), the same arXiv ID (any version) or the
+same title (ignoring case and punctuation). It can miss a paper whose PDF
+prints neither identifier and whose title is worded differently, for example
+a journal PDF of a paper you only know as a preprint. A PDF you saved in the
+last few minutes is found once `kb serve` has synced it.
 
-For an unattended run, set `fetch_recent_papers` and `search_kb` to "always
-allow", or run the task once by hand and approve them then. Both only read,
-so this is safe. `kb serve` must be running when the task fires.
-
-**How papers you already have are left out.** `fetch_recent_papers` marks a
-paper `[ALREADY IN PAPERS]` when it matches one in your papers folder, and
-the prompt tells the assistant to skip those. Jarvis does the matching, not
-the assistant. A paper matches if it has the same DOI, the same arXiv ID
-(any version) or the same title. bioRxiv papers match by DOI and arXiv
-papers by arXiv ID. It can miss a paper whose PDF prints neither identifier
-and whose title is different, for example a journal PDF of a paper whose
-arXiv preprint is in the feed.
+To keep a paper, open its DOI link and save the PDF into `papers_dir`.
 
 ---
 

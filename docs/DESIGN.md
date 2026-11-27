@@ -52,7 +52,7 @@ Three invariants shape everything below:
 │   ├── __init__.py          # switches off third-party telemetry before any import
 │   ├── core/
 │   │   ├── config.py        # ~/.jarvis/config.toml → Config; moved/obsolete key notes
-│   │   ├── errors.py        # domain exceptions + @with_retries
+│   │   ├── errors.py        # domain exceptions
 │   │   └── logs.py          # ~/.jarvis/logs/jarvis.log for every library module
 │   ├── kb/
 │   │   ├── mirror.py        # the two folders → the index (sync, move detection, rebuild)
@@ -63,18 +63,13 @@ Three invariants shape everything below:
 │   │   ├── frontmatter.py   # note YAML frontmatter → flat record metadata
 │   │   ├── serve.py         # `kb serve` and `kb status`
 │   │   └── cli.py           # the `kb` command
-│   ├── feeds/
-│   │   ├── arxiv.py         # recent papers by arXiv category
-│   │   └── biorxiv.py       # recent preprints by bioRxiv category or keyword
 │   └── mcp/
 │       └── server.py        # `jarvis-mcp`: the read-only MCP tools
 ├── tests/                   # see docs/TESTING.md
 └── docs/
     ├── DESIGN.md            # this file
     ├── TESTING.md
-    ├── CHANGELOG.md
-    └── examples/
-        └── weekly-digest-task.md   # a scheduled-task prompt for MCP clients
+    └── CHANGELOG.md
 ```
 
 ---
@@ -93,8 +88,8 @@ Three invariants shape everything below:
 | `pymupdf4llm` | Fast rule-based PDF → Markdown |
 | `pymupdf` | PDF annotations, embedded metadata, DOI extraction |
 | `pyyaml` | Note frontmatter (`safe_load` only) |
-| `arxiv` | arXiv API client with paging, retries and the courtesy delay |
-| `requests` | bioRxiv API and Crossref lookups |
+| `arxiv` | arXiv API client, for the title and authors of a preprint whose PDF has no Crossref record |
+| `requests` | Crossref lookups |
 
 ---
 
@@ -641,11 +636,11 @@ annotated `read_only_hint`:
 | `read_note(path)` | One vault file from disk, by relative or absolute path, under the privacy rules above |
 | `list_documents(kind, limit ≤ 50, category, status, entity)` | Papers or notes, newest first |
 | `kb_stats()` | Counts, and the record types and statuses in use |
-| `fetch_recent_papers(source, categories, keywords, days ≤ 60, max_per_category ≤ 200)` | Recent arXiv/bioRxiv papers with DOI links, marked `[ALREADY IN PAPERS]` when one matches an indexed paper; failed categories listed rather than hidden |
+| `has_paper(doi, arxiv_id, title)` | Whether an indexed paper matches any of the given identifiers, with its file path, DOI link, `get_document` source and which identifier matched |
 | `reveal_in_finder(path)` | `open -R` on an indexed document (macOS); list arguments, no shell |
 
-**No write tools.** There is no add, remove, edit or move. Text from papers,
-notes and arXiv abstracts is untrusted input to the model reading it; with
+**No write tools.** There is no add, remove, edit or move. Text from papers
+and notes is untrusted input to the model reading it; with
 nothing writable, there is nothing an injected instruction can change. As a
 further mitigation, document text comes back between `BEGIN/END RETRIEVED
 DATA` markers, and the server `instructions` tell the model to treat it as
@@ -674,31 +669,31 @@ When it is down:
   connection, so once the server is up the next call succeeds without
   restarting the client.
 
-**How `[ALREADY IN PAPERS]` is decided.** The mark is added by jarvis, not
-judged by the model: `_papers_already_indexed()` collects the DOI, arXiv ID
-and title of every indexed paper, and a recent paper is marked when any one
-of them matches (DOI and arXiv ID case-insensitively, the title after
-lower-casing and collapsing whitespace). bioRxiv papers match by DOI, since
-the feed and the PDF both carry it. arXiv papers match by arXiv ID, since
-the feed rarely has a DOI. A paper still goes unmarked if its PDF prints
-neither identifier and its indexed title differs from the feed's, for
-example a publisher PDF of a paper whose preprint is in the feed.
+**How `has_paper` decides.** jarvis does the matching, not the model. The
+tool reads the metadata of every indexed paper (`doc_type="paper"`, with
+the visibility backstop) and keeps one entry per `source`. A paper matches
+when any identifier given matches:
 
-**Scheduled work lives in the client, and must run on the user's machine.**
-The weekly digest is a scheduled task that calls `fetch_recent_papers` with
-a prompt the user owns (see `docs/examples/weekly-digest-task.md`). jarvis
-is a local stdio server, so only a task that runs locally can reach it:
+- **DOI.** Both sides go through `normalise_doi()` (`jarvis/kb/metadata.py`),
+  which pulls the DOI out of a `doi:` prefix or a doi.org link and
+  lower-cases it, since DOIs are case-insensitive.
+- **arXiv ID.** `normalise_arxiv_id()` accepts an ID, an `arXiv:` mention or
+  an arxiv.org link and drops the version, matching the version-less
+  `arxiv_id` stored at indexing. An arXiv DOI (`10.48550/arXiv.<id>`) is also
+  checked as an arXiv ID.
+- **Title.** Both sides are reduced to their lower-cased words, so case,
+  punctuation and spacing don't matter. The title must otherwise be the same.
 
-- **Claude Desktop's Cowork scheduled tasks run in the cloud** and cannot
-  reach jarvis. Such a run lists only claude.ai connectors and reports the
-  jarvis tools as missing.
-- **Claude Code scheduled tasks** (the Code tab in Claude Desktop) run
-  locally, but Claude Code reads its own MCP registry, not
-  `claude_desktop_config.json`, so jarvis must be added with
-  `claude mcp add --scope user jarvis -- <uv> --directory <jarvis> run jarvis-mcp`.
-- **Antigravity background automations** have not been tested with jarvis.
-  They can only work if they run on the same machine and jarvis is in
-  Antigravity's MCP config.
+An identifier that was given but cannot be parsed is a `ToolError`, not a
+silent "no match". A paper is still missed if its PDF prints neither
+identifier and its indexed title is worded differently, for example a
+journal PDF of a paper the model knows as a preprint; the "no match" reply
+says to try `search_kb` on the title.
+
+**Finding new papers is the client's job.** jarvis used to fetch recent
+arXiv and bioRxiv papers itself (`fetch_recent_papers`, removed in PR #6).
+MCP clients have their own literature connectors, which do this more
+reliably, and can call `has_paper` to skip what the user already has.
 
 ---
 
@@ -739,64 +734,10 @@ whether or not the server is running.
 
 ---
 
-## arXiv — `jarvis/feeds/arxiv.py`
-
-Uses the `arxiv` package (lukasschwab/arxiv.py) rather than a
-hand-rolled Atom-feed parser. The library's `Client` exists to work around
-the arXiv API's known flakiness: it pages requests, retries responses that
-come back empty despite HTTP 200, and enforces the 3-second courtesy delay
-arXiv's terms ask for. A single shared client is used so the courtesy delay
-applies across successive category fetches. This replaced a raw `requests`
-implementation whose failure mode was silent — the empty-feed-with-200 bug
-bypassed retries and silently returned no papers.
-
-Retry layering is two levels deep, deliberately:
-1. **Inside the library** — per-page retries for paging hiccups.
-2. **`@with_retries(exceptions=(FetchError,))` on top** — whole-search
-   failures. Library errors and connection problems are wrapped in
-   `FetchError`, and a fully empty result set is *also* raised as
-   `FetchError`, because a recent arXiv category is never genuinely empty —
-   an empty feed is treated as transient and retried. `with_retries` backs
-   off exponentially (`backoff * 2**(attempt-1)`) with up to 25% random
-   jitter, so repeated failures don't hammer a struggling service in
-   lockstep.
-
-- `fetch_arxiv(cat, max_results)` — the newest papers in one category. The
-  MCP tool filters these to its `days` window, since arXiv returns the newest
-  N regardless of date.
-- `deduplicate(papers)` — remove duplicate titles
-
-Each paper dict carries `arxiv_id`, the ID without its version
-(`get_short_id()` minus `vN`), which `fetch_recent_papers` matches against the
-IDs read from PDFs in the papers folder.
-
----
-
-## bioRxiv — `jarvis/feeds/biorxiv.py`
-
-Pulls recent preprints from the bioRxiv details API
-(`https://api.biorxiv.org/details/biorxiv/{start}/{end}/{cursor}/json`),
-which returns 30 records per page walked by a numeric cursor. Records map to
-the same paper dict shape as arXiv (`title`, `abstract`, `authors`, `link` =
-`https://doi.org/{doi}`, `published` = date, `source`).
-
-- `fetch_biorxiv(category, max_results, days=7)` — one server-side category over the last `days`. Only real bioRxiv categories (e.g. `bioinformatics`) filter server-side.
-- `fetch_biorxiv_keywords(keywords, max_results, days=7)` — one uncategorised window, client-side case-insensitive match of any keyword against title+abstract, tagged `source = "bioRxiv:{keyword}"` and DOI-deduped (a paper matching two keywords appears once). Covers topics with no bioRxiv category (cytometry, spatial transcriptomics, scRNA-seq).
-
-Both are wrapped in `@with_retries(exceptions=(FetchError,))`; an empty first
-page is treated as a transient failure and retried, mirroring the arXiv
-layering. `fetch_recent_papers` merges categories and keywords into one list
-and runs title-based `deduplicate()` over it.
-
----
-
----
-
 ## Error handling — `jarvis/core/errors.py`
 
 ```
 JarvisError
-├── FetchError        arXiv / bioRxiv / Crossref failures (incl. transient empty feeds)
 ├── RAGError          Vector store failures
 │   └── KBCorruptionError   unresolvable id, or a collection replaced by kb rebuild
 └── ConversionError   PDF → Markdown produced no text (scanned PDF)
@@ -812,10 +753,6 @@ it before degrading, or is narrow expected control flow. The ones that matter:
 - Metadata lookups, single-PDF indexing failures and a failed sync pass are
   logged with the real exception, then the next source / file / interval
   carries on.
-
-`@with_retries(max_attempts, backoff, exceptions)` — exponential backoff
-(`backoff * 2**(attempt-1)`) with up to 25% jitter, logged (not printed, since
-the fetchers run inside the MCP server); used by both feeds.
 
 ---
 

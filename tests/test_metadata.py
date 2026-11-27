@@ -181,7 +181,7 @@ def test_an_unreadable_file_still_resolves(tmp_path):
 
 # ── arXiv IDs ──────────────────────────────────────────────────────────────────
 # arXiv preprints rarely print a DOI, so the arXiv ID is what lets
-# fetch_recent_papers recognise one already in the papers folder.
+# has_paper recognise one already in the papers folder.
 
 def test_arxiv_stamp_found_without_its_version(tmp_path):
     pdf = _make_pdf(tmp_path / "p.pdf", "arXiv:2411.01234v2  [cs.LG]  3 Nov 2024")

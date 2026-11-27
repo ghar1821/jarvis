@@ -15,9 +15,8 @@ down a list of sources and keeps the first answer for each field:
      LaTeX often fill in, though sometimes with junk like "untitled".
   5. The filename, as the title of last resort.
 
-The arXiv ID is also what lets `fetch_recent_papers` recognise an arXiv
-paper that is already in the papers folder, since the arXiv feed rarely has
-a DOI to match on.
+The arXiv ID is also what lets `has_paper` recognise an arXiv preprint
+that is already in the papers folder, since arXiv PDFs rarely print a DOI.
 
 Every step is best-effort: a failure is logged and the next source is tried,
 so a paper is always indexed, at worst under its filename.
@@ -95,6 +94,28 @@ def arxiv_id_from_doi(doi: str) -> str:
     """The arXiv ID inside an arXiv DOI (10.48550/arXiv.<id>), or "" for any other DOI."""
     match = _ARXIV_DOI_RE.match(doi)
     return match.group(1) if match else ""
+
+
+def normalise_doi(text: str) -> str:
+    """
+    The bare, lower-cased DOI in text such as "10.1101/2024.05.01.592000",
+    "doi:10.1101/..." or "https://doi.org/10.1101/...", or "" if there is none.
+
+    DOIs are case-insensitive, so lower-casing lets two spellings of the same
+    DOI compare equal.
+    """
+    match = _DOI_RE.search(text.strip())
+    return match.group(0).rstrip(").,;]").lower() if match else ""
+
+
+def normalise_arxiv_id(text: str) -> str:
+    """
+    The bare, lower-cased arXiv ID, without its version, in text such as
+    "2411.01234v2", "arXiv:2411.01234" or "https://arxiv.org/abs/2411.01234v2".
+    Returns "" if there is none.
+    """
+    match = re.search(_ARXIV_ID, text.strip(), re.IGNORECASE)
+    return match.group(1).lower() if match else ""
 
 
 def arxiv_lookup(arxiv_id: str) -> dict:

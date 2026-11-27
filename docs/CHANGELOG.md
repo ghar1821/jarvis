@@ -2,6 +2,13 @@
 
 ### NEW FUNCTIONALITY
 
+- Added the `has_paper` tool, so your MCP client can check whether you
+  already have a paper before recommending it (PR #6). It takes a DOI, an
+  arXiv ID or a title, and a match on any one counts. DOIs are compared
+  ignoring case, arXiv IDs ignoring the version, and titles ignoring case and
+  punctuation. A match comes back with the file path and the source to pass
+  to `get_document`.
+
 - Jarvis is now a read-only knowledge server for MCP clients (Claude
   Desktop, Google Antigravity, Claude Code, …). The client is the assistant;
   jarvis makes no LLM calls and holds no API keys (PR #5):
@@ -87,6 +94,13 @@
 
 ### BREAKING CHANGES
 
+- Removed `fetch_recent_papers`, the `jarvis/feeds/` arXiv and bioRxiv
+  fetchers, and the weekly digest prompt in `docs/examples/` (PR #6). Your
+  MCP client's own connectors (for example PubMed, or arXiv and bioRxiv
+  connectors) find new papers more reliably. Ask it to call `has_paper` to
+  skip the ones you already have. A scheduled task that calls
+  `fetch_recent_papers` will now fail; change its prompt.
+
 - The previous version of jarvis, the full assistant with its own web UI, is
   archived on the `archive/pre-mcp-simplification` branch. It was cut from
   `main` at `c231389` (PR #4), just before this change, and is kept for
@@ -166,17 +180,6 @@
 
 ### MINOR CHANGES
 
-- Corrected the weekly digest setup in the README and
-  `docs/examples/weekly-digest-task.md` (PR #6). Scheduled tasks in Claude
-  Desktop's Cowork tab run in the cloud and can't reach jarvis, so the
-  digest came back saying the jarvis tools weren't available. The docs now
-  say to create the task in the **Code** tab, which runs Claude Code on your
-  computer, and to add jarvis to Claude Code with `claude mcp add`, since
-  Claude Code doesn't read `claude_desktop_config.json`.
-
-- The README now explains how `[ALREADY IN PAPERS]` is decided and what it
-  can miss (PR #6).
-
 - PDF export from the editor no longer gives up after a minute. The ceiling on
   one LaTeX or pandoc run (`[drafts] compile_timeout_seconds`) is now 180
   seconds, since the first Markdown export on a machine spends minutes building
@@ -212,12 +215,11 @@
 
 ### BUG FIXES
 
-- Fix the weekly digest suggesting arXiv papers you already have (PR #6).
-  `fetch_recent_papers` matched papers only by DOI or exact title. arXiv
-  feeds rarely include a DOI, arXiv PDFs rarely print one, and an arXiv PDF
-  without embedded metadata was indexed under its filename, so neither
-  matched. Jarvis now reads the arXiv ID that arXiv stamps on each PDF and
-  matches on that too, ignoring the version.
+- Fix arXiv preprints you already have not being recognised as yours
+  (PR #6). Papers could only be matched by DOI or exact title. arXiv PDFs
+  rarely print a DOI, and an arXiv PDF without embedded metadata was indexed
+  under its filename, so neither matched. Jarvis now reads the arXiv ID that
+  arXiv stamps on each PDF and stores it, so `has_paper` can match on it.
 
 - Fix arXiv preprints being titled by their filename, e.g. `2411.01234v2`
   (PR #6). When a PDF has an arXiv ID but no Crossref title, the title and

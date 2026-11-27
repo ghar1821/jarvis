@@ -9,21 +9,19 @@ private chunk is filtered by the visibility backstop.
 
 Calls go through the SDK's in-process Client, so they exercise the real MCP
 path — argument validation and the ToolError → is_error conversion — rather
-than calling the functions directly. The arXiv fetch and `open -R` are the
-only boundaries replaced.
+than calling the functions directly. `open -R` is the only boundary replaced.
 """
 
 import asyncio
 import os
 import subprocess
 import sys
-from datetime import date, timedelta
 
 import pytest
 from mcp import Client
 
 from jarvis.core.config import Config
-from jarvis.core.errors import FetchError, KBCorruptionError
+from jarvis.core.errors import KBCorruptionError
 from jarvis.kb.mirror import refresh_vault
 from jarvis.kb.store import add_texts
 from jarvis.mcp.server import server
@@ -88,7 +86,7 @@ def test_every_tool_is_read_only():
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == {
         "search_kb", "get_document", "read_note", "list_documents", "kb_stats",
-        "fetch_recent_papers", "reveal_in_finder",
+        "has_paper", "reveal_in_finder",
     }
     assert all(tool.annotations.read_only_hint for tool in tools)
 
@@ -201,57 +199,70 @@ def test_listings_and_stats_name_nothing_private(kb):
     assert "salary_negotiation" not in stats and "offer" not in stats
 
 
-# ── fetch_recent_papers ────────────────────────────────────────────────────────
+# ── has_paper ──────────────────────────────────────────────────────────────────
 
-def test_fetch_recent_papers_marks_what_is_already_indexed(kb, store, monkeypatch):
-    """
-    Recent papers come back with DOI links; one already in the papers folder
-    is marked; one older than the window is dropped; a failed category is
-    reported rather than silently missing.
-    """
-    today = date.today().isoformat()
-    old = (date.today() - timedelta(days=30)).isoformat()
-    # An arXiv preprint in the papers folder, indexed under its filename.
+@pytest.fixture
+def preprint(kb, store):
+    """An arXiv preprint saved under its filename, so its title is just the ID."""
     add_texts(content="Sparse autoencoders for single-cell data.",
               doc_type="paper", visibility="public", source="file:///papers/2411.01234v2.pdf",
               extra_metadata={"title": "2411.01234v2", "doi": "", "arxiv_id": "2411.01234",
                               "file_path": "/papers/2411.01234v2.pdf"},
               store=store)
 
-    def fake_fetch_arxiv(category, max_results):
-        if category == "q-bio.QM":
-            raise FetchError("arXiv is down")
-        return [
-            {"title": "Diamond magnetometry", "abstract": "Already have it.", "authors": "N. V. Centre",
-             "published": today, "source": "arXiv:cs.LG", "doi": "10.1234/DIAMOND", "link": "x"},
-            {"title": "Fresh result", "abstract": "Brand new.", "authors": "A. New",
-             "published": today, "source": "arXiv:cs.LG", "doi": "", "link": "http://arxiv.org/abs/2611.00001"},
-            # No DOI and a different title from the indexed copy: only the arXiv ID matches.
-            {"title": "Sparse autoencoders, revised title", "abstract": "Have it.", "authors": "A. Held",
-             "published": today, "source": "arXiv:cs.LG", "doi": "", "arxiv_id": "2411.01234",
-             "link": "http://arxiv.org/abs/2411.01234v3"},
-            {"title": "Old result", "abstract": "Too old.", "authors": "A. Old",
-             "published": old, "source": "arXiv:cs.LG", "doi": "", "link": "x"},
-        ]
 
-    monkeypatch.setattr("jarvis.feeds.arxiv.fetch_arxiv", fake_fetch_arxiv)
-    text, is_error = _call(
-        "fetch_recent_papers", {"source": "arxiv", "categories": ["cs.LG", "q-bio.QM"], "days": 7},
-    )
-
+@pytest.mark.parametrize("arguments, matched_by", [
+    # A doi.org link with the DOI in a different case from the indexed one.
+    ({"doi": "https://doi.org/10.1234/DIAMOND"}, "DOI"),
+    # Case and punctuation in the title are ignored.
+    ({"title": "  diamond MAGNETOMETRY. "}, "title"),
+    # A DOI that misses (e.g. the journal version) still matches on the title.
+    ({"doi": "10.9999/journal.version", "title": "Diamond magnetometry"}, "title"),
+])
+def test_has_paper_finds_a_paper_by_doi_or_title(kb, arguments, matched_by):
+    text, is_error = _call("has_paper", arguments)
     assert not is_error
-    assert "Diamond magnetometry  [ALREADY IN PAPERS]" in text
-    assert "Sparse autoencoders, revised title  [ALREADY IN PAPERS]" in text
-    assert "Fresh result" in text and "[ALREADY" not in text.split("Fresh result")[1].splitlines()[0]
-    assert "http://arxiv.org/abs/2611.00001" in text
-    assert "Old result" not in text
-    assert "q-bio.QM" in text and "arXiv is down" in text
+    assert "Yes, 1 matching paper" in text
+    assert "Diamond magnetometry" in text and "/papers/magnetometry.pdf" in text
+    assert f"Source (for get_document): {PAPER_SOURCE}" in text
+    assert f"Matched by: {matched_by}" in text
     assert "BEGIN RETRIEVED DATA" in text
 
 
-def test_fetch_recent_papers_needs_something_to_fetch(kb):
-    text, is_error = _call("fetch_recent_papers", {"source": "arxiv"})
-    assert is_error and "category" in text
+@pytest.mark.parametrize("arguments", [
+    {"arxiv_id": "2411.01234"},
+    # Any version, and an arxiv.org link.
+    {"arxiv_id": "https://arxiv.org/abs/2411.01234v3"},
+    # arXiv's own DOI carries the ID.
+    {"doi": "10.48550/arXiv.2411.01234"},
+])
+def test_has_paper_finds_a_preprint_by_arxiv_id(preprint, arguments):
+    text, is_error = _call("has_paper", arguments)
+    assert not is_error
+    assert "/papers/2411.01234v2.pdf" in text and "Matched by: arXiv ID" in text
+
+
+def test_has_paper_says_no_when_nothing_matches(preprint):
+    text, is_error = _call("has_paper", {"doi": "10.5555/unknown", "arxiv_id": "2501.00001",
+                                         "title": "A paper nobody saved"})
+    assert not is_error
+    assert text.startswith("No paper in the knowledge base matches")
+
+
+def test_has_paper_never_matches_a_note(kb):
+    """Only papers count: a note with the same title is not "having the paper"."""
+    text, _ = _call("has_paper", {"title": "Quantum public"})
+    assert text.startswith("No paper")
+
+
+@pytest.mark.parametrize("arguments, expected", [
+    ({}, "at least one of doi, arxiv_id or title"),
+    ({"doi": "not a doi"}, "does not look like a DOI"),
+    ({"arxiv_id": "abc"}, "does not look like an arXiv ID"),
+])
+def test_has_paper_rejects_unreadable_input(kb, arguments, expected):
+    text, is_error = _call("has_paper", arguments)
+    assert is_error and expected in text
 
 
 # ── reveal_in_finder ───────────────────────────────────────────────────────────
