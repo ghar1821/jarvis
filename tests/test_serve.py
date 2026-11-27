@@ -115,3 +115,72 @@ def test_start_up_explains_a_chroma_that_exits_immediately():
     """The usual cause is a second `kb serve` on the same port; say so."""
     with pytest.raises(RuntimeError, match="already using port 8321"):
         _wait_until_answering(_DeadChild(), 8321, timeout=2)
+
+
+# ── The real index server ──────────────────────────────────────────────────────
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@pytest.fixture
+def running_server(tmp_path, monkeypatch):
+    """
+    The real Chroma server, started the way `kb serve` starts it, on a free
+    port with its index and token in tmp_path. Nothing under ~/.jarvis is
+    touched: the token file location is pointed at tmp_path too.
+    """
+    import subprocess
+
+    from jarvis.kb import serve, store
+
+    token_file = serve.ensure_server_token(tmp_path / "state" / "server_token")
+    monkeypatch.setattr(store, "TOKEN_FILE", token_file)
+    rag_dir = tmp_path / "rag"
+    rag_dir.mkdir()
+    port = _free_port()
+    child = subprocess.Popen(
+        serve.server_command(port),
+        env=serve.server_environment(rag_dir, token_file),
+        cwd=rag_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_until_answering(child, port, timeout=60)
+        yield port, token_file
+    finally:
+        serve._stop_chroma(child)
+
+
+def test_the_server_refuses_a_request_without_the_token(running_server):
+    """
+    Any program on this machine can reach 127.0.0.1. Without the token it
+    must get nothing: not a list of collections, not a document.
+    """
+    import urllib.error
+    import urllib.request
+
+    port, _ = running_server
+    url = f"http://127.0.0.1:{port}/api/v2/tenants/default_tenant/databases/default_database/collections"
+    with pytest.raises(urllib.error.HTTPError) as refused:
+        urllib.request.urlopen(url, timeout=10)
+    assert refused.value.code in (401, 403)
+
+
+def test_the_server_accepts_the_token_and_names_a_wrong_one(running_server):
+    from jarvis.core.errors import ServerAuthError
+    from jarvis.kb.store import _server_client
+
+    port, token_file = running_server
+    client = _server_client(port)
+    client.get_or_create_collection("probe").add(ids=["a"], embeddings=[[0.1, 0.2]], documents=["x"])
+    assert client.get_collection("probe").count() == 1
+
+    token_file.write_text("not-the-token")
+    with pytest.raises(ServerAuthError, match="refused this process's token"):
+        _server_client(port)

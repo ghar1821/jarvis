@@ -26,6 +26,21 @@ class KBCorruptionError(RAGError):
     """
 
 
+class ServerAuthError(RAGError):
+    """
+    The knowledge-base server is running but refused this process's token.
+
+    Kept apart from "server not running" on purpose: a one-shot `kb` command
+    may open the index files itself when the server is down, but must never do
+    so while the server is up. Two processes writing the same index is the
+    fault the server exists to prevent.
+    """
+
+
+class ConfigError(JarvisError):
+    """~/.jarvis/config.toml asks for something jarvis will not do safely."""
+
+
 class ConversionError(JarvisError):
     """PDF-to-Markdown conversion produced no usable text (e.g. scanned/image-only PDF)."""
 

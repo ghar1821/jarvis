@@ -1,8 +1,8 @@
 """
 kb — the jarvis command line.
 
-The index mirrors two folders you manage yourself: your Obsidian vault
-(minus its private folders) and your papers folder. There is no add or
+The index mirrors two folders you manage yourself: your Obsidian vault and
+your papers folder. There is no add or
 remove command — save a file there to add it, delete the file to remove it.
 MCP clients reach the index through jarvis-mcp, which they start themselves.
 
@@ -14,7 +14,7 @@ Subcommands:
   stats           Show document and chunk counts
   schema [key]    Show which metadata keys/values exist (your record ontology)
   status          Show whether `kb serve` is running and how its last sync went
-  doctor          Diagnose index health, and list entries a rebuild would drop
+  doctor          Diagnose index health
 
 Examples:
   uv run kb serve
@@ -26,6 +26,7 @@ Examples:
 import argparse
 import sys
 
+from jarvis.core.errors import ConfigError
 from jarvis.kb.store import allow_direct_index_access
 
 
@@ -58,9 +59,8 @@ def cmd_rebuild() -> None:
     cfg = get_config()
     print(
         "This rebuilds the index from scratch, from:\n"
-        f"  vault:  {cfg.vault_path}  (not: {', '.join(cfg.private_vault_dirs) or 'nothing'})\n"
+        f"  vault:  {cfg.vault_path}  (every .md file in it)\n"
         f"  papers: {cfg.papers_dir or '— none (no papers_dir set)'}\n"
-        "Entries not backed by a file in those folders are dropped — `kb doctor` lists them.\n"
         "Only the index changes; no file anywhere is touched."
     )
     if input("Rebuild? [y/N] ").strip().lower() != "y":
@@ -81,6 +81,8 @@ def cmd_rebuild() -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     """List indexed papers, or vault notes/records with --notes."""
     from jarvis.core.config import get_config
+    from .frontmatter import display_tags
+    from .metadata import doi_url
     from .store import get_store, list_documents
 
     doc_type = "note" if args.notes else "paper"
@@ -104,7 +106,7 @@ def cmd_list(args: argparse.Namespace) -> None:
             if d.get("authors"):
                 print(f"  Authors: {d['authors']}")
             if d.get("doi"):
-                print(f"  DOI: https://doi.org/{d['doi']}")
+                print(f"  DOI: {doi_url(d['doi'])}")
         else:
             print(f"  {vault / d.get('file_path', '')}")
             record = " · ".join(
@@ -115,7 +117,7 @@ def cmd_list(args: argparse.Namespace) -> None:
             if d.get("event_date"):
                 print(f"  Date: {d['event_date']}")
             if d.get("tags"):
-                print(f"  Tags: {d['tags'].strip('|').replace('|', ', ')}")
+                print(f"  Tags: {display_tags(d['tags'])}")
         print()
 
 
@@ -170,14 +172,13 @@ def cmd_schema(args: argparse.Namespace) -> None:
 # command vanished with no output" into a diagnosis the user can act on.
 _DOCTOR_PROBE = """
 import json
-from jarvis.core.errors import KBCorruptionError, RAGError
-from jarvis.kb.store import count, get_store, search
+from jarvis.core.config import get_config
+from jarvis.core.errors import RAGError
+from jarvis.kb.store import _server_client, allow_direct_index_access, count, get_store, search
 
 result = {"opened": False, "count": None, "search_ok": None, "error": None,
           "via_server": None}
 try:
-    from jarvis.core.config import get_config
-    from jarvis.kb.store import _server_client, allow_direct_index_access
     try:
         _server_client(get_config().server_port)
         result["via_server"] = True
@@ -192,10 +193,10 @@ try:
         try:
             search("diagnostic probe query", n_results=1, store=store, rerank=False)
             result["search_ok"] = True
-        except (KBCorruptionError, RAGError) as exc:
+        except RAGError as exc:
             result["search_ok"] = False
             result["error"] = str(exc)
-except (RAGError, Exception) as exc:
+except Exception as exc:
     result["error"] = f"{type(exc).__name__}: {exc}"
 print("DOCTOR_RESULT " + json.dumps(result))
 """
@@ -233,83 +234,11 @@ def _run_doctor_probe() -> "dict | None":
     return None
 
 
-def find_unbacked_entries(store, cfg) -> dict:
-    """
-    Group the entries a rebuild would drop, because no file in the two
-    mirrored folders backs them. Older versions could add all of these.
-
-    Returns {"papers": [{title, doi, where}], "digests": [title],
-    "private_documents": int, "chat_chunks": int}. Private documents are only
-    counted — their titles are private too.
-    """
-    from pathlib import Path
-
-    result = store._collection.get(include=["metadatas"])
-    papers_dir = cfg.papers_dir.resolve() if cfg.papers_dir else None
-
-    papers: dict[str, dict] = {}
-    digests: dict[str, str] = {}
-    private_keys: set[str] = set()
-    chat_chunks = 0
-    for meta in result["metadatas"]:
-        doc_type = meta.get("doc_type")
-        key = meta.get("file_path") or meta.get("source", "")
-        if doc_type == "chat":
-            chat_chunks += 1
-        elif meta.get("visibility") == "private":
-            private_keys.add(key)
-        elif doc_type == "digest":
-            digests[meta.get("source", "")] = meta.get("title", "untitled digest")
-        elif doc_type == "paper":
-            file_path = meta.get("file_path", "")
-            backed = bool(file_path) and papers_dir is not None and Path(file_path).is_relative_to(papers_dir)
-            if not backed:
-                papers.setdefault(meta.get("source", ""), {
-                    "title": meta.get("title", "untitled"),
-                    "doi": meta.get("doi", ""),
-                    "where": file_path or meta.get("source", ""),
-                })
-    return {
-        "papers": sorted(papers.values(), key=lambda paper: paper["title"].lower()),
-        "digests": sorted(digests.values()),
-        "private_documents": len(private_keys),
-        "chat_chunks": chat_chunks,
-    }
-
-
-def _report_unbacked_entries(store) -> None:
-    """The one-time migration report: what `kb rebuild` would drop, and how to keep it."""
-    from jarvis.core.config import get_config
-
-    cfg = get_config()
-    unbacked = find_unbacked_entries(store, cfg)
-    if not any(unbacked.values()):
-        print("✓ Every entry comes from a file in the vault or papers folder.")
-        return
-
-    print("\n⚠️  Some entries are not backed by a file in your vault or papers folder.")
-    print("   They stay searchable for now, but `kb rebuild` would drop them:\n")
-    if unbacked["papers"]:
-        print(f"   {len(unbacked['papers'])} paper(s) — save the PDF into "
-              f"{cfg.papers_dir or 'your papers_dir'} to keep one:")
-        for paper in unbacked["papers"]:
-            link = f"https://doi.org/{paper['doi']}" if paper["doi"] else paper["where"]
-            print(f"     - {paper['title']}\n       {link}")
-    if unbacked["digests"]:
-        print(f"   {len(unbacked['digests'])} weekly digest document(s) from the old digest feature")
-    if unbacked["private_documents"]:
-        print(f"   {unbacked['private_documents']} private document(s) (not listed — they are private)")
-    if unbacked["chat_chunks"]:
-        print(f"   {unbacked['chat_chunks']} chunk(s) of indexed chat history from the old webapp")
-    print("\n   When you've saved what you want to keep: uv run kb rebuild")
-
-
 def cmd_doctor() -> None:
     """
-    Diagnose index health: open the store (exercises the embed-model guard),
-    count chunks, then probe a real search (exercises corruption detection).
-    Exits non-zero on any failure so this is scriptable. On a healthy index,
-    also reports entries a rebuild would drop.
+    Diagnose index health: open the store (exercises the version and
+    embedding-model checks), count chunks, then probe a real search (exercises
+    corruption detection). Exits non-zero on any failure so this is scriptable.
     """
     print("Checking knowledge base...", flush=True)
     result = _run_doctor_probe()
@@ -321,7 +250,7 @@ def cmd_doctor() -> None:
     if not result["opened"]:
         print(f"✗ Failed to open store: {result['error']}", file=sys.stderr)
         sys.exit(1)
-    print("✓ Store opened (embedding model matches)")
+    print("✓ Store opened (built by this version, embedding model matches)")
     if result.get("via_server"):
         print("✓ kb serve is running (jarvis-mcp uses it)")
     elif result.get("via_server") is False:
@@ -337,10 +266,6 @@ def cmd_doctor() -> None:
         print(f"✗ Search failed:\n  {result['error']}", file=sys.stderr)
         sys.exit(1)
     print("✓ Search probe succeeded")
-
-    from .store import get_store
-
-    _report_unbacked_entries(get_store())
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -367,7 +292,7 @@ def main() -> None:
     p_schema = sub.add_parser("schema", help="Show which metadata keys and values exist in the store")
     p_schema.add_argument("key", nargs="?", help="Show the distinct values of one key")
     sub.add_parser("status", help="Show whether kb serve is running and how its last sync went")
-    sub.add_parser("doctor", help="Diagnose index health; list entries a rebuild would drop")
+    sub.add_parser("doctor", help="Diagnose index health")
 
     args = parser.parse_args()
 
@@ -396,7 +321,11 @@ def main() -> None:
         "status":  print_status,
         "doctor":  cmd_doctor,
     }
-    dispatch[args.command]()
+    try:
+        dispatch[args.command]()
+    except ConfigError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@
 
 It does two things:
 
-1. Runs the Chroma server (`chroma run`, bound to 127.0.0.1) as a child
-   process. That server owns the index; jarvis-mcp and every other reader
-   connect to it, so no process ever holds a stale private copy of the
-   vectors while another rewrites them.
+1. Runs Chroma's server as a child process, bound to 127.0.0.1 and refusing
+   any request without the token in ~/.jarvis/state/server_token. That
+   server owns the index; jarvis-mcp and every other reader connect to it,
+   so no process ever holds a stale private copy of the vectors while
+   another rewrites them.
 2. Mirrors the vault and papers folder into the index every `sync_minutes`
    (see jarvis/kb/mirror.py), plus once at start-up.
 
@@ -21,7 +22,7 @@ A plain loop rather than a scheduler library: there is one periodic job, and
 import json
 import logging
 import os
-import shutil
+import secrets
 import signal
 import subprocess
 import sys
@@ -31,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.core.config import Config, format_describe, get_config
+from jarvis.core.errors import ConfigError
+from jarvis.core.files import make_private_dir
 
 STATUS_FILE = Path.home() / ".jarvis" / "state" / "serve_status.json"
 LOG_DIR = Path.home() / ".jarvis" / "logs"
@@ -51,7 +54,7 @@ def read_status(status_file: Path = STATUS_FILE) -> dict:
 
 def write_status(status: dict, status_file: Path = STATUS_FILE) -> None:
     """Atomically write the status file (temp file + os.replace)."""
-    status_file.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dir(status_file.parent)
     tmp_file = status_file.with_suffix(".json.tmp")
     tmp_file.write_text(json.dumps(status, indent=2), encoding="utf-8")
     os.replace(tmp_file, status_file)
@@ -95,45 +98,97 @@ def run_sync(status_file: Path = STATUS_FILE, store=None) -> bool:
 # ── The Chroma child process ──────────────────────────────────────────────────
 
 
+def ensure_server_token(token_file: Path | None = None) -> Path:
+    """
+    Create the server token the first time, and keep it after that.
+
+    Reusing it across restarts means a jarvis-mcp that is already running
+    keeps working when `kb serve` restarts. The file is created owner-only in
+    one step (O_EXCL with mode 0600), so it is never readable by anyone else,
+    not even for a moment. Returns the token file's path.
+    """
+    from jarvis.kb.store import TOKEN_FILE
+
+    token_file = token_file or TOKEN_FILE
+    make_private_dir(token_file.parent)
+    if token_file.exists():
+        # Tighten a file someone loosened by hand.
+        token_file.chmod(0o600)
+        return token_file
+    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secrets.token_urlsafe(32))
+    return token_file
+
+
+def server_command(port: int) -> list[str]:
+    """The command that runs Chroma's server on 127.0.0.1 only."""
+    return [
+        sys.executable, "-m", "uvicorn", "chromadb.app:app",
+        # Never a routable address. The token keeps out other programs on
+        # this machine; binding locally keeps out every other machine.
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--log-level", "warning",
+    ]
+
+
+def server_environment(rag_dir: Path, token_file: Path) -> dict[str, str]:
+    """
+    Settings for Chroma's server, which it reads from environment variables.
+
+    The token is passed as a file path rather than its value, so it never
+    appears in the process's environment.
+    """
+    return {
+        **os.environ,
+        "IS_PERSISTENT": "TRUE",
+        "PERSIST_DIRECTORY": str(rag_dir),
+        "ANONYMIZED_TELEMETRY": "FALSE",
+        "CHROMA_SERVER_AUTHN_PROVIDER": "chromadb.auth.token_authn.TokenAuthenticationServerProvider",
+        "CHROMA_SERVER_AUTHN_CREDENTIALS_FILE": str(token_file),
+    }
+
+
 def _start_chroma(cfg: Config) -> subprocess.Popen:
-    """Launch `chroma run` on 127.0.0.1, its own output going to a log file."""
-    chroma = shutil.which("chroma")
-    if chroma is None:
-        raise RuntimeError("The 'chroma' command is not on PATH. It ships with chromadb — try: uv sync")
-    cfg.rag_dir.mkdir(parents=True, exist_ok=True)
+    """Launch Chroma's server on 127.0.0.1, its own output going to a log file."""
     # Owner-only: the index holds the full text of your notes and papers.
-    os.chmod(cfg.rag_dir, 0o700)
-    chroma_log = open(LOG_DIR / "chroma.log", "a", encoding="utf-8")
-    return subprocess.Popen(
-        [
-            chroma, "run",
-            "--path", str(cfg.rag_dir),
-            # Never a routable address: Chroma's server has no authentication.
-            "--host", "127.0.0.1",
-            "--port", str(cfg.server_port),
-        ],
-        stdout=chroma_log,
-        stderr=subprocess.STDOUT,
-    )
+    make_private_dir(cfg.rag_dir)
+    token_file = ensure_server_token()
+    with open(LOG_DIR / "chroma.log", "a", encoding="utf-8") as chroma_log:
+        # The child keeps its own copy of the log handle, so ours can close.
+        return subprocess.Popen(
+            server_command(cfg.server_port),
+            env=server_environment(cfg.rag_dir, token_file),
+            # Run from the owner-only index folder, so Python cannot pick up
+            # a stray module from wherever `kb serve` happened to be started.
+            cwd=cfg.rag_dir,
+            stdout=chroma_log,
+            stderr=subprocess.STDOUT,
+        )
 
 
 def _wait_until_answering(child: subprocess.Popen, port: int, timeout: float = 60.0) -> None:
-    """Block until the server answers a heartbeat; raise if it dies or never does."""
+    """Block until the server answers with our token; raise if it dies or never does."""
+    from jarvis.core.errors import ServerAuthError
     from jarvis.kb.store import _server_client
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if child.poll() is not None:
             raise RuntimeError(
-                f"chroma exited with code {child.returncode} — is another `kb serve` "
-                f"already using port {port}? See {LOG_DIR / 'chroma.log'}"
+                f"The index server exited with code {child.returncode}. Is another "
+                f"`kb serve` already using port {port}? See {LOG_DIR / 'chroma.log'}"
             )
         try:
             _server_client(port)
             return
+        except ServerAuthError:
+            # Something else is answering on this port, and it is not ours.
+            raise
         except Exception:
             time.sleep(0.5)
-    raise RuntimeError(f"chroma did not start answering on port {port} within {timeout:.0f}s")
+    raise RuntimeError(f"The index server did not start answering on port {port} within {timeout:.0f}s")
 
 
 def _stop_chroma(child: subprocess.Popen) -> None:
@@ -150,7 +205,7 @@ def _stop_chroma(child: subprocess.Popen) -> None:
 
 def serve() -> None:
     """Run the index server and the periodic sync until Ctrl-C."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    make_private_dir(LOG_DIR)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -162,7 +217,11 @@ def serve() -> None:
     # which buries the sync lines that actually say something.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    cfg = get_config()
+    try:
+        cfg = get_config()
+    except ConfigError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(1)
     print("jarvis — kb serve\n" + format_describe(cfg) + "\n", flush=True)
     if cfg.sync_minutes < 1:
         print(f"✗ [kb] sync_minutes must be at least 1, got {cfg.sync_minutes}", file=sys.stderr)
@@ -172,11 +231,7 @@ def serve() -> None:
             # Not fatal: an unmounted drive comes back. Its sync just waits.
             log.warning("%s %s is not a folder — it will be skipped until it exists", label, folder)
 
-    try:
-        child = _start_chroma(cfg)
-    except RuntimeError as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        sys.exit(1)
+    child = _start_chroma(cfg)
 
     stop = threading.Event()
 
@@ -203,7 +258,7 @@ def serve() -> None:
             if child.poll() is not None:
                 # Without its server nothing else can work; stop loudly rather
                 # than keep syncing into a connection that is gone.
-                log.error("chroma exited unexpectedly (code %s) — stopping", child.returncode)
+                log.error("the index server exited unexpectedly (code %s), so kb serve is stopping", child.returncode)
                 break
             run_sync()
             stop.wait(cfg.sync_minutes * 60)

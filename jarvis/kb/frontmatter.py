@@ -9,16 +9,16 @@ and makes it filterable.
 Two kinds of key:
 
 - **Well-known keys** (`type`/`category`, `status`, `entity`, `date`, `tags`)
-  map onto named metadata fields the CLI and UI expose as filters, because
-  they are the axes worth having a UI for.
+  map onto named metadata fields that the CLI and the MCP tools offer as
+  filters.
 - **Every other scalar key passes through** under an `x_` prefix, so
   `venue: NeurIPS` becomes `x_venue` and needs no code change.
 
 **The `x_` prefix is a security boundary, not tidiness.** A `.md` file can
 arrive in the vault from anywhere — downloaded, synced, shared. Without
-namespacing, a note carrying `visibility: public` or `doc_type: paper` in its
-frontmatter would overwrite jarvis's own schema when the two dicts merged, and
-a private note could reclassify itself into cloud-visible. Prefixing makes that
+namespacing, a note carrying `doc_type: paper` or `source: ...` in its
+frontmatter would overwrite jarvis's own schema when the two dicts merged,
+and could pass itself off as a different document. Prefixing makes that
 structurally impossible rather than something to remember to check.
 
 ChromaDB metadata values must be scalars, so lists are joined and nested
@@ -27,6 +27,10 @@ be worse than a noisy one).
 """
 
 import re
+
+from jarvis.core.logs import get_logger
+
+log = get_logger(__name__)
 
 # Frontmatter is a `---` fenced block at the very top of the file. The body and
 # its trailing newline are one optional unit, so a genuinely empty block
@@ -38,7 +42,7 @@ import re
 _FRONTMATTER = re.compile(r"\A---\r?\n(?:(.*?)\r?\n)?---\r?\n?", re.DOTALL)
 
 # Frontmatter key → the metadata field it populates. These are the axes the
-# CLI and webapp offer as filters; everything else becomes x_<key>.
+# CLI and MCP tools offer as filters; everything else becomes x_<key>.
 _WELL_KNOWN = {
     "type": "category",
     "category": "category",
@@ -81,6 +85,11 @@ def format_tags(tags) -> str:
     if not values:
         return ""
     return TAG_SEPARATOR + TAG_SEPARATOR.join(values) + TAG_SEPARATOR
+
+
+def display_tags(stored: str) -> str:
+    """A stored tag string ("|a|b|") as readable text ("a, b")."""
+    return ", ".join(tag for tag in stored.split(TAG_SEPARATOR) if tag)
 
 
 def has_tag(stored: str, tag: str) -> bool:
@@ -136,10 +145,9 @@ def parse_frontmatter(content: str, file_label: str = "") -> tuple[dict, str]:
         # construct arbitrary Python objects.
         parsed = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
-        print(
-            f"  ⚠️  {file_label or 'note'}: could not parse frontmatter ({exc.__class__.__name__})"
-            " — indexing its text without metadata",
-            flush=True,
+        log.warning(
+            "%s: could not parse its frontmatter (%s), so it is indexed as plain "
+            "text with no record fields", file_label or "a note", exc.__class__.__name__,
         )
         return {}, body
 
@@ -160,10 +168,9 @@ def parse_frontmatter(content: str, file_label: str = "") -> tuple[dict, str]:
 
         scalar = _scalar(value)
         if scalar is UNSTORABLE:
-            print(
-                f"  ⚠️  {file_label or 'note'}: skipping frontmatter key {name!r} "
-                "— only scalars and flat lists can be stored",
-                flush=True,
+            log.warning(
+                "%s: skipped frontmatter key %r, because only single values and "
+                "flat lists can be stored", file_label or "a note", name,
             )
             continue
         if scalar is None:
@@ -182,7 +189,7 @@ def record_header(metadata: dict) -> str:
     A one-line summary of a record's identity, e.g.
     "job_application · Acme Bio · rejected".
 
-    Passed to add_texts as the embed_header so EVERY chunk of the record
+    Passed to build_text_documents as the embed_header so EVERY chunk of the record
     carries it in its embedded text — that is what makes "jobs I was rejected
     from" match a record whose body never uses those words. Reuses the
     mechanism papers already use for title/authors rather than inventing one.

@@ -1,8 +1,8 @@
 """
 Retrieval-quality benchmark for the knowledge base.
 
-Unlike test_store.py (which checks correctness — visibility filters, idempotency,
-privacy), this file measures *how good* retrieval actually is: given a realistic
+Unlike test_store.py (which checks correctness — doc_type filters, idempotency,
+deletes), this file measures *how good* retrieval actually is: given a realistic
 query, does the right document come back near the top? It builds a small fixture
 corpus of paper summaries and markdown notes, runs a fixed set of golden queries
 through the real search() pipeline (embeddings + re-ranking), and reports
@@ -32,7 +32,8 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from jarvis.kb.store import add_texts, search
+from helpers import index_text
+from jarvis.kb.store import search
 
 # Same gitignored store directory the other KB tests use (see conftest.py).
 TEST_CHROMA_DIR = Path(__file__).parent / ".chroma"
@@ -95,7 +96,7 @@ _PAPERS = [
      "their gene-expression signatures, revealing heterogeneity within a tissue sample.", ""),
 ]
 
-# Markdown notes: (source, markdown_text). Stored via add_texts as full-text notes
+# Markdown notes: (source, markdown_text). Stored via index_text as full-text notes
 # with real headers so section-aware chunking has something to work with.
 _NOTES = [
     ("note-optimisers",
@@ -216,12 +217,11 @@ def quality_store(embeddings):
         persist_directory=str(TEST_CHROMA_DIR),
     )
     for source, title, text, authors in _PAPERS:
-        add_texts(content=text, doc_type="paper", visibility="public", source=source,
+        index_text(content=text, doc_type="paper", source=source,
                   extra_metadata={"title": title, "authors": authors},
                   embed_header=f"{title} — {authors}" if authors else title, store=store)
     for source, text in _NOTES:
-        add_texts(content=text, doc_type="note", visibility="public",
-                  source=source, store=store)
+        index_text(content=text, doc_type="note", source=source, store=store)
     yield store
     store.delete_collection()
 

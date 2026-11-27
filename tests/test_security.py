@@ -33,6 +33,8 @@ _ALLOWED_WRITES = {
     ("kb/serve.py", "open:a"),
     # <rag_dir>/.write.lock, the advisory lock for direct index access.
     ("kb/store.py", "open:w"),
+    # ~/.jarvis/state/server_token, created owner-only in one step.
+    ("kb/serve.py", "os.open"),
 }
 
 
@@ -53,6 +55,9 @@ def _write_sites() -> set[tuple[str, str]]:
                 ):
                     continue
                 sites.add((relative, name))
+            elif name == "open" and isinstance(func, ast.Attribute) and getattr(func.value, "id", "") == "os":
+                # os.open takes flags, not a mode string, so any call counts.
+                sites.add((relative, "os.open"))
             elif name == "open" and isinstance(func, ast.Name):
                 mode = node.args[1] if len(node.args) > 1 else next(
                     (kw.value for kw in node.keywords if kw.arg == "mode"), None
@@ -78,9 +83,37 @@ def test_no_file_is_ever_deleted():
 
 
 def test_the_allowed_writes_point_inside_dot_jarvis():
-    """The serve status file and logs live under ~/.jarvis, never in a mirrored folder."""
-    from jarvis.kb import serve
+    """The serve status file, server token and logs live under ~/.jarvis, never in a mirrored folder."""
+    from jarvis.kb import serve, store
 
     dot_jarvis = Path.home() / ".jarvis"
     assert serve.STATUS_FILE.is_relative_to(dot_jarvis)
     assert serve.LOG_DIR.is_relative_to(dot_jarvis)
+    assert store.TOKEN_FILE.is_relative_to(dot_jarvis)
+
+
+def test_folders_under_dot_jarvis_are_made_owner_only(tmp_path):
+    """Logs, state and the index name your papers and notes, so only you can read them."""
+    from jarvis.core.files import make_private_dir
+
+    folder = tmp_path / "state"
+    make_private_dir(folder)
+    assert folder.stat().st_mode & 0o777 == 0o700
+
+    # An existing folder with looser permissions is tightened too.
+    folder.chmod(0o755)
+    make_private_dir(folder)
+    assert folder.stat().st_mode & 0o777 == 0o700
+
+
+def test_the_server_token_is_created_owner_only_and_kept(tmp_path):
+    from jarvis.kb.serve import ensure_server_token
+
+    token_file = ensure_server_token(tmp_path / "state" / "server_token")
+    token = token_file.read_text()
+    assert len(token) >= 40
+    assert token_file.stat().st_mode & 0o777 == 0o600
+    assert token_file.parent.stat().st_mode & 0o777 == 0o700
+
+    # Restarting kb serve reuses the token, so running clients keep working.
+    assert ensure_server_token(token_file).read_text() == token

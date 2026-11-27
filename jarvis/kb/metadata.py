@@ -24,6 +24,7 @@ so a paper is always indexed, at worst under its filename.
 
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 import arxiv
 import pymupdf
@@ -70,11 +71,21 @@ def _first_pages_text(pdf_path: Path, max_pages: int) -> str:
         doc.close()
 
 
-def extract_doi(pdf_path: Path, max_pages: int = 2) -> str:
-    """The first DOI printed on the first pages, or "" if there is none."""
-    match = _DOI_RE.search(_first_pages_text(pdf_path, max_pages))
+def _first_doi(text: str) -> str:
+    """The first DOI in text, or "" if there is none."""
+    match = _DOI_RE.search(text)
     # A DOI printed mid-sentence often drags trailing punctuation with it.
     return match.group(0).rstrip(").,;]") if match else ""
+
+
+def doi_url(doi: str) -> str:
+    """The doi.org link for a DOI, or "" when there is no DOI."""
+    return f"https://doi.org/{doi}" if doi else ""
+
+
+def extract_doi(pdf_path: Path, max_pages: int = 2) -> str:
+    """The first DOI printed on the first pages, or "" if there is none."""
+    return _first_doi(_first_pages_text(pdf_path, max_pages))
 
 
 def extract_arxiv_id(pdf_path: Path) -> str:
@@ -104,8 +115,7 @@ def normalise_doi(text: str) -> str:
     DOIs are case-insensitive, so lower-casing lets two spellings of the same
     DOI compare equal.
     """
-    match = _DOI_RE.search(text.strip())
-    return match.group(0).rstrip(").,;]").lower() if match else ""
+    return _first_doi(text.strip()).lower()
 
 
 def normalise_arxiv_id(text: str) -> str:
@@ -152,8 +162,10 @@ def crossref_lookup(doi: str) -> dict:
     arXiv fetcher produces, so author-name search behaves the same for both.
     """
     try:
+        # Escaped because a DOI read from a PDF can contain "?", "#" or "%",
+        # which would otherwise change what the URL asks for.
         response = requests.get(
-            _CROSSREF_URL.format(doi=doi),
+            _CROSSREF_URL.format(doi=quote(doi, safe="/")),
             headers=_CROSSREF_HEADERS,
             timeout=_CROSSREF_TIMEOUT,
         )

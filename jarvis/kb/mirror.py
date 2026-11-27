@@ -1,8 +1,8 @@
 """
 The index as a mirror of two folders you manage yourself.
 
-Everything in the knowledge base comes from a file: vault notes (`.md`
-outside the private folders) and the PDFs under `papers_dir`. Adding,
+Everything in the knowledge base comes from a file: the `.md` notes in the
+vault and the PDFs under `papers_dir`. Adding,
 removing, moving or renaming a file is how you change the index — jarvis has
 no add or remove command, and never writes to either folder. Each sync pass
 brings the index back in line with the files:
@@ -17,9 +17,10 @@ recreate the whole index from disk.
 
 Two safety rules hold throughout:
 
-- Private vault folders are never read. Every MCP client sends what it
-  retrieves to a cloud model, so a private note is kept out of the index
-  entirely rather than filtered at query time.
+- Nothing outside the two folders is ever read. A symlink inside a folder
+  that leads out of it is skipped with a warning, because every MCP client
+  sends what it retrieves to a cloud model. Private notes belong in a
+  separate folder outside the vault.
 - A folder that is missing (an unmounted drive, a moved vault) never empties
   the index. Its sync is skipped with a warning, deletions included.
 """
@@ -34,6 +35,7 @@ from langchain_chroma import Chroma
 
 from jarvis.core.config import Config, get_config
 from jarvis.core.errors import ConversionError
+from jarvis.core.files import resolves_inside
 from jarvis.core.logs import get_logger
 
 from .store import (
@@ -55,23 +57,6 @@ log = get_logger(__name__)
 
 
 # ── What counts as a source file ──────────────────────────────────────────────
-
-
-def get_visibility(file_path: Path, vault_root: Path) -> str:
-    """
-    "private" when the file sits under a top-level private vault folder.
-
-    Top-level only, by contract: `research/private/` is not private. The
-    caller should pass a resolved path, so a symlink in a public folder that
-    points into `private/` is classified by where it really leads.
-    """
-    try:
-        parts = file_path.relative_to(vault_root).parts
-        if parts and parts[0] in get_config().private_vault_dirs:
-            return "private"
-    except ValueError:
-        pass
-    return "public"
 
 
 def _is_hidden(path: Path, root: Path) -> bool:
@@ -97,6 +82,18 @@ def _modified_at(path: Path) -> str:
 
 def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _text_hash(text: str) -> str:
+    """The hash stored for a vault note: over its whole text, frontmatter included."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _warn_outside(path: Path, root: Path) -> None:
+    log.warning(
+        "skipped %s: it is a link to %s, which is outside %s. jarvis only reads "
+        "files inside the folders in its config.", path, path.resolve(), root,
+    )
 
 
 def wait_for_stable(
@@ -156,7 +153,7 @@ def index_vault_file(
     rel_path = str(file_path.relative_to(vault_root))
     # Hashed over the WHOLE file, frontmatter included — editing only the
     # status of a record must still count as a change.
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    content_hash = _text_hash(content)
 
     record_metadata, body = parse_frontmatter(content, file_label=rel_path)
     title_match = re.search(r"^#\s+(.+)", body, re.MULTILINE)
@@ -165,9 +162,6 @@ def index_vault_file(
     documents = build_text_documents(
         content=body,
         doc_type="note",
-        # Only public notes are ever indexed; the field stays so the search
-        # backstop (visibility="public") has something to match.
-        visibility="public",
         source="local",
         extra_metadata={
             # Record fields FIRST, jarvis's own keys after, so the note's own
@@ -193,11 +187,9 @@ def refresh_vault(
     store: Chroma | None = None,
 ) -> tuple[int, int, int]:
     """
-    Bring the indexed notes in line with the vault's public .md files.
+    Bring the indexed notes in line with the vault's .md files.
 
-    Returns (added, updated, deleted) file counts. A note that moves into a
-    private folder simply stops being a source, so it is deleted from the
-    index on the next pass — no separate reclassification step exists.
+    Returns (added, updated, deleted) file counts.
     """
     s = store or get_store()
 
@@ -221,21 +213,20 @@ def refresh_vault(
         if rel_path and rel_path not in indexed:
             indexed[rel_path] = (meta.get("content_hash", ""), int(meta.get("meta_schema", 0)))
 
-    # The public .md files on disk right now.
+    # The .md files on disk right now.
     vault_root = vault_root.resolve()
     current: dict[str, tuple[Path, str]] = {}
     for md_file in vault_root.rglob("*.md"):
         if _is_hidden(md_file, vault_root):
             continue
-        if get_visibility(md_file.resolve(), vault_root) == "private":
+        if not resolves_inside(md_file, vault_root):
+            _warn_outside(md_file, vault_root)
             continue
         try:
             text = md_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        current[str(md_file.relative_to(vault_root))] = (
-            md_file, hashlib.sha256(text.encode()).hexdigest()
-        )
+        current[str(md_file.relative_to(vault_root))] = (md_file, _text_hash(text))
 
     added = updated = deleted = 0
     for rel_path, (file_path, file_hash) in current.items():
@@ -309,8 +300,7 @@ def index_paper_file(pdf_path: Path, store: Chroma | None = None) -> int:
     }
 
     documents = build_annotation_documents(
-        resolved, doc_type="paper", visibility="public", source=source,
-        title=title, file_path=str(resolved),
+        resolved, source=source, title=title, file_path=str(resolved),
     )
     for document in documents:
         document.metadata.update(file_metadata)
@@ -324,7 +314,6 @@ def index_paper_file(pdf_path: Path, store: Chroma | None = None) -> int:
         documents += build_text_documents(
             content=body,
             doc_type="paper",
-            visibility="public",
             source=source,
             extra_metadata=file_metadata,
             # Title and authors on every chunk, so an author-name or title
@@ -340,36 +329,14 @@ def index_paper_file(pdf_path: Path, store: Chroma | None = None) -> int:
     return len(documents)
 
 
-def _record_arxiv_id(pdf_path: Path, store: Chroma) -> bool:
-    """
-    One-time upgrade for a paper indexed before arXiv IDs were recorded.
-
-    If the PDF carries an arXiv ID, the paper is indexed again. That stores
-    the ID and also replaces a filename title with the real one from arXiv.
-    If it has none, an empty arxiv_id is stored so the PDF is not read again
-    on the next pass. Returns True when the paper was indexed again.
-    """
-    from .metadata import arxiv_id_from_doi, extract_arxiv_id, extract_doi
-
-    try:
-        arxiv_id = arxiv_id_from_doi(extract_doi(pdf_path)) or extract_arxiv_id(pdf_path)
-        if arxiv_id:
-            index_paper_file(pdf_path, store)
-            return True
-        update_metadata_fields(str(pdf_path), {"arxiv_id": ""}, store)
-    except Exception:
-        # Not fatal: the paper stays searchable, and the next pass tries again.
-        log.exception("papers: could not check %s for an arXiv ID", pdf_path)
-    return False
-
-
 def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict[str, int]:
     """
     Bring the indexed papers in line with the PDFs under papers_dir.
 
-    Returns counts: {"added", "updated", "moved", "deleted"}. Only entries
-    whose file lives under papers_dir take part — anything indexed from
-    elsewhere by an older version is left alone (`kb doctor` reports those).
+    Returns counts: {"added", "updated", "moved", "deleted"}. A paper
+    indexed from somewhere that is no longer under papers_dir (because the
+    setting changed) counts as gone, unless the same PDF is found inside the
+    folder, in which case it is moved.
     """
     counts = {"added": 0, "updated": 0, "moved": 0, "deleted": 0}
     if papers_dir is None:
@@ -380,24 +347,17 @@ def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict
     papers_dir = papers_dir.resolve()
     s = store or get_store()
 
-    # source → {file_path, content_hash, modified_at} for papers under papers_dir.
+    # source → {file_path, content_hash, modified_at} for every indexed paper.
     try:
         result = s._collection.get(where={"doc_type": {"$eq": "paper"}}, include=["metadatas"])
     except Exception as exc:
         raise _diagnose_kb_error(exc, f"Failed to read the papers index: {exc}") from exc
     indexed: dict[str, dict] = {}
     for meta in result["metadatas"]:
-        file_path = meta.get("file_path", "")
-        if not file_path or not Path(file_path).is_relative_to(papers_dir):
-            continue
-        entry = indexed.setdefault(meta["source"], {"file_path": file_path, "has_arxiv_id": False})
+        entry = indexed.setdefault(meta["source"], {"file_path": meta.get("file_path", "")})
         for key in ("content_hash", "modified_at"):
             if meta.get(key) and not entry.get(key):
                 entry[key] = meta[key]
-        # Papers indexed before arXiv IDs were recorded have no "arxiv_id"
-        # key at all (not even an empty one). They are checked once below.
-        if "arxiv_id" in meta:
-            entry["has_arxiv_id"] = True
     indexed_by_path = {entry["file_path"]: source for source, entry in indexed.items()}
 
     # The PDFs on disk right now. An iCloud-evicted file shows up only as a
@@ -409,8 +369,12 @@ def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict
         if path.name.startswith(".") and path.name.endswith(".pdf.icloud"):
             evicted.add(str(path.with_name(path.name[1:-len(".icloud")])))
             continue
-        if path.suffix.lower() == ".pdf" and path.is_file() and not _is_hidden(path, papers_dir):
-            current.append(path)
+        if path.suffix.lower() != ".pdf" or not path.is_file() or _is_hidden(path, papers_dir):
+            continue
+        if not resolves_inside(path, papers_dir):
+            _warn_outside(path, papers_dir)
+            continue
+        current.append(path)
     current_paths = {str(path) for path in current}
 
     # Entries whose file has gone: either moved (matched by hash below) or deleted.
@@ -427,8 +391,6 @@ def refresh_papers(papers_dir: Path | None, store: Chroma | None = None) -> dict
             # bytes, which skips hashing hundreds of PDFs every pass.
             entry = indexed[source]
             if entry.get("modified_at") == _modified_at(path):
-                if not entry["has_arxiv_id"] and _record_arxiv_id(path, s):
-                    counts["updated"] += 1
                 continue
             if not wait_for_stable(path):
                 log.warning("papers: %s still changing — leaving it for the next pass", path.name)
@@ -492,8 +454,7 @@ def rebuild_index(cfg: Config | None = None) -> dict[str, int]:
     The new collection is built beside the live one and only replaces it once
     complete, so an interrupted rebuild leaves the old index exactly as it
     was. It never reads the old collection, which is why this is also the fix
-    for an index too damaged to open. Anything not backed by a file (entries
-    from older versions: arXiv URLs, digests, chat history) is gone afterwards.
+    for an index too damaged to open, or one built by an older version.
     """
     cfg = cfg or get_config()
     client, _via_server = open_index_client()

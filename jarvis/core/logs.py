@@ -13,6 +13,8 @@ one.
 import logging
 from pathlib import Path
 
+from jarvis.core.files import make_private_dir
+
 LOG_FILE = Path.home() / ".jarvis" / "logs" / "jarvis.log"
 
 _FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
@@ -32,7 +34,8 @@ def get_logger(name: str) -> logging.Logger:
     root = logging.getLogger("jarvis")
     if not root.handlers:
         try:
-            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # Owner-only: the log names papers and notes.
+            make_private_dir(LOG_FILE.parent)
             handler = logging.FileHandler(LOG_FILE)
             handler.setFormatter(logging.Formatter(_FORMAT))
             root.addHandler(handler)

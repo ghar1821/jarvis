@@ -1,6 +1,5 @@
 """
-Tests for jarvis/kb/cli.py — `kb doctor`, its migration report, and `kb rebuild`'s
-confirmation.
+Tests for jarvis/kb/cli.py — `kb doctor` and `kb rebuild`'s confirmation.
 
 The doctor's probe runs in a subprocess, because reading a damaged vector
 index kills the process by signal rather than raising. `_run_doctor_probe` is
@@ -15,8 +14,7 @@ import pytest
 
 from jarvis.core.config import Config
 import jarvis.kb.cli as cli
-from jarvis.kb.cli import cmd_doctor, find_unbacked_entries
-from jarvis.kb.store import add_texts
+from jarvis.kb.cli import cmd_doctor
 
 
 def _healthy(via_server=True, count=5):
@@ -29,8 +27,6 @@ def _healthy(via_server=True, count=5):
 def test_cmd_doctor_reports_healthy_store(monkeypatch, capsys):
     """A store that opens, counts and search-probes cleanly reports healthy."""
     monkeypatch.setattr(cli, "_run_doctor_probe", _healthy)
-    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda: object())
 
     cmd_doctor()
 
@@ -103,8 +99,6 @@ def test_cmd_doctor_reports_empty_store_without_search_probe(monkeypatch, capsys
 def test_doctor_says_when_kb_serve_is_not_running(monkeypatch, capsys):
     """jarvis-mcp needs `kb serve`; the CLI does not. Doctor says which case this is."""
     monkeypatch.setattr(cli, "_run_doctor_probe", lambda: _healthy(via_server=False))
-    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
 
     cmd_doctor()
 
@@ -115,86 +109,12 @@ def test_doctor_says_when_kb_serve_is_not_running(monkeypatch, capsys):
 
 def test_doctor_confirms_kb_serve_when_it_is_up(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_run_doctor_probe", _healthy)
-    monkeypatch.setattr(cli, "_report_unbacked_entries", lambda store: None)
-    monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
 
     cmd_doctor()
 
     out = capsys.readouterr().out
     assert "kb serve is running" in out
     assert "NOT running" not in out
-
-
-# ── Doctor: the one-time migration report ──────────────────────────────────────
-
-@pytest.fixture
-def legacy_index(store, tmp_path):
-    """An index holding one of everything an older version could have added."""
-    papers_dir = tmp_path / "papers"
-    papers_dir.mkdir()
-    backed_pdf = papers_dir / "kept.pdf"
-
-    def add(content, doc_type, visibility, source, **metadata):
-        add_texts(content=content, doc_type=doc_type, visibility=visibility,
-                  source=source, extra_metadata=metadata, store=store)
-
-    add("A paper in the papers folder.", "paper", "public", backed_pdf.as_uri(),
-        title="Kept paper", file_path=str(backed_pdf))
-    add("A paper added by arXiv URL.", "paper", "public", "https://arxiv.org/abs/2301.00001",
-        title="URL paper", doi="10.48550/arXiv.2301.00001")
-    add("A paper added from Downloads.", "paper", "public", "file:///Users/x/Downloads/d.pdf",
-        title="Downloads paper", file_path="/Users/x/Downloads/d.pdf")
-    add("A weekly digest.", "digest", "public", "file:///digests/2026-07-06.md",
-        title="Paper Digest — 2026-07-06")
-    add("A private note.", "note", "private", "local",
-        title="Secret salary note", file_path="private/salary.md")
-    add("An old chat exchange.", "chat", "public", "session:abc", title="A chat")
-    add("A public note.", "note", "public", "local", title="Public note", file_path="n.md")
-    return store, Config(papers_dir=papers_dir)
-
-
-def test_unbacked_entries_are_grouped_and_private_ones_only_counted(legacy_index):
-    """
-    Everything a rebuild would drop is found: papers with no file in
-    papers_dir (with a DOI link where one is known), digests, private
-    documents (counted only — their titles are private too) and chat chunks.
-    Backed papers and public notes are not reported.
-    """
-    store, config = legacy_index
-
-    unbacked = find_unbacked_entries(store, config)
-
-    assert [paper["title"] for paper in unbacked["papers"]] == ["Downloads paper", "URL paper"]
-    assert unbacked["papers"][1]["doi"] == "10.48550/arXiv.2301.00001"
-    assert unbacked["digests"] == ["Paper Digest — 2026-07-06"]
-    assert unbacked["private_documents"] == 1
-    assert unbacked["chat_chunks"] == 1
-
-
-def test_the_report_names_how_to_keep_each_paper_and_hides_private_titles(
-    legacy_index, monkeypatch, capsys
-):
-    store, config = legacy_index
-    monkeypatch.setattr("jarvis.core.config.get_config", lambda: config)
-
-    cli._report_unbacked_entries(store)
-
-    out = capsys.readouterr().out
-    assert "https://doi.org/10.48550/arXiv.2301.00001" in out
-    assert "/Users/x/Downloads/d.pdf" in out
-    assert "1 private document(s)" in out
-    assert "Secret salary note" not in out
-    assert "uv run kb rebuild" in out
-
-
-def test_a_clean_index_reports_nothing_to_migrate(store, tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("jarvis.core.config.get_config", lambda: Config(papers_dir=tmp_path))
-    add_texts(content="A public note.", doc_type="note", visibility="public", source="local",
-              extra_metadata={"file_path": "n.md"}, store=store)
-
-    cli._report_unbacked_entries(store)
-
-    assert "Every entry comes from a file" in capsys.readouterr().out
 
 
 # ── Rebuild confirmation ───────────────────────────────────────────────────────

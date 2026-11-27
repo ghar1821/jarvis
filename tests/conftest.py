@@ -69,12 +69,11 @@ def store(embeddings):
 
 
 @pytest.fixture(autouse=True)
-def _prompts_never_seed_into_the_real_home(tmp_path_factory, monkeypatch):
+def _never_read_the_real_config(tmp_path_factory, monkeypatch):
     """
-    Building a system prompt seeds ~/.jarvis/prompts/ on first use, so a test
-    that does it without isolating CONFIG_FILE writes into the developer's own
-    home. Point every test at a throwaway directory; a test that wants to
-    assert on the copies overrides CONFIG_FILE itself and still lands in tmp.
+    Point every test at a config file that does not exist, so the developer's
+    own ~/.jarvis/config.toml (with their real vault and papers folder) can
+    never leak into a test. A test that wants a config writes its own.
     """
     home = tmp_path_factory.mktemp("jarvis-home")
     monkeypatch.setattr("jarvis.core.config.CONFIG_FILE", home / "config.toml")
@@ -83,23 +82,18 @@ def _prompts_never_seed_into_the_real_home(tmp_path_factory, monkeypatch):
 @pytest.fixture(autouse=True)
 def _never_touch_the_real_jarvis_home():
     """
-    Fail any test that writes into the developer's own ~/.jarvis.
+    Fail any test that changes the developer's own server token or config.
 
-    A `Config()` built in a test inherits home-rooted defaults for every path
-    it does not override, so forgetting one silently points a test at real
-    data. That happened: a fixture overrode drafts_dir and vault_path but left
-    a third path at its default, and a test wrote into the developer's actual
-    home directory.
-
-    Watching the paths that get *written* by default-constructed Configs is
-    cheap (a stat call per test) and turns that whole class of mistake into a
-    failing test instead of a surprise on someone's machine.
+    A test that forgets to point TOKEN_FILE or CONFIG_FILE at tmp_path would
+    otherwise overwrite the token a running `kb serve` checks, or the real
+    config. Watching them is cheap (a stat call per test) and turns that
+    mistake into a failing test instead of a surprise on someone's machine.
+    The index and status file are not watched: a `kb serve` running on the
+    same machine changes them during the test run on its own.
     """
     watched = [
-        Path.home() / ".jarvis" / "drafts",
-        # Prompt copies are seeded on first use, so any test that builds a
-        # system prompt without isolating CONFIG_FILE writes here.
-        Path.home() / ".jarvis" / "prompts",
+        Path.home() / ".jarvis" / "state" / "server_token",
+        Path.home() / ".jarvis" / "config.toml",
     ]
 
     def snapshot():
@@ -115,6 +109,6 @@ def _never_touch_the_real_jarvis_home():
     yield
     for path, was in snapshot().items():
         assert was == before[path], (
-            f"a test modified {path}, which is real user data — give the test "
-            f"a tmp_path for it (see the drafts fixture)"
+            f"a test modified {path}, which is real user data. Give the test "
+            f"a tmp_path for it (see running_server in test_serve.py)."
         )

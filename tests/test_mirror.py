@@ -5,12 +5,12 @@ The vault and the papers folder are the only sources: adding, changing,
 moving or deleting a file is how the index changes. These tests drive the
 sync against real files in tmp_path and a real isolated collection (the
 `store` fixture), and check both what lands in the index and what must never
-land there (private notes, hidden folders) or never be deleted (everything,
-when a folder is missing).
+land there (files outside the folders, hidden folders) or never be deleted
+(everything, when a folder is missing).
 
 Sections
 --------
-1. Vault notes: add / change / delete, private and hidden folders
+1. Vault notes: add / change / delete, links out of the vault, hidden folders
 2. Records: frontmatter indexing, filtered search, schema migration
 3. Papers: add / skip / change / move / delete, safety rules, metadata
 4. rebuild_index
@@ -132,43 +132,40 @@ def test_refresh_vault_removes_deleted_files(tmp_path, store):
     assert deleted == 1
 
 
-def test_private_folders_are_never_indexed(tmp_path, store):
+def test_a_link_out_of_the_vault_is_never_indexed(tmp_path, store, caplog):
     """
-    A note under a top-level private folder never reaches the index — not
-    even filtered: every MCP client is a cloud model, so the safe place for a
-    private note is outside the index altogether.
+    jarvis reads only inside the vault. A note that is really a link to a
+    file somewhere else is skipped, with a warning naming where it points,
+    because whatever is indexed is sent to the MCP client's cloud model.
 
-    Input:  public/open.md and private/secret.md
-    Expected output: only open.md is indexed; no chunk mentions the secret
+    Input:  vault/open.md, and vault/linked.md → a file outside the vault
+    Expected output: only open.md is indexed; the warning names the target
     """
-    (tmp_path / "public").mkdir()
-    (tmp_path / "private").mkdir()
-    (tmp_path / "public" / "open.md").write_text("# Open\nShared project notes.")
-    (tmp_path / "private" / "secret.md").write_text("# Secret\nSalary negotiation notes.")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "open.md").write_text("# Open\nShared project notes.")
+    outside = tmp_path / "elsewhere" / "secret.md"
+    outside.parent.mkdir()
+    outside.write_text("# Secret\nSalary negotiation notes.")
+    (vault / "linked.md").symlink_to(outside)
 
-    added, _, _ = refresh_vault(tmp_path, store)
+    added, _, _ = refresh_vault(vault, store)
 
     assert added == 1
     texts = store._collection.get(include=["documents"])["documents"]
     assert not any("Salary" in text for text in texts)
+    assert "linked.md" in caplog.text and str(outside.resolve()) in caplog.text
 
 
-def test_a_note_moved_into_a_private_folder_leaves_the_index(tmp_path, store):
-    """
-    Moving a note into private/ is how you make it private, so the next pass
-    must remove it — there is no separate reclassification step.
-    """
-    note = tmp_path / "plans.md"
-    note.write_text("# Plans\nThings I would rather keep to myself.")
-    refresh_vault(tmp_path, store)
-    assert _chunks(store, file_path="plans.md")[0]
+def test_a_link_that_stays_inside_the_vault_is_indexed(tmp_path, store):
+    """Links are fine as long as they lead somewhere inside the vault."""
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "note.md").write_text("# Real\nA linked note.")
+    (tmp_path / "shortcut.md").symlink_to(tmp_path / "real" / "note.md")
 
-    (tmp_path / "private").mkdir()
-    note.rename(tmp_path / "private" / "plans.md")
-    added, updated, deleted = refresh_vault(tmp_path, store)
+    added, _, _ = refresh_vault(tmp_path, store)
 
-    assert (added, updated, deleted) == (0, 0, 1)
-    assert store._collection.count() == 0
+    assert added == 2
 
 
 def test_hidden_folders_are_skipped(tmp_path, store):
@@ -226,10 +223,10 @@ def test_vault_note_frontmatter_becomes_filterable_metadata(store, tmp_path):
         assert meta["event_date"] == "2026-05-02"
         assert meta["tags"] == "|remote|senior|"
         assert meta["x_venue"] == "NeurIPS"
-        # Still a plain note as far as every existing privacy/delete path is
+        # Still a plain note as far as every filter and delete path is
         # concerned — records ride on doc_type, they don't replace it.
         assert meta["doc_type"] == "note"
-        assert meta["visibility"] == "public"
+        assert "visibility" not in meta
 
     documents = store._collection.get(include=["documents"])["documents"]
     assert not any("type: job_application" in d for d in documents)
@@ -559,21 +556,34 @@ def test_an_icloud_evicted_paper_keeps_its_entry(tmp_path, store):
     assert _chunks(store, source=pdf.as_uri())[0]
 
 
-def test_papers_indexed_from_elsewhere_are_left_alone(tmp_path, store):
+def test_a_paper_outside_papers_dir_leaves_the_index(tmp_path, store):
     """
-    Entries added by older versions from outside papers_dir are not this
-    sync's to delete; `kb doctor` reports them and `kb rebuild` drops them.
+    The index mirrors papers_dir. A paper indexed from a folder that is no
+    longer papers_dir (because the setting changed) is not backed by it, so
+    the next pass removes it like any deleted file.
     """
-    from jarvis.kb.store import add_texts
-
-    add_texts(content="A paper added from the Downloads folder.", doc_type="paper",
-              visibility="public", source="file:///Users/x/Downloads/old.pdf",
-              extra_metadata={"file_path": "/Users/x/Downloads/old.pdf"}, store=store)
+    old_folder = tmp_path / "old-papers"
+    _write_pdf(old_folder / "old.pdf", "A paper in the folder papers_dir used to name.")
+    refresh_papers(old_folder, store)
     papers = tmp_path / "papers"
     papers.mkdir()
 
-    assert refresh_papers(papers, store)["deleted"] == 0
-    assert _chunks(store, source="file:///Users/x/Downloads/old.pdf")[0]
+    assert refresh_papers(papers, store)["deleted"] == 1
+    assert store._collection.count() == 0
+
+
+def test_a_pdf_link_out_of_papers_dir_is_never_indexed(tmp_path, store, caplog):
+    """The same rule as for notes: a PDF that really lives elsewhere is skipped."""
+    outside = _write_pdf(tmp_path / "elsewhere" / "private.pdf", "Not part of the papers folder.")
+    papers = tmp_path / "papers"
+    _write_pdf(papers / "kept.pdf", "A paper in the folder.")
+    (papers / "linked.pdf").symlink_to(outside)
+
+    counts = refresh_papers(papers, store)
+
+    assert counts["added"] == 1
+    assert not _chunks(store, source=(papers / "linked.pdf").as_uri())[0]
+    assert "linked.pdf" in caplog.text
 
 
 def test_highlights_survive_a_pdf_with_no_text_layer(tmp_path, store):
@@ -635,42 +645,6 @@ def test_arxiv_preprint_records_its_id_and_real_title(tmp_path, store, monkeypat
     assert {m["title"] for m in metadatas} == {"Sparse Autoencoders"}
 
 
-def test_papers_indexed_before_arxiv_ids_are_upgraded_once(tmp_path, store, monkeypatch):
-    """
-    A paper indexed by an older version has no arxiv_id. The next sync
-    re-indexes it if its PDF has an arXiv ID, and otherwise stores an empty
-    one, so the PDF is not read again on later passes.
-    """
-    papers = tmp_path / "papers"
-    preprint = _write_pdf(papers / "2411.01234v2.pdf", "arXiv:2411.01234v2 [cs.LG] 3 Nov 2024")
-    journal = _write_pdf(papers / "journal.pdf", "doi: 10.1038/s41586-020-1234-5. Results.")
-    refresh_papers(papers, store)
-
-    # Make both look like they came from the older version.
-    result = store._collection.get(include=["metadatas"])
-    # Chroma merges metadata on update, and a None value deletes the key.
-    old_metadatas = [{**m, "arxiv_id": None} for m in result["metadatas"]]
-    store._collection.update(ids=result["ids"], metadatas=old_metadatas)
-    assert all("arxiv_id" not in m for m in store._collection.get(include=["metadatas"])["metadatas"])
-
-    monkeypatch.setattr("jarvis.kb.metadata.arxiv_lookup",
-                        lambda arxiv_id: {"title": "Sparse Autoencoders", "authors": "A. Lovelace"})
-    assert refresh_papers(papers, store)["updated"] == 1
-
-    _, preprint_metadatas = _chunks(store, source=preprint.as_uri())
-    assert {m["arxiv_id"] for m in preprint_metadatas} == {"2411.01234"}
-    assert {m["title"] for m in preprint_metadatas} == {"Sparse Autoencoders"}
-    _, journal_metadatas = _chunks(store, source=journal.as_uri())
-    assert {m["arxiv_id"] for m in journal_metadatas} == {""}
-
-    # Already upgraded: the next pass reads neither PDF.
-    def must_not_read(pdf_path, *args, **kwargs):
-        raise AssertionError(f"{pdf_path} was read again")
-
-    monkeypatch.setattr("jarvis.kb.metadata.extract_arxiv_id", must_not_read)
-    assert refresh_papers(papers, store)["updated"] == 0
-
-
 def test_sync_all_covers_both_folders(tmp_path, store):
     """One pass reports notes and papers together."""
     vault = tmp_path / "vault"
@@ -697,7 +671,8 @@ def test_rebuild_keeps_only_what_the_folders_back(tmp_path, monkeypatch):
     import chromadb
 
     from jarvis.kb import store as store_module
-    from jarvis.kb.store import COLLECTION_NAME, add_texts, open_collection
+    from helpers import index_text
+    from jarvis.kb.store import COLLECTION_NAME, open_collection
 
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -715,8 +690,8 @@ def test_rebuild_keeps_only_what_the_folders_back(tmp_path, monkeypatch):
 
     # The live collection holds one legacy entry with no file behind it.
     client = chromadb.PersistentClient(path=str(config.rag_dir), settings=store_module._chroma_settings())
-    add_texts(content="An arXiv paper added by URL long ago.", doc_type="paper",
-              visibility="public", source="https://arxiv.org/abs/2301.00001",
+    index_text(content="An arXiv paper added by URL long ago.", doc_type="paper",
+              source="https://arxiv.org/abs/2301.00001",
               store=open_collection(client, COLLECTION_NAME))
 
     counts = rebuild_index(config)
@@ -727,3 +702,5 @@ def test_rebuild_keeps_only_what_the_folders_back(tmp_path, monkeypatch):
     assert "https://arxiv.org/abs/2301.00001" not in sources
     assert (papers / "p.pdf").as_uri() in sources and "local" in sources
     assert [c.name for c in client.list_collections()] == [COLLECTION_NAME]
+    # Tagged with the current layout, so the version check accepts it.
+    assert client.get_collection(COLLECTION_NAME).metadata["index_schema"] == store_module.INDEX_SCHEMA

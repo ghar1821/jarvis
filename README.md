@@ -46,9 +46,10 @@ papers_dir = "~/Documents/papers"       # PDFs here, and in its subfolders, are 
 
 - **`vault_path`** can be left out if your vault is at `~/vault`.
 - **`papers_dir`** can be left out, but then no papers are indexed, only notes.
-- **`private_vault_dirs`** is the list of top-level vault folders that are never
-  indexed. It defaults to `["private"]`. Add it under `[kb]` only if yours are
-  named differently, e.g. `private_vault_dirs = ["journal"]`.
+
+Every note in `vault_path` is indexed and readable by your assistant, so keep
+private notes in a separate folder outside it (see
+[Keep things private](#keep-things-private)).
 
 There are no API keys to add. Everything else has a sensible default (see
 [`docs/DESIGN.md`](docs/DESIGN.md#configuration)).
@@ -171,7 +172,7 @@ The index mirrors your files:
 | Write or edit a note in the vault | Adds it or updates it |
 | Move or rename a PDF | Follows it, without re-indexing |
 | Delete a file | Drops it |
-| Move a note into a private folder | Drops it |
+| Move a file out of the folder | Drops it |
 
 Changes show up at the next sync (within `sync_minutes`, 30 by default).
 `uv run kb sync` runs one now.
@@ -228,17 +229,22 @@ also how you catch a typo like `stauts`.
 
 ## Keep things private
 
-Every MCP client sends what it reads to a cloud model. So jarvis never
-indexes notes in `private_vault_dirs`, and `read_note` refuses them:
+Every MCP client sends what it reads to a cloud model. jarvis only ever reads
+inside `vault_path` and `papers_dir`, so the way to keep a note private is to
+keep it outside both, for example in a second Obsidian vault:
 
 ```
-vault/
-├── private/    ← never indexed, never readable by your assistant
-└── research/   ← searchable
+Documents/
+├── obsidian/   ← vault_path: searchable by your assistant
+└── private/    ← a separate vault: jarvis never reads it
 ```
 
-Read private notes in Obsidian. Only top-level folders count: `research/private/`
-is not private.
+A link (symlink) inside the vault that points somewhere else does not pull
+that file in. jarvis skips it and logs a warning naming where it points.
+
+The index that `kb serve` runs only answers requests that carry a secret
+token, which `kb serve` creates in `~/.jarvis/state/server_token`, readable
+only by you. Other programs on your Mac can't read the index or add to it.
 
 ---
 
@@ -278,25 +284,23 @@ and a document editor), added papers by arXiv URL, and kept digests and chat
 history in the index. That version is preserved on the
 `archive/pre-mcp-simplification` branch if you ever need it.
 
-Entries those versions added are still searchable after upgrading, but no file
-backs them. To remove them all:
+An index built by an older version has to be rebuilt once. Until it is,
+jarvis refuses to use it and says so. To upgrade:
 
-1. Set `papers_dir` (or keep your old `[sync] pdf_watch_dir`, which still
-   counts) to the folder that holds your PDFs. Any paper whose PDF isn't in
-   that folder is dropped by the next step.
-2. Run `uv run kb rebuild` and answer `y`. It rebuilds the index from your
-   vault's public notes and `papers_dir`. Everything else is dropped:
-   arXiv-URL papers, digests, chat history, private notes. Only index entries
-   go; no file is touched.
-3. Restart `kb serve` and your MCP client.
+1. If your config sets `private_vault_dirs`, move those notes out of the
+   vault first, then delete the setting. jarvis no longer keeps folders
+   inside the vault private, and it won't start while the setting is there.
+2. Put your settings under `[kb]` and `[rag]` as shown above. Old sections
+   such as `[chat]` and `[sync]` are no longer read; jarvis names every
+   setting it ignores, and never edits the file itself.
+3. Stop `kb serve`, then run `uv run kb rebuild` and answer `y`. It rebuilds
+   the index from your vault and `papers_dir`. Everything else is dropped:
+   arXiv-URL papers, digests, chat history, PDFs outside `papers_dir`. Only
+   index entries go; no file is touched.
+4. Start `kb serve` again, then restart your MCP client.
 
-To see what would be dropped before you rebuild, run `uv run kb doctor`. It
-lists each entry with a DOI link, in case you want to save a PDF first.
-
-Your old config keeps working. Jarvis prints one line for each setting that has
-moved or no longer does anything, and never edits the file itself. Old
-`~/.jarvis/sessions/`, `~/.jarvis/drafts/` and `~/.jarvis/prompts/` folders are
-left untouched. Delete them yourself if you don't need them.
+Old `~/.jarvis/sessions/`, `~/.jarvis/drafts/` and `~/.jarvis/prompts/`
+folders are left untouched. Delete them yourself if you don't need them.
 
 ---
 
@@ -310,7 +314,7 @@ uv run kb list        # indexed papers (--notes for notes and records)
 uv run kb stats       # counts
 uv run kb schema      # which metadata keys and values exist
 uv run kb status      # is kb serve running, and how did the last sync go
-uv run kb doctor      # diagnose the index; list entries a rebuild would drop
+uv run kb doctor      # diagnose the index
 # jarvis-mcp is started by your MCP client, not by hand
 ```
 
@@ -323,6 +327,9 @@ or not it's running.
 | Your assistant says the index can't resolve an id | `kb doctor` |
 | `kb doctor` dies or reports damage | `kb rebuild` (nothing is lost; every entry comes from a file) |
 | You changed `embed_model` in the config | `kb rebuild` |
+| jarvis says the index was built by an older version | `kb rebuild` |
+| jarvis says the server refused its token | Restart `kb serve`, then your MCP client |
 
 Everything jarvis stores lives under `~/.jarvis/`: `config.toml`, the index,
-logs, and the `kb serve` status file.
+logs, the `kb serve` status file and its server token. All of it is readable
+only by you.

@@ -6,8 +6,8 @@ jarvis makes an Obsidian vault and a folder of research papers searchable by
 any MCP client — Claude Desktop, Google Antigravity, Claude Code and others.
 It is a **read-only knowledge server**:
 
-1. It mirrors two folders the user manages — the vault (minus its private
-   folders) and `papers_dir` — into a local search index.
+1. It mirrors two folders the user manages — the vault and `papers_dir` —
+   into a local search index.
 2. It exposes that index over MCP as read-only tools.
 3. The client is the assistant: it holds the conversation, runs the model,
    schedules tasks. jarvis makes no LLM calls and holds no API keys.
@@ -19,9 +19,10 @@ Three invariants shape everything below:
   rebuilt from disk.
 - **jarvis only reads your folders.** It writes nothing outside `~/.jarvis/`
   and deletes no file anywhere (enforced by `tests/test_security.py`).
-- **Private notes never enter the index.** Every MCP client sends what it
-  reads to a cloud model, so the safe place for a private note is outside the
-  index altogether.
+- **jarvis reads nothing outside those two folders.** Every MCP client sends
+  what it reads to a cloud model, so everything inside the folders is treated
+  as shareable and everything outside them is never touched. Private notes
+  belong in a separate folder outside the vault.
 
 ---
 
@@ -51,8 +52,9 @@ Three invariants shape everything below:
 ├── jarvis/
 │   ├── __init__.py          # switches off third-party telemetry before any import
 │   ├── core/
-│   │   ├── config.py        # ~/.jarvis/config.toml → Config; moved/obsolete key notes
+│   │   ├── config.py        # ~/.jarvis/config.toml → Config; unknown-key notes
 │   │   ├── errors.py        # domain exceptions
+│   │   ├── files.py         # owner-only folders, and the "is it really inside?" check
 │   │   └── logs.py          # ~/.jarvis/logs/jarvis.log for every library module
 │   ├── kb/
 │   │   ├── mirror.py        # the two folders → the index (sync, move detection, rebuild)
@@ -113,9 +115,14 @@ Everything jarvis writes is under `~/.jarvis/`:
 | `~/.jarvis/config.toml` | User configuration (read only; never rewritten by jarvis) |
 | `~/.jarvis/rag/` | The Chroma index (`rag_dir`), plus `.write.lock` for direct access. Dir 0700 |
 | `~/.jarvis/state/serve_status.json` | `kb serve`'s pid, start time and last sync outcome (read by `kb status`) |
+| `~/.jarvis/state/server_token` | The secret every request to the index server must carry. Created once by `kb serve`, file 0600 |
 | `~/.jarvis/logs/serve.log` | `kb serve` log (also echoed to stderr) |
 | `~/.jarvis/logs/chroma.log` | Output of the Chroma server child |
 | `~/.jarvis/logs/jarvis.log` | Library warnings: the store, the mirror, metadata lookups, the MCP server |
+
+`logs/` and `state/` are made 0700 like the index, because the logs name
+papers and notes. The permissions are re-applied every time jarvis starts, so
+folders made by older versions are fixed too.
 
 Folders left by older versions (`~/.jarvis/sessions/`, `drafts/`, `prompts/`)
 are not read and not deleted.
@@ -141,7 +148,6 @@ same values, which is why a file beats environment variables in practice.
 | Key | Default | Env var | Description |
 |---|---|---|---|
 | `[kb] vault_path` | `~/vault` | `VAULT_PATH` | Obsidian vault root |
-| `[kb] private_vault_dirs` | `["private"]` | — | Top-level vault folders that are never indexed and never readable over MCP |
 | `[kb] papers_dir` | unset | `PAPERS_DIR` | Folder of PDFs (recursive). Unset means no papers |
 | `[kb] sync_minutes` | `30` | — | Minutes between `kb serve` sync passes (≥ 1) |
 | `[rag] rag_dir` | `~/.jarvis/rag` | — | Index location |
@@ -150,17 +156,19 @@ same values, which is why a file beats environment variables in practice.
 | `[rag] chunk_size` / `chunk_overlap` | `1024` / `128` | — | Characters per chunk / overlap |
 | `[rag] rerank_model` | `cross-encoder/ms-marco-MiniLM-L6-v2` | — | Cross-encoder reranker; `""` disables re-ranking |
 | `[rag] rerank_top_n` | `25` | — | Candidates fetched before re-ranking |
-| `[rag] hybrid` | `true` | — | Dense + BM25 fused by reciprocal rank fusion; `false` is dense-only |
+| `[rag] hybrid` | `true` | — | Dense + BM25 fused by reciprocal rank fusion; `false` is dense-only. Must be a TOML boolean: a quoted `"false"` is an error, not true |
 | `[rag] server_port` | `8321` | — | Chroma server port, always on 127.0.0.1 |
 
-**Old configs keep working.** `[chat] vault_path`, `[chat]
-private_vault_dirs`, `[sync] pdf_watch_dir` (→ `papers_dir`) and `[sync]
-vault_refresh_minutes` (→ `sync_minutes`) are still read from where they were,
-with a one-line note. Every other key from the old assistant (`[chat]`,
-`[auth]`, `[digest]`, `[drafts]`, `[models]`, `[openrouter]`, `[rag]
-figure_*`) is named once as "no longer does anything". Notes go to stderr,
-because stdout is the MCP channel inside `jarvis-mcp`. The file is never
-rewritten.
+**Unknown settings are named, not guessed at.** Any section or key jarvis does
+not read (a typo, or a setting from an older version such as `[chat]` or
+`[sync]`) gets one line on stderr saying it is ignored. stderr, because stdout
+is the MCP channel inside `jarvis-mcp`. The file is never rewritten.
+
+**`private_vault_dirs` stops jarvis.** Older versions kept named vault folders
+out of the index. This one indexes the whole vault, so a config that still
+lists private folders (under `[kb]` or the old `[chat]`) raises `ConfigError`
+at start-up with the fix: move those notes outside the vault, then delete
+the setting. A warning would scroll past while the notes went to the cloud.
 
 ---
 
@@ -170,7 +178,7 @@ The index mirrors two folders, and nothing else can add to it.
 
 | Source | `doc_type` | `source` | `file_path` |
 |---|---|---|---|
-| `.md` files in the vault, outside `private_vault_dirs` and dot-folders | `note` | `"local"` | vault-relative path |
+| `.md` files in the vault, outside dot-folders | `note` | `"local"` | vault-relative path |
 | `.pdf` files under `papers_dir`, recursively | `paper` | `file://` URI | absolute path |
 
 ### Vault notes — `refresh_vault`
@@ -178,25 +186,20 @@ The index mirrors two folders, and nothing else can add to it.
 Builds `file_path → (content_hash, meta_schema)` for indexed notes, scans the
 vault, and reconciles: new file → index; changed hash → delete and re-index;
 older `meta_schema` → re-index only if the note has frontmatter, otherwise
-stamp the marker (see Records); file gone → delete. A note under a private
-folder is simply not a source, so moving a note into `private/` deletes it
-from the index on the next pass — there is no reclassification step. Dot-
-folders (`.obsidian/`, `.trash/`) are skipped; `.trash/` would otherwise keep
-deleted notes searchable.
+stamp the marker (see Records); file gone → delete. Dot-folders
+(`.obsidian/`, `.trash/`) are skipped; `.trash/` would otherwise keep deleted
+notes searchable. A `.md` that is a symlink to a file outside the vault is
+skipped with a warning (see Safety rules).
 
 ### Papers — `refresh_papers`
 
-Only entries whose `file_path` lies under `papers_dir` take part; anything an
-older version indexed from elsewhere is left alone (and reported by `kb
-doctor`). For each PDF on disk:
+Every indexed paper takes part. One whose file is no longer under
+`papers_dir` (because the setting changed) is treated like a deleted file,
+unless the same bytes turn up inside the folder, which makes it a move. For
+each PDF on disk:
 
 1. **Indexed at this path, same mtime** → skip without hashing. This is what
-   makes a pass over hundreds of PDFs cheap. The one exception is a paper
-   indexed before arXiv IDs were recorded, whose chunks have no `arxiv_id`
-   key at all. Its first page is read once (`_record_arxiv_id`). If it has
-   an arXiv ID, the paper is re-indexed, which stores the ID and replaces a
-   filename title with the real one. If not, an empty `arxiv_id` is stored
-   so the PDF is not read again.
+   makes a pass over hundreds of PDFs cheap.
 2. **Indexed, mtime changed** → wait until the file is stable, hash it. Same
    hash: refresh `modified_at` only. Different hash: re-index (new highlights
    saved into a PDF land here).
@@ -223,9 +226,16 @@ half-present. There is no summary mode: every paper is full text.
 - **Half-written files wait.** `wait_for_stable` polls size and mtime; a PDF
   still being written by a sync client is left for the next pass.
 - **One bad PDF doesn't stop a pass.** Indexing failures are logged per file.
-- **Paths are not resolved.** A paper is keyed on the path where it sits under
-  `papers_dir`, so a symlinked PDF does not look like it lives elsewhere and
-  get re-indexed every pass.
+- **Nothing outside the folders is read.** `resolves_inside()`
+  (`jarvis/core/files.py`) follows symlinks and `..` and checks the result is
+  inside the folder. A note or PDF that is really a link to somewhere else
+  is skipped, with a warning naming where it points. Symlinked *folders* are
+  not followed at all (`rglob` does not follow them on Python 3.12).
+- **Paths are not resolved for keys.** A paper is keyed on the path where it
+  sits under `papers_dir`, so a PDF reached through a symlink inside the
+  folder does not look like it lives elsewhere and get re-indexed every pass.
+  `update_file_path` stores a moved paper's new path as given, for the same
+  reason.
 
 ### Rebuild — `rebuild_index`
 
@@ -239,11 +249,12 @@ afterwards. The swap gives the collection a new id, so already-connected
 processes need a restart (`kb serve`'s sync reconnects by itself after one
 failed pass).
 
-This is also the whole upgrade path from older versions. One `kb rebuild`
-drops every entry no file backs: papers added by arXiv URL or from outside
-`papers_dir`, digest documents, chat history and private notes. `kb doctor`
-lists them beforehand (`find_unbacked_entries`), but saving any of them is
-optional.
+This is also the whole upgrade path from older versions, and a required one:
+`get_store()` refuses an index whose collection lacks the current
+`index_schema` tag (see "Knowledge base storage"). The rebuild drops every
+entry no file backs (papers added by arXiv URL or from outside `papers_dir`,
+digest documents, chat history and private notes) and tags the new
+collection.
 
 ---
 
@@ -282,25 +293,40 @@ the source of truth.
 
 ## Privacy model
 
-There is one rule: **private vault folders are never indexed and never read
-over MCP.**
+There is one rule: **jarvis reads nothing outside `vault_path` and
+`papers_dir`.** Everything inside them is treated as shareable with the MCP
+client's cloud model. There are no private folders inside the vault; keep
+private notes in a separate folder (for example a second Obsidian vault).
 
-- `get_visibility(path, vault_root)` (mirror.py) is the single policy: a path
-  whose first component under the vault is in `private_vault_dirs` is private.
-  Top-level only, by contract — `research/private/` is not private.
-- `refresh_vault` skips private files, so nothing private is ever chunked,
-  embedded or stored.
-- `read_note` classifies the **resolved** path — a symlink in a public folder
-  pointing into `private/` is refused — and also refuses dot-folders and
-  anything outside the vault. Its refusal carries no content.
-- `reveal_in_finder` only accepts the `file_path` of an indexed, public
-  document, so it can't be pointed at a private note or a system file.
+- `resolves_inside(path, root)` (`jarvis/core/files.py`) is the single check.
+  It follows symlinks and `..`, then tests whether the real path is inside
+  the folder. It is applied wherever a file is read: `refresh_vault` and
+  `refresh_papers` for every file, `read_note` for the path it is given, and
+  `reveal_in_finder` again just before calling `open`.
+- `read_note` also refuses dot-folders, which hold app settings and
+  Obsidian's bin of deleted notes. Its refusal carries no content.
+- `reveal_in_finder` only accepts the `file_path` of an indexed document, so
+  it can't be pointed at a system file.
 
-**A backstop for old indexes.** Indexes built by older versions can still hold
-`visibility="private"` chunks until the first sync (notes) or `kb rebuild`
-(anything else). Every MCP query therefore still filters
-`visibility="public"` in the same `where` clause as its other filters, so
-record filters can only narrow what it returns.
+**Why private folders were removed.** They were checked by comparing folder
+names, which is fragile: APFS is case-insensitive and `Path.resolve()` keeps
+whatever case it is given, so `read_note("PRIVATE/x.md")` reached a note in
+`private/`. Keeping private notes outside the folders jarvis reads is a
+boundary that a spelling trick cannot get around.
+
+**Prompt injection.** Text from documents is untrusted input to the model.
+Every tool result that contains document text, titles or frontmatter values
+is wrapped between `BEGIN/END RETRIEVED DATA` markers, and any marker already
+inside the text is defused first, so a document cannot close the fence
+early. That is a mitigation; the real protection is that no tool can change
+anything.
+
+**The index server needs a token.** The Chroma server listens on 127.0.0.1,
+which any program on the machine can reach, and a web page can too via DNS
+rebinding. So it refuses any request without the token in
+`~/.jarvis/state/server_token` (see "Who owns the index"). Without that, a
+local program could read every note or plant text in the index for the
+assistant to read.
 
 Every MCP client is treated the same, as a cloud model. There is no
 local-model path: a local MCP client would get exactly the same tools.
@@ -314,12 +340,11 @@ metadata schema; the schema is documented at the top of `store.py`.
 
 | Function | Description |
 |---|---|
-| `get_store()` | Process-wide store; through the server, or the files when `allow_direct_index_access()` was called; enforces the embedding-model guard |
+| `get_store()` | Process-wide store; through the server, or the files when `allow_direct_index_access()` was called; refuses an index from an older version or another embedding model |
 | `open_index_client()` · `open_collection()` · `forget_store()` | Raw client access for `kb rebuild`, and dropping the cached store after a swap |
 | `build_text_documents()` · `build_annotation_documents()` | Turn input into `Document`s without touching the database |
 | `commit_documents(documents, replace_source=)` | The only write: optional delete of a replaced source plus the add, in one lock |
-| `add_texts()` · `add_annotations()` | Build + commit |
-| `search(query, n_results, visibility, doc_type, category, status, entity, fields, tags)` | Hybrid or dense search with metadata filters, then re-ranking |
+| `search(query, n_results, doc_type, category, status, entity, fields, tags)` | Hybrid or dense search with metadata filters, then re-ranking |
 | `list_documents()` · `count_unique_documents()` · `count()` | De-duplicated listing and counts |
 | `metadata_key_counts()` · `metadata_value_counts()` | `kb schema` and `kb_stats` |
 | `get_document_chunks(source)` | Every chunk of one document in reading order |
@@ -327,12 +352,35 @@ metadata schema; the schema is documented at the top of `store.py`.
 
 ### Who owns the index
 
-One process does: the Chroma server that `uv run kb serve` runs as a child
-(`chroma run`, bound to 127.0.0.1). `jarvis-mcp` and `kb serve`'s own sync
-connect to it over loopback and fail with the command to run when it is down. One-shot `kb` commands call `allow_direct_index_access()` in `main()`,
-which lets them open the index files themselves when the server is down —
-safe because they exit in seconds, and it keeps `kb doctor` usable at exactly
-the moment the server is the broken thing.
+One process does: the Chroma server that `uv run kb serve` runs as a child.
+`jarvis-mcp` and `kb serve`'s own sync connect to it over loopback and fail
+with the command to run when it is down. One-shot `kb` commands call
+`allow_direct_index_access()` in `main()`, which lets them open the index
+files themselves when the server is down — safe because they exit in
+seconds, and it keeps `kb doctor` usable at exactly the moment the server is
+the broken thing.
+
+**The server and its token.** The child is Chroma's Python server
+(`python -m uvicorn chromadb.app:app --host 127.0.0.1`), configured through
+environment variables to persist to `rag_dir` and to require a token
+(`TokenAuthenticationServerProvider`). It is not `chroma run`, Chroma's Rust
+server, because that one has no way to require authentication. Chroma 1.x
+treats the Python server's dependencies (`fastapi`,
+`opentelemetry-instrumentation-fastapi`) as dev extras, so jarvis lists them
+itself, and `tests/test_serve.py` starts the real server so an upgrade that
+breaks it fails the suite.
+
+- `kb serve` creates `~/.jarvis/state/server_token` the first time
+  (`secrets.token_urlsafe(32)`, created 0600 in one step with `O_EXCL`) and
+  reuses it afterwards, so an MCP client that is already running keeps
+  working across restarts. The server reads the token from that file; it
+  never appears in a command line or environment value.
+- Clients read the same file. Constructing the `HttpClient` makes an
+  authenticated round trip, so a wrong token fails at connect time with
+  `ServerAuthError` and a message that says to restart `kb serve`.
+- A refused token is never a reason to fall back to the files: the server is
+  still running and writing to them. Only "not running" (including "no token
+  file yet") allows the direct path.
 
 This replaced every process opening its own `PersistentClient`. That model had
 a fault that looked like corruption and wasn't: the chunk text and metadata
@@ -345,20 +393,25 @@ half: a reader that didn't happen to touch a deleted id simply searched an
 out-of-date index, so freshly edited notes were unfindable until the process
 restarted, with no error at all.
 
-**Cross-process write lock (`_kb_write_lock`).** Narrower than it used to be.
-The server serialises everything that goes through it, so this advisory `flock`
-on `<rag_dir>/.write.lock` now only covers the direct path — two one-shot `kb`
-commands writing to the same SQLite file while the server is down. Still
-re-entrant per thread so a composite operation like `refresh_vault` →
-`add_texts` doesn't self-deadlock.
+**Cross-process write lock (`_kb_write_lock`).** The server serialises
+everything that goes through it, so this advisory `flock` on
+`<rag_dir>/.write.lock` only matters on the direct path — two one-shot `kb`
+commands writing to the same SQLite file while the server is down. Nothing
+takes it while already holding it, so it is a plain lock.
 
 **Permissions.** `rag_dir` is created (and chmod'ed on every open) `0700`,
 since it holds the full text of your notes and papers.
 
+**The compatibility check.** Every collection is tagged when it is created
+with `embed_model` and `index_schema` (currently 2: no `visibility` field and
+no private, chat or digest chunks). `get_store()` refuses a non-empty
+collection whose tags differ and names `kb rebuild` as the fix. An empty one
+is re-tagged instead.
+
 ### Staged writes
 
-Each `add_*` splits into a `build_*` that only creates `Document`s and one
-shared `commit_documents()` that performs the write. `index_paper_file`
+Indexing is split into `build_*` functions that only create `Document`s and
+one shared `commit_documents()` that performs the write. `index_paper_file`
 builds a paper's body and annotation chunks, then commits them — with the
 delete of the previous version, via `replace_source` — under one lock. A
 failure part-way leaves the index exactly as it was: never a body without its
@@ -383,7 +436,7 @@ RETRIEVAL (§2-3)
     ├─ embed_model embeds it ─► HNSW nearest neighbours ─► ranking A  semantic
     │
     └─ BM25, built in memory over the same
-       visibility-filtered pool ───────────────────────► ranking B  keyword
+       filtered pool ──────────────────────────────────► ranking B  keyword
                                        │
                     reciprocal rank fusion of A and B
                                        │
@@ -403,7 +456,7 @@ Two things that are easy to get backwards:
   ...])`. That is what makes it accurate and why it cannot replace stage 2 —
   see stage 3.
 
-**1. Chunking, at index time.** `add_texts` splits content on markdown
+**1. Chunking, at index time.** `build_text_documents` splits content on markdown
 headers (`MarkdownHeaderTextSplitter`) and then by size
 (`RecursiveCharacterTextSplitter`). Each chunk stores its `chunk_index` and a
 `section` breadcrumb, and the breadcrumb is prepended to the embedded text so
@@ -416,7 +469,7 @@ any chunk of a long paper.
 
 **2. Hybrid retrieval.** Gated by `[rag] hybrid` (default `true`). When
 enabled, `_hybrid_search` fetches the ChromaDB candidate pool filtered by
-`visibility`/`doc_type` first, then ranks it two ways over that same filtered
+`doc_type` and any record filters first, then ranks it two ways over that same filtered
 pool: dense (the query embedded with a BGE-style model, `embed_model`,
 prefixed by `query_prefix` on the query side only) and sparse (a BM25 index
 rebuilt fresh per query, via `rank-bm25` — held in memory only, so unlike the
@@ -483,18 +536,9 @@ On a badly corrupted store even `count()` can hard-segfault the process — a
 Rust-side ChromaDB crash, uncatchable in Python — so `kb doctor` dying
 abruptly is itself the diagnosis, not a bug in the doctor command.
 
-**The migration report.** Once the store is confirmed healthy, `kb doctor`
-lists every entry no file in the two folders backs (`find_unbacked_entries`):
-papers added by arXiv URL or from outside `papers_dir` (with a DOI link each,
-so they can be saved into `papers_dir`), digest documents, chat chunks, and
-private documents — the last only counted, since their titles are private
-too. These are what `kb rebuild` would drop. Nothing is deleted by the
-report itself.
-
 **Embedding-model guard.** ChromaDB records `embed_model` in the collection
 metadata when the collection is first created. `get_store()` compares that
-tag against the configured model and raises `RAGError` on any mismatch —
-including legacy collections created before the tag existed. This prevents
+tag against the configured model and raises `RAGError` on any mismatch. This prevents
 silently comparing vectors from two incompatible embedding spaces. The fix is
 `uv run kb rebuild`, which re-indexes everything from the files under the
 new model into a fresh collection and swaps it in.
@@ -527,12 +571,12 @@ type needs no code change.
 
 The `x_` prefix is a security boundary, not tidiness. A `.md` file can arrive
 in the vault from anywhere, and without namespacing, a note carrying
-`visibility: private` or `doc_type: paper` in its frontmatter would overwrite
-jarvis's own schema when the two dicts merged — a note could reclassify
-itself and slip past a filter. Prefixing makes that structurally
+`doc_type: paper` or a `source` in its frontmatter would overwrite jarvis's
+own schema when the two dicts merged — a note could pass itself off as a
+paper and slip past a filter. Prefixing makes that structurally
 impossible rather than something to remember to check. The merge order backs
-it up too: both `index_vault_file` and `add_texts` spread the caller's
-metadata *first* and jarvis's own fields (`doc_type`, `visibility`, `source`,
+it up too: both `index_vault_file` and `build_text_documents` spread the
+caller's metadata *first* and jarvis's own fields (`doc_type`, `source`,
 `file_path`, `content_hash`, `meta_schema`) *after*, so a collision is won by
 jarvis even if the `x_` table were ever wrong.
 
@@ -549,7 +593,7 @@ separators are what stop `|remote|` from matching `|remote-first|`.
 
 The record header rides along in every chunk. `record_header()` builds a
 string like `"job_application · Acme Bio · rejected"` and passes it to
-`add_texts` as the `embed_header`, so every chunk carries it in its embedded
+`build_text_documents` as the `embed_header`, so every chunk carries it in its embedded
 text — that's what makes "jobs I was rejected from" match a record whose body
 never uses those words. It's the same mechanism papers already use for
 title/authors.
@@ -635,18 +679,19 @@ annotated `read_only_hint`:
 |---|---|
 | `search_kb(query, kinds, n_results ≤ 20, category, status, entity, tags, fields)` | Full matching passages, each with title, absolute file path, record fields or authors and DOI link, and (for papers) the source to pass to `get_document` |
 | `get_document(source, page)` | A paper's chunks in reading order, 15 per page. `source="local"` is refused (every note shares it) with a pointer to `read_note` |
-| `read_note(path)` | One vault file from disk, by relative or absolute path, under the privacy rules above |
+| `read_note(path)` | One vault file from disk, by relative or absolute path. Refused if its real path is outside the vault or in a dot-folder |
 | `list_documents(kind, limit ≤ 50, category, status, entity)` | Papers or notes, newest first |
-| `kb_stats()` | Counts, and the record types and statuses in use |
+| `kb_stats()` | Counts, and the record types and statuses in use (fenced as retrieved data, since they come from frontmatter) |
 | `has_paper(doi, arxiv_id, title)` | Whether an indexed paper matches any of the given identifiers, with its file path, DOI link, `get_document` source and which identifier matched |
-| `reveal_in_finder(path)` | `open -R` on an indexed document (macOS); list arguments, no shell |
+| `reveal_in_finder(path)` | `open -R` on an indexed document whose real path is still inside the vault or papers folder (macOS); list arguments, no shell |
 
 **No write tools.** There is no add, remove, edit or move. Text from papers
 and notes is untrusted input to the model reading it; with
 nothing writable, there is nothing an injected instruction can change. As a
 further mitigation, document text comes back between `BEGIN/END RETRIEVED
 DATA` markers, and the server `instructions` tell the model to treat it as
-data.
+data. Any such marker already inside a document is defused before wrapping,
+so a document cannot end the fence early.
 
 **Errors.** Expected failures raise the SDK's `ToolError`, which the client
 sees as `is_error=True` with the message. A `KBCorruptionError` is prefixed
@@ -672,8 +717,8 @@ When it is down:
   restarting the client.
 
 **How `has_paper` decides.** jarvis does the matching, not the model. The
-tool reads the metadata of every indexed paper (`doc_type="paper"`, with
-the visibility backstop) and keeps one entry per `source`. A paper matches
+tool reads the metadata of every indexed paper (`doc_type="paper"`) and keeps
+one entry per `source`. A paper matches
 when any identifier given matches:
 
 - **DOI.** Both sides go through `normalise_doi()` (`jarvis/kb/metadata.py`),
@@ -702,10 +747,14 @@ reliably, and can call `has_paper` to skip what the user already has.
 ## `kb serve` — `jarvis/kb/serve.py`
 
 1. Prints the resolved config.
-2. Starts `chroma run --host 127.0.0.1 --port <server_port>` as a child, its
-   output going to `chroma.log`, and waits for a heartbeat. A child that exits
-   at once is reported as "is another `kb serve` already using the port?".
-3. Opens the store (so an embedding-model mismatch stops start-up loudly).
+2. Creates the server token if it does not exist yet, then starts Chroma's
+   server (`uvicorn chromadb.app:app --host 127.0.0.1 --port <server_port>`)
+   as a child, run from the owner-only `rag_dir`, its output going to
+   `chroma.log`. It waits until the server answers an authenticated request.
+   A child that exits at once is reported as "is another `kb serve` already
+   using the port?".
+3. Opens the store, so an index from an older version or an embedding-model
+   mismatch stops start-up loudly.
 4. Loops: `run_sync()`, then `Event.wait(sync_minutes * 60)`. SIGINT/SIGTERM
    set the event; the loop also stops if the Chroma child dies.
 5. On exit, terminates the child (kill after 10 s).
@@ -729,7 +778,7 @@ periodic job, and `Event.wait` is both the sleep and the shutdown signal.
 | `rebuild` | `rebuild_index` after a y/N prompt that names both folders and says no file is touched |
 | `list` · `stats` · `schema` | Inspection |
 | `status` | `kb serve` liveness and last sync |
-| `doctor` | Health probe in a child process, then the migration report |
+| `doctor` | Health probe in a child process |
 
 Every command except `serve` calls `allow_direct_index_access()`, so it works
 whether or not the server is running.
@@ -741,7 +790,9 @@ whether or not the server is running.
 ```
 JarvisError
 ├── RAGError          Vector store failures
-│   └── KBCorruptionError   unresolvable id, or a collection replaced by kb rebuild
+│   ├── KBCorruptionError   unresolvable id, or a collection replaced by kb rebuild
+│   └── ServerAuthError     the index server refused this process's token
+├── ConfigError       config.toml asks for something unsafe (private_vault_dirs, a quoted boolean)
 └── ConversionError   PDF → Markdown produced no text (scanned PDF)
 ```
 
@@ -755,6 +806,9 @@ it before degrading, or is narrow expected control flow. The ones that matter:
 - Metadata lookups, single-PDF indexing failures and a failed sync pass are
   logged with the real exception, then the next source / file / interval
   carries on.
+- Every store read and write goes through `_diagnose_kb_error`, so "server
+  down" and "collection replaced by a rebuild" get their own message
+  wherever they happen. Counts raise rather than report 0.
 
 ---
 
@@ -779,8 +833,9 @@ What made that safe rather than a loss of capability:
 - **The privacy model got simpler and stronger.** It used to depend on the
   provider (local Ollama could see private notes, cloud models couldn't),
   with session private-flags, hard stops and a result caveat. With every
-  client treated as cloud, private notes are kept out of the index, so there
-  is nothing to filter.
+  client treated as cloud, private notes are kept out of the folders jarvis
+  reads, so there is nothing to filter. (Private folders *inside* the vault
+  were dropped later for the same reason; see "Privacy model".)
 - **Write paths became file operations.** `kb add/remove/set-meta/update-path`
   and the confirmation dialogs existed because the index was a separate thing
   to manage. With the index mirroring files, Finder and Obsidian are the

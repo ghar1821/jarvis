@@ -63,13 +63,12 @@ def test_unknown_keys_pass_through_namespaced():
 def test_user_frontmatter_cannot_shadow_jarvis_schema():
     """
     The `x_` prefix is a security boundary, not tidiness. A .md file can arrive
-    in the vault from anywhere; without namespacing, `visibility: public` in a
-    private note's frontmatter would overwrite the folder-derived
-    classification when the metadata dicts merged.
+    in the vault from anywhere; without namespacing, `doc_type: paper` or a
+    `source` in its frontmatter would overwrite jarvis's own fields when the
+    metadata dicts merged, and the note could pass itself off as a paper.
     """
     hostile = """\
 ---
-visibility: public
 doc_type: paper
 source: https://evil.example/paper
 file_path: ../../etc/passwd
@@ -79,9 +78,8 @@ body text
 """
     metadata, _ = parse_frontmatter(hostile)
 
-    for reserved in ("visibility", "doc_type", "source", "file_path"):
+    for reserved in ("doc_type", "source", "file_path"):
         assert reserved not in metadata
-    assert metadata["x_visibility"] == "public"
     assert metadata["x_doc_type"] == "paper"
 
 
@@ -105,7 +103,7 @@ def test_a_single_tag_value_is_accepted():
     assert metadata["tags"] == "|solo|"
 
 
-def test_malformed_yaml_warns_but_keeps_the_note(capsys):
+def test_malformed_yaml_warns_but_keeps_the_note(caplog):
     """
     Losing a note because its header had a stray character would be far worse
     than losing its filters, so parsing degrades to no metadata and the body
@@ -116,12 +114,12 @@ def test_malformed_yaml_warns_but_keeps_the_note(capsys):
 
     assert metadata == {}
     assert "the body survives" in body
-    warning = capsys.readouterr().out
+    warning = caplog.text
     assert "notes/broken.md" in warning
     assert "frontmatter" in warning
 
 
-def test_nested_values_are_skipped_with_a_warning(capsys):
+def test_nested_values_are_skipped_with_a_warning(caplog):
     """Flat over nested: a dict value can't be stored, and a silent drop
     would be worse than a noisy one."""
     nested = "---\ntype: project\nowner:\n  name: Ada\n  role: lead\n---\nbody\n"
@@ -129,7 +127,7 @@ def test_nested_values_are_skipped_with_a_warning(capsys):
 
     assert metadata["category"] == "project"
     assert "x_owner" not in metadata
-    assert "owner" in capsys.readouterr().out
+    assert "owner" in caplog.text
 
 
 def test_a_note_without_frontmatter_is_untouched():
@@ -195,7 +193,7 @@ def test_format_tags_drops_blanks():
     assert format_tags([]) == ""
 
 
-def test_empty_values_are_absent_not_errors(capsys):
+def test_empty_values_are_absent_not_errors(caplog, capsys):
     """
     An Obsidian template is full of keys with nothing after them. Those are
     absent values, not unstorable ones — warning about each on every vault
@@ -205,9 +203,17 @@ def test_empty_values_are_absent_not_errors(capsys):
     metadata, _ = parse_frontmatter(template, file_label="templates/project.md")
 
     assert metadata == {"category": "project"}
+    assert caplog.text == ""
     assert capsys.readouterr().out == ""
 
 
 def test_an_empty_tag_list_is_absent():
     metadata, _ = parse_frontmatter("---\ntags: []\ntype: note\n---\nbody\n")
     assert "tags" not in metadata
+
+
+def test_display_tags_reads_the_stored_form_back():
+    from jarvis.kb.frontmatter import display_tags
+
+    assert display_tags(format_tags(["remote", "ml"])) == "remote, ml"
+    assert display_tags("") == ""

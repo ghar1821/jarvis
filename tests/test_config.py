@@ -3,15 +3,18 @@ Tests for jarvis/core/config.py — load_config() and the README's promises.
 
 Each test writes its own config.toml into tmp_path and passes it to
 load_config() directly, so the user's real ~/.jarvis/config.toml is never
-read. Config notes (moved and obsolete keys) go to stderr, because stdout is
-the MCP channel inside jarvis-mcp.
+read. Config notes (unknown keys) go to stderr, because stdout is the MCP
+channel inside jarvis-mcp.
 """
 
 import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from jarvis.core.config import Config, format_describe, load_config
+from jarvis.core.errors import ConfigError
 
 ROOT = Path(__file__).parent.parent
 
@@ -26,7 +29,6 @@ def test_defaults_when_no_config_file(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     assert cfg == Config()
     assert cfg.papers_dir is None
-    assert cfg.private_vault_dirs == ["private"]
     assert cfg.sync_minutes == 30 and cfg.hybrid is True
 
 
@@ -34,7 +36,6 @@ def test_kb_and_rag_sections_are_read(tmp_path):
     cfg = load_config(_write(tmp_path, """
 [kb]
 vault_path = "~/notes"
-private_vault_dirs = ["private", "journal"]
 papers_dir = "~/papers"
 sync_minutes = 10
 
@@ -48,79 +49,62 @@ server_port = 9000
     # "~" is expanded — a literal one would be a path that never resolves.
     assert cfg.vault_path == Path.home() / "notes"
     assert cfg.papers_dir == Path.home() / "papers"
-    assert cfg.private_vault_dirs == ["private", "journal"]
     assert cfg.sync_minutes == 10
     assert cfg.rag_dir == Path.home() / "index"
     assert cfg.embed_model == "BAAI/bge-base-en-v1.5"
     assert cfg.rerank_model == "" and cfg.hybrid is False and cfg.server_port == 9000
 
 
-def test_moved_keys_still_work_from_their_old_place_and_say_so(tmp_path, capsys):
+@pytest.mark.parametrize("section", ["kb", "chat"])
+def test_private_vault_dirs_stops_jarvis_with_the_fix(tmp_path, section):
     """
-    An existing config keeps working: [chat] vault_path and [sync]
-    pdf_watch_dir are read as [kb] vault_path and papers_dir, with a note.
+    jarvis no longer keeps private folders out of the index. A config that
+    still lists them would quietly send those notes to the cloud model, so it
+    is refused outright, with a message that says what to do instead.
+    """
+    config_file = _write(tmp_path, f'[{section}]\nprivate_vault_dirs = ["private"]\n')
+    with pytest.raises(ConfigError) as caught:
+        load_config(config_file)
+    message = str(caught.value)
+    assert "private_vault_dirs" in message
+    assert "outside vault_path" in message
+    assert str(config_file) in message
+
+
+def test_an_empty_private_vault_dirs_is_harmless(tmp_path):
+    """An empty list kept nothing out of the index, so it does not stop jarvis."""
+    load_config(_write(tmp_path, "[kb]\nprivate_vault_dirs = []\n"))
+
+
+def test_unknown_sections_and_keys_are_named_and_ignored(tmp_path, capsys):
+    """
+    A typo or a setting left over from an older version must not be mistaken
+    for one that works. Each is named on stderr, and an API key left in the
+    file is not echoed.
     """
     cfg = load_config(_write(tmp_path, """
-[chat]
-vault_path = "~/old-vault"
-private_vault_dirs = ["secret"]
-
-[sync]
-pdf_watch_dir = "~/old-inbox"
-vault_refresh_minutes = 15
-"""))
-    assert cfg.vault_path == Path.home() / "old-vault"
-    assert cfg.private_vault_dirs == ["secret"]
-    assert cfg.papers_dir == Path.home() / "old-inbox"
-    assert cfg.sync_minutes == 15
-
-    captured = capsys.readouterr()
-    assert captured.out == ""  # stdout is the MCP channel
-    assert "[sync] pdf_watch_dir has moved to [kb] papers_dir" in captured.err
-    assert "[chat] vault_path has moved to [kb] vault_path" in captured.err
-
-
-def test_the_new_location_wins_over_the_old_one(tmp_path):
-    cfg = load_config(_write(tmp_path, """
-[chat]
-vault_path = "~/old-vault"
-
 [kb]
-vault_path = "~/new-vault"
-"""))
-    assert cfg.vault_path == Path.home() / "new-vault"
-
-
-def test_obsolete_keys_are_reported_once_and_ignored(tmp_path, capsys):
-    """
-    Settings from the old assistant (providers, API keys, drafts, digest
-    schedule, figure captions) do nothing now. Each is named so a setting
-    that silently stopped working is never a mystery — and an API key left
-    in the file is not echoed.
-    """
-    load_config(_write(tmp_path, """
-[chat]
-provider = "anthropic"
-vault_path = "~/vault"
+vault_pth = "~/typo"
 
 [auth]
 api_key = "sk-ant-should-never-be-printed"
 
-[digest]
-enabled = true
-
 [rag]
 figure_captions = true
 """))
-    err = capsys.readouterr().err
-    assert "[chat] provider in" in err and "no longer does anything" in err
-    assert "[auth] api_key" in err and "sk-ant-should-never-be-printed" not in err
-    assert "[digest] enabled" in err
-    assert "[rag] figure_captions" in err
-    # A moved key is reported as moved, not as obsolete.
-    obsolete_chat_line = next(line for line in err.splitlines() if "[chat] provider" in line)
-    assert "vault_path" not in obsolete_chat_line
-    assert "[chat] vault_path has moved" in err
+    assert cfg == Config()
+    captured = capsys.readouterr()
+    assert captured.out == ""  # stdout is the MCP channel
+    assert "[kb] vault_pth" in captured.err
+    assert "[auth] in" in captured.err
+    assert "[rag] figure_captions" in captured.err
+    assert "sk-ant-should-never-be-printed" not in captured.err
+
+
+def test_a_quoted_boolean_is_an_error_not_true(tmp_path):
+    """bool("false") is True, so a quoted "false" would silently turn hybrid on."""
+    with pytest.raises(ConfigError, match="without quotes"):
+        load_config(_write(tmp_path, '[rag]\nhybrid = "false"\n'))
 
 
 def test_env_vars_override_the_file(tmp_path, monkeypatch):
@@ -141,7 +125,7 @@ def test_format_describe_shows_the_resolved_folders(tmp_path):
 def test_the_readme_example_config_loads_cleanly(tmp_path, capsys):
     """
     The config block a new user copies out of the README must load with no
-    "moved" or "obsolete" notes and produce absolute paths.
+    notes about unknown keys and produce absolute paths.
     """
     readme = (ROOT / "README.md").read_text()
     blocks = re.findall(r"```toml\n(.*?)```", readme, re.DOTALL)

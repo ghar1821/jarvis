@@ -9,8 +9,7 @@ Resolution order (later wins):
 Example ~/.jarvis/config.toml:
 
     [kb]
-    vault_path = "~/vault"
-    private_vault_dirs = ["private"]   # top-level vault folders never indexed
+    vault_path = "~/vault"             # every .md file in here is indexed
     papers_dir = "~/Documents/papers"  # PDFs here (and in subfolders) are indexed
     sync_minutes = 30                  # how often `kb serve` re-mirrors both folders
 
@@ -27,9 +26,10 @@ Example ~/.jarvis/config.toml:
     server_port = 8321           # `kb serve` listens here, on 127.0.0.1 only
 
 jarvis has no API keys and makes no LLM calls: the MCP client does all of
-that. Keys left over from older versions are reported once and otherwise
-ignored, and keys that moved to [kb] are still read from where they used to
-be. The file is never rewritten for you.
+that. A section or key jarvis does not know is reported on stderr and
+otherwise ignored, so a typo or a setting left over from an older version is
+never silently mistaken for a working one. The file is never rewritten for
+you.
 """
 
 import os
@@ -38,17 +38,18 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from jarvis.core.errors import ConfigError
+
 CONFIG_FILE = Path.home() / ".jarvis" / "config.toml"
 
 
 @dataclass
 class Config:
     # ── The two folders the index mirrors ─────────────────────────────────────
+    # Every .md file under this folder is indexed and readable by the MCP
+    # client, which sends what it reads to a cloud model. Private notes belong
+    # in a separate folder outside it.
     vault_path: Path = field(default_factory=lambda: Path("~/vault").expanduser())
-    # Top-level vault folders that are never indexed and never readable over
-    # MCP. Every MCP client sends what it reads to a cloud model, so the only
-    # safe place for private notes is outside the index altogether.
-    private_vault_dirs: list[str] = field(default_factory=lambda: ["private"])
     # PDFs under this folder (recursively) are the papers. None means no
     # papers are indexed at all.
     papers_dir: Path | None = None
@@ -79,35 +80,66 @@ class Config:
     server_port: int = 8321
 
 
-# Keys that moved to [kb]: (old section, old key) -> new key. Still read from
-# the old place, with a note, so an existing config keeps working.
-_MOVED_KEYS = {
-    ("chat", "vault_path"): "vault_path",
-    ("chat", "private_vault_dirs"): "private_vault_dirs",
-    ("sync", "pdf_watch_dir"): "papers_dir",
-    ("sync", "vault_refresh_minutes"): "sync_minutes",
+# Every key jarvis reads, by section. Anything else is reported as unknown.
+_KB_KEYS = {"vault_path", "papers_dir", "sync_minutes"}
+_RAG_KEYS = {
+    "rag_dir", "embed_model", "query_prefix", "chunk_size", "chunk_overlap",
+    "rerank_model", "rerank_top_n", "hybrid", "server_port",
 }
-
-# Whole sections and single keys that no longer do anything.
-_OBSOLETE_SECTIONS = {"digest", "chat", "drafts", "openrouter", "models", "auth", "sync"}
-_OBSOLETE_RAG_KEYS = {"figure_captions", "figure_max_per_doc", "figure_min_pixels"}
-
-_KB_PATH_KEYS = {"vault_path", "papers_dir"}
-
-
-def _apply_kb_value(cfg: Config, key: str, value) -> None:
-    """Set one [kb] value on cfg, converting it to the field's type."""
-    if key in _KB_PATH_KEYS:
-        setattr(cfg, key, Path(str(value)).expanduser())
-    elif key == "private_vault_dirs":
-        cfg.private_vault_dirs = [str(name) for name in value]
-    elif key == "sync_minutes":
-        cfg.sync_minutes = int(value)
+_KNOWN_KEYS = {"kb": _KB_KEYS, "rag": _RAG_KEYS}
 
 
 def _note(message: str) -> None:
     """Config notes go to stderr: stdout is the MCP channel in jarvis-mcp."""
     print(f"⚠️  {message}", file=sys.stderr, flush=True)
+
+
+def _refuse_private_vault_dirs(data: dict, config_file: Path) -> None:
+    """
+    Stop if the config still lists private vault folders.
+
+    Older versions kept those folders out of the index. This one indexes the
+    whole vault, so carrying on would quietly send private notes to the MCP
+    client's cloud model. That is too serious for a warning that scrolls past.
+    """
+    for section in ("kb", "chat"):
+        folders = data.get(section, {}).get("private_vault_dirs")
+        if folders:
+            raise ConfigError(
+                f"{config_file} sets [{section}] private_vault_dirs = {folders!r}, "
+                "but jarvis no longer keeps private folders out of the index. "
+                "Every note under vault_path is indexed and can be read by your "
+                "MCP client, which sends it to a cloud model.\n"
+                "Move your private notes to a folder outside vault_path, then "
+                f"delete the private_vault_dirs line from {config_file}."
+            )
+
+
+def _boolean(section: str, key: str, value, config_file: Path) -> bool:
+    """A TOML true/false. A quoted "false" is a string, and bool("false") is True."""
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"[{section}] {key} in {config_file} is {value!r}, but it has to be "
+            "true or false, written without quotes."
+        )
+    return value
+
+
+def _report_unknown_keys(data: dict, config_file: Path) -> None:
+    """Name every section and key jarvis does not read, so none is mistaken for working."""
+    for section in sorted(data):
+        known = _KNOWN_KEYS.get(section)
+        if known is None:
+            _note(
+                f"[{section}] in {config_file} is not a section jarvis reads, so it "
+                "is ignored. It may be left over from an older version; you can delete it."
+            )
+            continue
+        for key in sorted(set(data[section]) - known):
+            _note(
+                f"[{section}] {key} in {config_file} is not a setting jarvis knows, "
+                "so it is ignored. Check the spelling, or delete it."
+            )
 
 
 def load_config(config_file: Path = CONFIG_FILE) -> Config:
@@ -117,20 +149,16 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
     if config_file.exists():
         with open(config_file, "rb") as f:
             data = tomllib.load(f)
-
-        # Old locations first, so a value in [kb] wins if both are present.
-        for (section, old_key), new_key in _MOVED_KEYS.items():
-            if old_key in data.get(section, {}):
-                _apply_kb_value(cfg, new_key, data[section][old_key])
-                _note(
-                    f"[{section}] {old_key} has moved to [kb] {new_key} in {config_file} "
-                    "(still read from the old place for now)"
-                )
+        _refuse_private_vault_dirs(data, config_file)
+        _report_unknown_keys(data, config_file)
 
         kb = data.get("kb", {})
-        for key in ("vault_path", "private_vault_dirs", "papers_dir", "sync_minutes"):
-            if key in kb:
-                _apply_kb_value(cfg, key, kb[key])
+        if "vault_path" in kb:
+            cfg.vault_path = Path(str(kb["vault_path"])).expanduser()
+        if "papers_dir" in kb:
+            cfg.papers_dir = Path(str(kb["papers_dir"])).expanduser()
+        if "sync_minutes" in kb:
+            cfg.sync_minutes = int(kb["sync_minutes"])
 
         r = data.get("rag", {})
         if "rag_dir" in r:
@@ -148,28 +176,9 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
         if "rerank_top_n" in r:
             cfg.rerank_top_n = int(r["rerank_top_n"])
         if "hybrid" in r:
-            cfg.hybrid = bool(r["hybrid"])
+            cfg.hybrid = _boolean("rag", "hybrid", r["hybrid"], config_file)
         if "server_port" in r:
             cfg.server_port = int(r["server_port"])
-
-        # Report everything that is now ignored, once, so a setting that
-        # silently stopped doing anything is never a mystery.
-        moved_old_keys = {pair for pair in _MOVED_KEYS}
-        for section in sorted(_OBSOLETE_SECTIONS & data.keys()):
-            leftover = [
-                key for key in data[section] if (section, key) not in moved_old_keys
-            ]
-            if leftover:
-                _note(
-                    f"[{section}] {', '.join(sorted(leftover))} in {config_file} "
-                    "no longer does anything — safe to delete"
-                )
-        stale_rag = sorted(_OBSOLETE_RAG_KEYS & r.keys())
-        if stale_rag:
-            _note(
-                f"[rag] {', '.join(stale_rag)} in {config_file} "
-                "no longer does anything — safe to delete"
-            )
 
     # Env var overrides (always win over TOML)
     if v := os.environ.get("VAULT_PATH"):
@@ -193,12 +202,6 @@ def get_config() -> Config:
     return _config
 
 
-def reset_config() -> None:
-    """Clear the singleton so the next get_config() reloads from disk."""
-    global _config
-    _config = None
-
-
 def format_describe(cfg: "Config | None" = None) -> str:
     """
     The resolved configuration as printable text, shown when `kb serve`
@@ -209,7 +212,6 @@ def format_describe(cfg: "Config | None" = None) -> str:
     rows = [
         ("config file", f"{CONFIG_FILE}{'' if CONFIG_FILE.exists() else '  (not found — defaults)'}"),
         ("vault_path", cfg.vault_path),
-        ("private_vault_dirs", ", ".join(cfg.private_vault_dirs) or "—"),
         ("papers_dir", cfg.papers_dir or "— (no papers indexed)"),
         ("sync_minutes", cfg.sync_minutes),
         ("rag_dir", cfg.rag_dir),

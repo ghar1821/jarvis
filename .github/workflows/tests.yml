@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+# The tests only read the repository, so the job's token can do nothing else.
+permissions:
+  contents: read
+
 # A new push to the same branch supersedes whatever run is still going.
 concurrency:
   group: tests-${{ github.ref }}

@@ -94,6 +94,32 @@
 
 ### BREAKING CHANGES
 
+- Removed private vault folders (PR #6). jarvis now indexes every note in
+  `vault_path`, and only ever reads inside `vault_path` and `papers_dir`.
+  Keep private notes in a separate folder outside the vault. A config that
+  still sets `private_vault_dirs` stops jarvis with instructions, rather than
+  quietly indexing those notes.
+
+- An index built by an older version must be rebuilt once with
+  `uv run kb rebuild` (PR #6). Until then jarvis refuses to use it and says
+  so. This drops entries that no file backs (arXiv-URL papers, digests, chat
+  history, private notes, PDFs outside `papers_dir`), and with them the code
+  that kept those working: the `visibility` filters, the `digest` and `chat`
+  document types, `kb doctor`'s report of unbacked entries, and the one-time
+  arXiv-ID upgrade.
+
+- Old config sections and keys (`[chat]`, `[sync]`, `pdf_watch_dir`, …) are no
+  longer read from their old places (PR #6). Every section or key jarvis does
+  not know is named on stderr as ignored. `hybrid = "false"` in quotes is now
+  an error, because it used to be read as true.
+
+- `kb serve` runs Chroma's Python server instead of `chroma run`, and the
+  index now requires a token (PR #6). Other programs on your Mac, and web
+  pages using DNS rebinding, could previously read or change the whole index
+  on 127.0.0.1. The token is created once in `~/.jarvis/state/server_token`,
+  readable only by you. Restart `kb serve` and your MCP client after
+  upgrading.
+
 - Removed `fetch_recent_papers`, the `jarvis/feeds/` arXiv and bioRxiv
   fetchers (PR #6). Your MCP client's own connectors (for example PubMed,
   or arXiv and bioRxiv connectors) find new papers more reliably. Ask it to
@@ -216,6 +242,35 @@
   - Add explicit "USD" next to cost.
 
 ### BUG FIXES
+
+- Fix `read_note` returning a note from a private folder when the folder name
+  was typed in a different case, for example `PRIVATE/` (PR #6). macOS file
+  names ignore case, but the check did not.
+
+- Fix notes and PDFs that are links to files outside the vault or papers
+  folder being indexed and sent to the MCP client (PR #6). They are now
+  skipped with a warning naming where they point. `reveal_in_finder` checks
+  the same thing before opening Finder.
+
+- Fix a document being able to end the "retrieved data" fence early by
+  printing the closing marker itself (PR #6). `kb_stats` now fences the
+  record types and statuses it lists, since they come from notes.
+
+- Fix the Crossref lookup asking for the wrong work when a DOI contains `?`,
+  `#` or `%` (PR #6). The DOI is now escaped in the URL.
+
+- Fix the logs and the `kb serve` status file being readable by other users
+  (PR #6). `~/.jarvis/logs/` and `~/.jarvis/state/` are now owner-only, like
+  the index.
+
+- Fix a moved PDF inside a symlinked subfolder of `papers_dir` being recorded
+  at the link's target and indexed twice (PR #6).
+
+- Fix `kb stats` and `kb_stats` reporting 0 documents when the count could not
+  be read (PR #6). They now show the error.
+
+- Fix "server not running" and "collection was rebuilt" being reported as
+  generic failures by deletes, listings and path updates (PR #6).
 
 - Fix arXiv preprints you already have not being recognised as yours
   (PR #6). Papers could only be matched by DOI or exact title. arXiv PDFs

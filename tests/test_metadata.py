@@ -116,6 +116,23 @@ def test_crossref_request_carries_nothing_identifying(monkeypatch):
     assert "mailto" not in " ".join(seen_headers.values()).lower()
 
 
+def test_crossref_escapes_the_doi_in_the_url(monkeypatch):
+    """
+    A DOI read from a PDF can contain "?" or "#". Unescaped, those would turn
+    part of the DOI into a query string or fragment and ask for the wrong work.
+    """
+    seen_urls = []
+
+    def fake_get(url, headers, timeout):
+        seen_urls.append(url)
+        return _Response(_CROSSREF_WORK)
+
+    monkeypatch.setattr(metadata.requests, "get", fake_get)
+    crossref_lookup("10.1002/(SICI)1097?x#y")
+
+    assert seen_urls == ["https://api.crossref.org/works/10.1002/%28SICI%291097%3Fx%23y"]
+
+
 def test_crossref_failure_gives_empty_dict(monkeypatch):
     """A network error or a 404 is logged and falls through, never raised."""
     def failing_get(url, headers, timeout):

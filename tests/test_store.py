@@ -20,11 +20,11 @@ from langchain_chroma import Chroma
 
 from jarvis.core.config import Config
 from jarvis.core.errors import KBCorruptionError, RAGError
+from helpers import index_annotations, index_text
 from jarvis.kb.store import (
-    _check_embedding_model_matches,
+    INDEX_SCHEMA,
+    _check_index_compatible,
     _reciprocal_rank_fusion,
-    add_annotations,
-    add_texts,
     build_text_documents,
     commit_documents,
     count,
@@ -54,7 +54,7 @@ def test_building_documents_writes_nothing(store):
     before = count(store)
     documents = build_text_documents(
         content="Staged but never committed.",
-        doc_type="paper", visibility="public", source="file:///staged.pdf",
+        doc_type="paper", source="file:///staged.pdf",
     )
     assert documents, "the build step should have produced chunks"
     assert count(store) == before
@@ -68,16 +68,16 @@ def test_commit_documents_replaces_and_adds_together(store):
     commit leaves the old entry intact.
     """
     source = "file:///paper.pdf"
-    add_texts(
+    index_text(
         content="The original body text.",
-        doc_type="paper", visibility="public", source=source,
+        doc_type="paper", source=source,
         extra_metadata={"title": "Original"},
         store=store,
     )
 
     replacement = build_text_documents(
         content="The replacement body text.",
-        doc_type="paper", visibility="public", source=source,
+        doc_type="paper", source=source,
         extra_metadata={"title": "Replacement"},
     )
     ids = commit_documents(replacement, store, replace_source=source)
@@ -97,9 +97,9 @@ def test_commit_documents_with_nothing_staged_still_replaces(store):
     rather than silently leaving stale chunks behind.
     """
     source = "file:///empty.pdf"
-    add_texts(
+    index_text(
         content="Stale content to be superseded.",
-        doc_type="paper", visibility="public", source=source,
+        doc_type="paper", source=source,
         store=store,
     )
     assert commit_documents([], store, replace_source=source) == []
@@ -108,22 +108,21 @@ def test_commit_documents_with_nothing_staged_still_replaces(store):
 
 # ── 1. Indexing ────────────────────────────────────────────────────────────────
 
-def test_add_texts_returns_ids_and_increases_count(store):
+def test_index_text_returns_ids_and_increases_count(store):
     """
-    add_texts() chunks the content and stores each chunk in the collection.
+    index_text() chunks the content and stores each chunk in the collection.
     The returned list of IDs should be non-empty, and the collection count
     should rise by exactly the number of IDs returned.
 
-    Input:  a single sentence, doc_type="note", visibility="public"
+    Input:  a single sentence, doc_type="note"
     Expected output:
         len(ids) > 0
         count increases by len(ids)
     """
     before = count(store=store)
-    ids = add_texts(
+    ids = index_text(
         content="Transformer architectures use self-attention to capture long-range dependencies.",
         doc_type="note",
-        visibility="public",
         source="local",
         store=store,
     )
@@ -133,37 +132,35 @@ def test_add_texts_returns_ids_and_increases_count(store):
 
 # ── 2. Search ──────────────────────────────────────────────────────────────────
 
-def test_search_visibility_filter_excludes_private_docs(store):
+def test_search_doc_type_filter_excludes_other_types(store):
     """
-    search() with visibility="public" must not return private documents even
-    when the private document is semantically identical to the query.
+    search() with doc_type="paper" must not return notes, even when a note is
+    word-for-word the same as the paper.
 
-    Both documents have the same content so without the filter either could rank
-    highest — the filter must do the exclusion, not relevance scoring.
+    Both documents have the same content, so without the filter either could
+    rank highest. The filter has to do the exclusion, not relevance scoring.
 
     Input:
-        doc A — visibility="public",  source="public-doc"
-        doc B — visibility="private", source="private-doc"
+        doc A — doc_type="paper", source="paper-doc"
+        doc B — doc_type="note",  source="note-doc"
         query — text matching both documents
     Expected output:
-        results contain "public-doc"
-        results do not contain "private-doc"
+        results contain "paper-doc"
+        results do not contain "note-doc"
     """
     content = "Gradient descent iteratively adjusts weights to minimise the loss function."
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="public-doc", store=store)
-    add_texts(content=content, doc_type="note", visibility="private",
-              source="private-doc", store=store)
+    index_text(content=content, doc_type="paper", source="paper-doc", store=store)
+    index_text(content=content, doc_type="note", source="note-doc", store=store)
 
     results = search(
         "gradient descent weight optimisation",
         n_results=10,
-        visibility="public",
+        doc_type="paper",
         store=store,
     )
     sources = {doc.metadata["source"] for doc in results}
-    assert "public-doc" in sources
-    assert "private-doc" not in sources
+    assert "paper-doc" in sources
+    assert "note-doc" not in sources
 
 
 # ── 4. Deletion ────────────────────────────────────────────────────────────────
@@ -183,13 +180,13 @@ def test_delete_by_metadata_removes_only_matching_chunks(store):
         count drops by exactly `deleted`
         searching for doc B still returns a result; doc A is gone
     """
-    add_texts(
+    index_text(
         content="Reinforcement learning maximises a cumulative reward signal.",
-        doc_type="note", visibility="public", source="to-delete", store=store,
+        doc_type="note", source="to-delete", store=store,
     )
-    add_texts(
+    index_text(
         content="Supervised learning requires labelled examples for training.",
-        doc_type="note", visibility="public", source="to-keep", store=store,
+        doc_type="note", source="to-keep", store=store,
     )
 
     before = count(store=store)
@@ -214,13 +211,12 @@ def test_list_documents_deduplicates_and_reports_chunk_count(store):
     Input:  a long summary that the splitter divides into multiple chunks
     Expected output:
         exactly one entry for that source in list_documents()
-        entry["chunk_count"] == number of IDs returned by add_texts()
+        entry["chunk_count"] == number of IDs returned by index_text()
     """
     source = "file:///papers/attention.pdf"
     # Repeat a sentence to exceed the default chunk_size and force multiple chunks
     long_text = "Self-attention computes pairwise interactions between all tokens. " * 200
-    ids = add_texts(content=long_text, doc_type="paper", visibility="public",
-                    source=source, extra_metadata={"title": "Attention"}, store=store)
+    ids = index_text(content=long_text, doc_type="paper", source=source, extra_metadata={"title": "Attention"}, store=store)
     assert len(ids) > 1, "the text should have produced multiple chunks"
 
     papers = list_documents(store=store)
@@ -249,10 +245,9 @@ def test_update_file_path_updates_metadata_and_source_uri(store, tmp_path):
     new_path = str(tmp_path / "paper.pdf")
     expected_source = Path(new_path).as_uri()
 
-    add_texts(
+    index_text(
         content="Sparse autoencoders decompose activations into interpretable features.",
         doc_type="note",
-        visibility="public",
         source=old_source,
         extra_metadata={"file_path": "/old/paper.pdf"},
         store=store,
@@ -269,6 +264,27 @@ def test_update_file_path_updates_metadata_and_source_uri(store, tmp_path):
     for meta in result["metadatas"]:
         assert meta["file_path"] == new_path
         assert meta["source"] == expected_source
+
+
+def test_update_file_path_stores_a_symlinked_path_as_given(store, tmp_path):
+    """
+    Papers are keyed on where they sit in papers_dir. If the new path were
+    resolved, a PDF reached through a symlinked subfolder would be recorded
+    at the link's target, and the next sync would not find it where it is.
+    """
+    real_folder = tmp_path / "real"
+    real_folder.mkdir()
+    (real_folder / "paper.pdf").write_bytes(b"%PDF")
+    linked_folder = tmp_path / "linked"
+    linked_folder.symlink_to(real_folder)
+    new_path = str(linked_folder / "paper.pdf")
+
+    index_text(content="Some paper text.", doc_type="paper", source="file:///old/paper.pdf",
+               extra_metadata={"file_path": "/old/paper.pdf"}, store=store)
+    update_file_path("file:///old/paper.pdf", new_path, store=store)
+
+    stored = store._collection.get(include=["metadatas"])["metadatas"]
+    assert {meta["file_path"] for meta in stored} == {new_path}
 
 
 def test_update_file_path_returns_zero_for_unknown_source(store):
@@ -300,14 +316,13 @@ def test_get_document_chunks_orders_body_before_annotations(store):
         "## Method\nSecond section content about survey methodology used.\n\n"
         "## Results\nThird section content about population estimates found.\n"
     )
-    add_texts(content=content, doc_type="paper", visibility="public",
-              source=source, store=store)
-    add_texts(content="[HIGHLIGHT p.1] a key finding", doc_type="paper",
-              visibility="public", source=source,
+    index_text(content=content, doc_type="paper", source=source, store=store)
+    index_text(content="[HIGHLIGHT p.1] a key finding", doc_type="paper",
+              source=source,
               extra_metadata={"annotation_kind": "highlight", "page": 1, "note_text": ""},
               store=store)
-    add_texts(content="[FIGURE p.2] a captioned figure", doc_type="paper",
-              visibility="public", source=source,
+    index_text(content="[FIGURE p.2] a captioned figure", doc_type="paper",
+              source=source,
               extra_metadata={"annotation_kind": "figure", "page": 2, "note_text": ""},
               store=store)
 
@@ -331,51 +346,81 @@ def test_get_document_chunks_unknown_source_returns_empty_list(store):
     assert get_document_chunks("file:///does/not/exist.pdf", store=store) == []
 
 
-# ── 8. Embedding-model guard ────────────────────────────────────────────────────
+# ── 8. Index compatibility guard ───────────────────────────────────────────────
 
-def _tagged_store(embeddings, embed_model_tag: str) -> Chroma:
-    """A fresh isolated collection tagged with a given embed_model in its metadata."""
+@pytest.fixture
+def default_config(monkeypatch):
+    """Default config (bge-small embeddings), whatever ~/.jarvis/config.toml says."""
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config())
+
+
+def _tagged_store(embeddings, tags: dict) -> Chroma:
+    """A fresh isolated collection carrying the given collection metadata."""
     TEST_CHROMA_DIR.mkdir(exist_ok=True)
     return Chroma(
         collection_name=f"test_{uuid.uuid4().hex[:8]}",
         embedding_function=embeddings,
         persist_directory=str(TEST_CHROMA_DIR),
-        collection_metadata={"embed_model": embed_model_tag},
+        collection_metadata=tags,
     )
 
 
-def test_embedding_guard_raises_on_model_mismatch(embeddings):
+CURRENT_TAGS = {"embed_model": "BAAI/bge-small-en-v1.5", "index_schema": INDEX_SCHEMA}
+
+
+def test_guard_raises_on_model_mismatch(embeddings, default_config):
     """
     A non-empty collection built with one embedding model must not be searched
     with a different model — the vectors live in incompatible spaces. The guard
     raises RAGError so the mismatch fails loudly instead of returning garbage.
     """
-    store = _tagged_store(embeddings, "some-old-model")
-    add_texts(content="Attention mechanisms weight input tokens.", doc_type="note",
-              visibility="public", source="d1", store=store)
+    store = _tagged_store(embeddings, {**CURRENT_TAGS, "embed_model": "some-old-model"})
+    index_text(content="Attention mechanisms weight input tokens.", doc_type="note",
+              source="d1", store=store)
     try:
-        with pytest.raises(RAGError):
-            _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")
+        with pytest.raises(RAGError, match="Embedding model mismatch"):
+            _check_index_compatible(store)
     finally:
         store.delete_collection()
 
 
-def test_embedding_guard_allows_matching_model(embeddings):
-    """A collection tagged with the model in use passes the guard silently."""
-    store = _tagged_store(embeddings, "BAAI/bge-small-en-v1.5")
-    add_texts(content="Attention mechanisms weight input tokens.", doc_type="note",
-              visibility="public", source="d1", store=store)
+def test_guard_refuses_an_index_from_an_older_version(embeddings, default_config):
+    """
+    An index without the current index_schema tag may hold chunks this version
+    no longer expects (private notes, chat history), so it is refused with a
+    pointer to `kb rebuild` rather than searched.
+    """
+    store = _tagged_store(embeddings, {"embed_model": "BAAI/bge-small-en-v1.5"})
+    index_text(content="Attention mechanisms weight input tokens.", doc_type="note",
+              source="d1", store=store)
     try:
-        _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")  # no raise
+        with pytest.raises(RAGError, match="kb rebuild"):
+            _check_index_compatible(store)
     finally:
         store.delete_collection()
 
 
-def test_embedding_guard_ignores_empty_collection(embeddings):
-    """An empty collection has no vectors to be incompatible, so the guard is a no-op."""
-    store = _tagged_store(embeddings, "some-old-model")
+def test_guard_allows_a_current_index(embeddings, default_config):
+    """A collection tagged with this version and the model in use passes silently."""
+    store = _tagged_store(embeddings, CURRENT_TAGS)
+    index_text(content="Attention mechanisms weight input tokens.", doc_type="note",
+              source="d1", store=store)
     try:
-        _check_embedding_model_matches(store, "BAAI/bge-small-en-v1.5")  # no raise
+        _check_index_compatible(store)  # no raise
+    finally:
+        store.delete_collection()
+
+
+def test_guard_retags_an_empty_collection(embeddings, default_config):
+    """
+    An empty collection has nothing to get wrong, so it is given the
+    current tags. Otherwise it would be refused as soon as anything was added.
+    """
+    store = _tagged_store(embeddings, {"embed_model": "some-old-model"})
+    try:
+        _check_index_compatible(store)  # no raise
+        assert store._collection.metadata["index_schema"] == INDEX_SCHEMA
+        assert store._collection.metadata["embed_model"] == "BAAI/bge-small-en-v1.5"
     finally:
         store.delete_collection()
 
@@ -388,36 +433,34 @@ def rerank_on(monkeypatch):
     monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config())
 
 
-def test_reranked_search_still_excludes_private_docs(store, rerank_on):
+def test_reranked_search_still_honours_filters(store, rerank_on):
     """
-    Re-ranking runs after the ChromaDB visibility filter, so it must never
-    surface a private document — the privacy invariant holds through the
-    re-rank path just as it does for plain similarity search.
+    Re-ranking runs after the ChromaDB filter, so it must never bring back a
+    chunk the filter excluded. The filter holds through the re-rank path just
+    as it does for plain similarity search.
     """
     content = "Backpropagation computes gradients through the chain rule."
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="pub-rr", store=store)
-    add_texts(content=content, doc_type="note", visibility="private",
-              source="priv-rr", store=store)
+    index_text(content=content, doc_type="paper", source="paper-rr", store=store)
+    index_text(content=content, doc_type="note", source="note-rr", store=store)
 
     results = search("backpropagation chain rule gradients", n_results=10,
-                     visibility="public", store=store)
+                     doc_type="paper", store=store)
     sources = {doc.metadata["source"] for doc in results}
-    assert "pub-rr" in sources
-    assert "priv-rr" not in sources
+    assert "paper-rr" in sources
+    assert "note-rr" not in sources
 
 
 def test_search_rerank_false_skips_reranker(store, monkeypatch):
     """
     rerank=False must return plain similarity results without invoking the
-    cross-encoder at all (used for the cheap private-existence probe).
+    cross-encoder at all (used by the cheap `kb doctor` search probe).
     """
     def fail_if_called():
         raise AssertionError("reranker must not be loaded when rerank=False")
 
     monkeypatch.setattr("jarvis.kb.store._get_reranker", fail_if_called)
-    add_texts(content="Recurrent networks process sequences step by step.",
-              doc_type="note", visibility="public", source="seq", store=store)
+    index_text(content="Recurrent networks process sequences step by step.",
+              doc_type="note", source="seq", store=store)
     results = search("recurrent sequence model", n_results=3, store=store, rerank=False)
     assert any(doc.metadata["source"] == "seq" for doc in results)
 
@@ -435,8 +478,7 @@ def test_chunks_get_distinct_index_and_section_breadcrumb(store):
         "## Methods\nWe designed a guide RNA library targeting 500 genes.\n\n"
         "## Results\nTwelve genes reduced proliferation when knocked out.\n"
     )
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="note-sections", store=store)
+    index_text(content=content, doc_type="note", source="note-sections", store=store)
 
     stored = store._collection.get(
         where={"source": {"$eq": "note-sections"}}, include=["metadatas"]
@@ -456,8 +498,8 @@ def test_headerless_content_has_empty_section_and_no_breadcrumb(store):
     single unlabelled chunk — empty section, and no breadcrumb prepended to the
     embedded text.
     """
-    add_texts(content="Plain prose with no markdown headers whatsoever.",
-              doc_type="note", visibility="public", source="plain", store=store)
+    index_text(content="Plain prose with no markdown headers whatsoever.",
+              doc_type="note", source="plain", store=store)
 
     stored = store._collection.get(
         where={"source": {"$eq": "plain"}}, include=["metadatas", "documents"]
@@ -486,15 +528,14 @@ def _annotated_pdf(tmp_path: Path) -> Path:
     return pdf_path
 
 
-def test_add_annotations_indexes_highlights_and_comments(store, tmp_path):
+def test_annotations_index_highlights_and_comments(store, tmp_path):
     """
-    add_annotations turns each highlight/comment into its own chunk with
+    build_annotation_documents turns each highlight/comment into its own chunk with
     annotation metadata and the [HIGHLIGHT]/[USER NOTE] page prefix embedded.
     """
     pdf_path = _annotated_pdf(tmp_path)
-    ids = add_annotations(
-        pdf_path, doc_type="paper", visibility="public",
-        source="file:///annotated.pdf", title="Annotated", store=store,
+    ids = index_annotations(
+        pdf_path, source="file:///annotated.pdf", title="Annotated", store=store,
     )
     assert len(ids) == 2
 
@@ -514,7 +555,7 @@ def test_add_annotations_indexes_highlights_and_comments(store, tmp_path):
     assert comments["documents"][0] == "[USER NOTE p.1] Check the original 1957 reference"
 
 
-def test_add_annotations_unannotated_pdf_is_noop(store, tmp_path):
+def test_unannotated_pdf_indexes_nothing(store, tmp_path):
     """A PDF without annotations adds nothing and returns []."""
     import pymupdf
 
@@ -526,9 +567,8 @@ def test_add_annotations_unannotated_pdf_is_noop(store, tmp_path):
     doc.close()
 
     before = count(store)
-    assert add_annotations(
-        pdf_path, doc_type="paper", visibility="public",
-        source="file:///plain.pdf", store=store,
+    assert index_annotations(
+        pdf_path, source="file:///plain.pdf", store=store,
     ) == []
     assert count(store) == before
 
@@ -540,10 +580,9 @@ def test_delete_by_source_sweeps_body_and_annotations(store, tmp_path):
     """
     pdf_path = _annotated_pdf(tmp_path)
     source = "file:///swept.pdf"
-    add_texts(content="Body text of the swept paper.", doc_type="paper",
-              visibility="public", source=source, store=store)
-    add_annotations(pdf_path, doc_type="paper", visibility="public",
-                    source=source, store=store)
+    index_text(content="Body text of the swept paper.", doc_type="paper",
+              source=source, store=store)
+    index_annotations(pdf_path, source=source, store=store)
 
     deleted = delete_by_metadata("source", source, store)
     assert deleted == 3  # 1 body chunk + 2 annotation chunks
@@ -557,10 +596,9 @@ def test_search_annotation_kind_filter(store, tmp_path):
     when body chunks about the same topic exist.
     """
     pdf_path = _annotated_pdf(tmp_path)
-    add_texts(content="Long discussion about cellular energy production.",
-              doc_type="paper", visibility="public", source="file:///cells.pdf", store=store)
-    add_annotations(pdf_path, doc_type="paper", visibility="public",
-                    source="file:///cells.pdf", store=store)
+    index_text(content="Long discussion about cellular energy production.",
+              doc_type="paper", source="file:///cells.pdf", store=store)
+    index_annotations(pdf_path, source="file:///cells.pdf", store=store)
 
     results = search("cell energy powerhouse", n_results=5,
                      annotation_kind="highlight", store=store, rerank=False)
@@ -613,8 +651,8 @@ def test_search_raises_kb_corruption_error_on_hybrid_path(store, monkeypatch):
     monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=True))
     # The hybrid path only reaches the dense query() call if the candidate
     # pool is non-empty, so seed one chunk first.
-    add_texts(content="Graph neural networks aggregate messages over edges.",
-              doc_type="note", visibility="public", source="hybrid-corruption-seed", store=store)
+    index_text(content="Graph neural networks aggregate messages over edges.",
+              doc_type="note", source="hybrid-corruption-seed", store=store)
 
     def broken_query(*args, **kwargs):
         raise Exception("chromadb.errors.InternalError: Error finding id abcd1234")
@@ -647,7 +685,7 @@ def test_search_diagnoses_stale_collection_handle_after_rebuild(store, monkeypat
         search("anything", store=store, rerank=False)
 
 
-def test_add_texts_diagnoses_stale_collection_handle_after_rebuild(store, monkeypatch):
+def test_commit_diagnoses_stale_collection_handle_after_rebuild(store, monkeypatch):
     """The same stale-handle diagnosis must fire on the write path — that is
     where a long-lived process hits it when it next indexes something."""
 
@@ -660,8 +698,7 @@ def test_add_texts_diagnoses_stale_collection_handle_after_rebuild(store, monkey
     monkeypatch.setattr(store, "add_documents", stale_add_documents)
 
     with pytest.raises(KBCorruptionError, match="restart this process"):
-        add_texts(content="anything", doc_type="note", visibility="public",
-                  source="stale-handle-test", store=store)
+        index_text(content="anything", doc_type="note", source="stale-handle-test", store=store)
 
 
 # ── 13. Embed header ─────────────────────────────────────────────────────────────
@@ -673,9 +710,8 @@ def test_embed_header_is_prepended_to_every_chunk(store):
     long paper, since the author's name appears in no body chunk otherwise.
     """
     long_content = "Self-attention computes pairwise interactions between all tokens. " * 200
-    add_texts(
-        content=long_content, doc_type="paper", visibility="public",
-        source="header-test", store=store,
+    index_text(
+        content=long_content, doc_type="paper", source="header-test", store=store,
         embed_header="A Long Paper — Jane Doe, John Smith",
     )
     stored = store._collection.get(where={"source": {"$eq": "header-test"}}, include=["documents"])
@@ -693,8 +729,8 @@ def test_hybrid_disabled_reproduces_plain_similarity_search(store, monkeypatch):
         raise AssertionError("_hybrid_search must not be called when hybrid=False")
 
     monkeypatch.setattr("jarvis.kb.store._hybrid_search", fail_if_called)
-    add_texts(content="Recurrent networks process sequences step by step.",
-              doc_type="note", visibility="public", source="seq-hybrid-off", store=store)
+    index_text(content="Recurrent networks process sequences step by step.",
+              doc_type="note", source="seq-hybrid-off", store=store)
     results = search("recurrent sequence model", n_results=3, store=store, rerank=False)
     assert any(doc.metadata["source"] == "seq-hybrid-off" for doc in results)
 
@@ -712,8 +748,8 @@ def test_hybrid_enabled_uses_hybrid_search_and_returns_expected_doc(store, monke
         return original(*args, **kwargs)
 
     monkeypatch.setattr("jarvis.kb.store._hybrid_search", spy)
-    add_texts(content="Diffusion models learn to reverse a gradual noising process.",
-              doc_type="note", visibility="public", source="diffusion-hybrid-on", store=store)
+    index_text(content="Diffusion models learn to reverse a gradual noising process.",
+              doc_type="note", source="diffusion-hybrid-on", store=store)
     results = search("diffusion denoising model", n_results=3, store=store, rerank=False)
     assert calls["n"] == 1
     assert any(doc.metadata["source"] == "diffusion-hybrid-on" for doc in results)
@@ -730,34 +766,25 @@ def test_reciprocal_rank_fusion_favours_ids_ranked_high_in_both_lists():
     assert set(fused[2:]) == {"c", "d"}
 
 
-# ── 16. doc_type list filter (papers + digests) ────────────────────────────────
+# ── 16. doc_type list filter ───────────────────────────────────────────────────
 
-def test_search_doc_type_list_returns_papers_and_digests(store):
+def test_search_doc_type_list_is_matched_with_in(store):
     """
-    search() with a doc_type LIST must return documents of every listed type
-    and still exclude the rest — this is what keeps digest documents indexed
-    by older versions findable under the "papers" kind until a rebuild.
-
-    All three documents share the same content, so the doc_type filter (not
-    relevance) must do the discrimination.
+    A list of doc_types is matched with $in: every listed type can come back,
+    and an unlisted one cannot. The documents share their content, so the
+    filter (not relevance) must do the discrimination.
     """
     content = "Spatial transcriptomics maps gene expression onto tissue coordinates."
-    add_texts(content=content, doc_type="paper", visibility="public",
-              source="paper-src", store=store)
-    add_texts(content=content, doc_type="digest", visibility="public",
-              source="file:///digests/digest-2026-07-06.md", store=store)
-    add_texts(content=content, doc_type="note", visibility="public",
-              source="note-src", store=store)
+    index_text(content=content, doc_type="paper", source="paper-src", store=store)
+    index_text(content=content, doc_type="note", source="note-src", store=store)
 
-    results = search("spatial transcriptomics tissue", n_results=10,
-                     doc_type=["paper", "digest"], store=store, rerank=False)
-    types = {doc.metadata["doc_type"] for doc in results}
-    assert types == {"paper", "digest"}
+    both = search("spatial transcriptomics tissue", n_results=10,
+                  doc_type=["paper", "note"], store=store, rerank=False)
+    assert {doc.metadata["doc_type"] for doc in both} == {"paper", "note"}
 
-    # A plain string still narrows to that single type.
-    only_papers = search("spatial transcriptomics tissue", n_results=10,
-                         doc_type="paper", store=store, rerank=False)
-    assert {doc.metadata["doc_type"] for doc in only_papers} == {"paper"}
+    papers_only = search("spatial transcriptomics tissue", n_results=10,
+                         doc_type=["paper"], store=store, rerank=False)
+    assert {doc.metadata["doc_type"] for doc in papers_only} == {"paper"}
 
 
 # ── Who owns the index ─────────────────────────────────────────────────────────
@@ -804,17 +831,54 @@ def test_get_store_falls_back_to_the_files_for_one_shot_commands(monkeypatch, tm
         raise ConnectionError("connection refused")
 
     monkeypatch.setattr(store_module, "_server_client", no_server)
+    monkeypatch.setattr(store_module, "_allow_direct", True)
 
-    opened = store_module.get_store(allow_direct=True)
+    opened = store_module.get_store()
     assert opened.add_documents is not None  # a usable store, not an error
     store_module._store = None
 
 
+def test_a_refused_token_never_falls_back_to_the_files(monkeypatch, tmp_path):
+    """
+    A server that answers but rejects our token is still running and still
+    writing to the index. Opening the files as well would put two writers on
+    one index, so even a one-shot command must stop with the token error.
+    """
+    from jarvis.core.errors import ServerAuthError
+    from jarvis.kb import store as store_module
+
+    monkeypatch.setattr(store_module, "_store", None)
+    monkeypatch.setattr(store_module, "get_config", lambda: Config(rag_dir=tmp_path / "rag"))
+    monkeypatch.setattr(store_module, "_allow_direct", True)
+
+    def wrong_token(port):
+        raise ServerAuthError("the server refused this process's token")
+
+    monkeypatch.setattr(store_module, "_server_client", wrong_token)
+
+    with pytest.raises(ServerAuthError):
+        store_module.get_store()
+    assert not (tmp_path / "rag").exists()  # the files were never opened
+
+
+def test_no_token_file_reads_as_the_server_not_running(monkeypatch, tmp_path):
+    """
+    kb serve writes the token before it starts the server, so a missing token
+    file means it has never run. That gets the "start kb serve" message,
+    and a one-shot command may fall back to the files.
+    """
+    from jarvis.kb import store as store_module
+
+    monkeypatch.setattr(store_module, "TOKEN_FILE", tmp_path / "missing_token")
+    with pytest.raises(RAGError, match="uv run kb serve"):
+        store_module._server_client(1)
+
+
 def test_the_index_directory_is_owner_only(monkeypatch, tmp_path):
     """
-    The index holds the full text of private notes, so it gets the same 0700
-    treatment as sessions and drafts. Applied on every open, not just at
-    creation, so an index that predates this is fixed by using it.
+    The index holds the full text of your notes and papers, so it gets the
+    same 0700 treatment as the logs and server state. Applied on every open,
+    not just at creation, so an index that predates this is fixed by using it.
     """
     import os
     import stat
@@ -829,11 +893,27 @@ def test_the_index_directory_is_owner_only(monkeypatch, tmp_path):
     monkeypatch.setattr(store_module, "get_config", lambda: Config(rag_dir=rag_dir))
     monkeypatch.setattr(store_module, "_server_client",
                         lambda port: (_ for _ in ()).throw(ConnectionError("connection refused")))
+    monkeypatch.setattr(store_module, "_allow_direct", True)
 
-    store_module.get_store(allow_direct=True)
+    store_module.get_store()
     store_module._store = None
 
     assert stat.S_IMODE(rag_dir.stat().st_mode) == 0o700
+
+
+def test_count_unique_documents_raises_instead_of_reporting_zero(store, monkeypatch):
+    """
+    A count that cannot be read must not come back as 0. "You have 0 papers"
+    is alarming and wrong when the truth is "the index could not be read".
+    """
+    from jarvis.kb.store import count_unique_documents
+
+    def broken_get(*args, **kwargs):
+        raise Exception("Error finding id 42")
+
+    monkeypatch.setattr(store._collection, "get", broken_get)
+    with pytest.raises(KBCorruptionError):
+        count_unique_documents("paper", "source", store)
 
 
 def test_a_connection_reset_is_not_reported_as_a_stopped_server(store, monkeypatch):
@@ -872,3 +952,14 @@ def test_the_chroma_client_is_built_with_telemetry_off():
     from jarvis.kb.store import _chroma_settings
 
     assert _chroma_settings().anonymized_telemetry is False
+    assert _chroma_settings("a-token").anonymized_telemetry is False
+
+
+def test_the_server_client_sends_the_token():
+    """Every connection to the server carries the token; without one there is no auth at all."""
+    from jarvis.kb.store import _chroma_settings
+
+    with_token = _chroma_settings("a-token")
+    assert with_token.chroma_client_auth_provider == "chromadb.auth.token_authn.TokenAuthClientProvider"
+    assert with_token.chroma_client_auth_credentials == "a-token"
+    assert _chroma_settings().chroma_client_auth_provider is None
